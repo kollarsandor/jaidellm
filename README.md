@@ -1,5 +1,3 @@
-JAIDE áttekintés
-
 A JAIDE (v40) egy nagy nyelvi modell, amely az alapoktól kezdve a Reversible Scatter Flow (RSF) paradigma megvalósítására épült. A hagyományos transzformátor vagy CNN architektúrákkal ellentétben a JAIDE bijektív csatolási rétegeket használ, amelyek lehetővé teszik az O(1) memória visszaterjedést és egy paramétermentes Haar-wavelet keverő blokkot, amelyet OFTB-nek neveznek
 
 A rendszert nagy teljesítményű futtatásra tervezték különböző hardvereken, a szabványos CPU-któl kezdve a több GPU-s B200 klasztereken át a kvantum relációs gráfokig
@@ -387,3 +385,8 @@ A négy korábbi paradigma:
 | RNN | σ(W_h h + W_x x) | rejtett állapot → nem | O(T) |
 | Transformer | softmax(QKᵀ/√d)V | softmax → nem | O(L·S·d) |
 | **RSF** | kereszt-affin coupling | det J > 0 → **igen** | **O(1)** |
+
+
+
+A chaos_core.zig egy önszervező, tartalom-alapú futásidejű végrehajtási kernel, amely az NSIR gráf csomópontjait SHA-256 hash-elt memóriablokkokká képezi le, entanglement-mechanizmuson keresztül szemantikai közelségi hálót épít a fizikai memóriában, dinamikusan ütemezi és migrálja az adatokat a legoptimálisabb processzormaghoz, és ezzel egy lokalitás-tudatos, önszervező infrastruktúrát biztosít az RSF/JAIDE architektúra számára, amely lehetővé teszi, hogy a kvantum-relációs következtetés hardverfüggetlenül skálázódjon és meghaladja a transformer statikus, O(n²) attention-alapú memóriakezelésének korlátait.
+
