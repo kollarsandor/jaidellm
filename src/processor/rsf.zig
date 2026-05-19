@@ -1250,6 +1250,7 @@ fn snapshotModelForSave(allocator: Allocator, core: *const RSFCore) !SavedModelS
 
 pub const RSF = struct {
     id: u64 = 0,
+    ctrl: ?*RSFCore = null,
 
     pub fn init(allocator: Allocator, dim: usize, num_layers: usize) !RSF {
         return initWithConfig(allocator, dim, num_layers, .{});
@@ -1316,7 +1317,7 @@ pub const RSF = struct {
         }
 
         const id = try registerModelCore(core);
-        return RSF{ .id = id };
+        return RSF{ .id = id, .ctrl = core };
     }
 
     pub fn deinit(self: *RSF) void {
@@ -1324,6 +1325,7 @@ pub const RSF = struct {
         if (id == 0) return;
         const should_destroy = shouldDestroyModelHandle(self);
         self.id = 0;
+        self.ctrl = null;
         if (should_destroy) requestDestroyModelCore(id);
     }
 
@@ -1642,7 +1644,7 @@ pub const RSF = struct {
         }
 
         const id = try registerModelCore(core);
-        return RSF{ .id = id };
+        return RSF{ .id = id, .ctrl = core };
     }
 
     pub fn saveLoadRoundtrip(allocator: Allocator, self: *const RSF, path: []const u8, abs_tol: f32, rel_tol: f32) !bool {

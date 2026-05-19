@@ -1,4 +1,4 @@
-Const std = @import("std");  
+const std = @import("std");  
 const Allocator = std.mem.Allocator;  
 const Tensor = @import("../core/tensor.zig").Tensor;  
   
