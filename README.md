@@ -1,3 +1,8 @@
+A readme dokumentáció magyar fordítása!
+forrás:https://deepwiki.com/kollarsandor/jaidellm
+
+
+
 A JAIDE (v40) egy nagy nyelvi modell, amely az alapoktól kezdve a Reversible Scatter Flow (RSF) paradigma megvalósítására épült. A hagyományos transzformátor vagy CNN architektúrákkal ellentétben a JAIDE bijektív csatolási rétegeket használ, amelyek lehetővé teszik az O(1) memória visszaterjedést és egy paramétermentes Haar-wavelet keverő blokkot, amelyet OFTB-nek neveznek
 
 A rendszert nagy teljesítményű futtatásra tervezték különböző hardvereken, a szabványos CPU-któl kezdve a több GPU-s B200 klasztereken át a kvantum relációs gráfokig
