@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import modal
 
 APP_NAME = "jaide-v40-distributed-training"
-GPU_SPEC = "B200:8"
+GPU_SPEC = "B200+:8"
 DATA_VOLUME_NAME = "jaide-training-data"
 CHECKPOINT_VOLUME_NAME = "jaide-checkpoints"
 
