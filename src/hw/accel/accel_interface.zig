@@ -275,7 +275,7 @@ pub const FutharkArray2DF16 = struct {
         }
     }
 
-    pub fn values(self: *Self, ctx: *FutharkContext, allocator: std.mem.Allocator) AccelError![][]f16 {
+    pub fn values(self: *const Self, ctx: *FutharkContext, allocator: std.mem.Allocator) AccelError![][]f16 {
         if (ctx.ctx == null) return AccelError.NullPointer;
         if (self.arr == null) return AccelError.NullPointer;
 
