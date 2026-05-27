@@ -62,7 +62,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         distributed_futhark_exe.linkLibC();
-        distributed_futhark_exe.addCSourceFile(.{ .file = futhark_c, .flags = &.{"-O2"} });
         distributed_futhark_exe.addCSourceFile(.{ .file = futhark_gpu_c, .flags = &.{"-O2"} });
         distributed_futhark_exe.addIncludePath(futhark_include);
         distributed_futhark_exe.addIncludePath(.{ .cwd_relative = "/usr/local/cuda/include" });

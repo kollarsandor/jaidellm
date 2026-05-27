@@ -43,10 +43,10 @@ pub const MGT = struct {
         var mgt = initEmpty(allocator);
         errdefer mgt.deinit();
 
-        try mgt.addToken("[PAD]");
-        try mgt.addToken("[UNK]");
-        try mgt.addToken("[BOS]");
-        try mgt.addToken("[EOS]");
+        _ = try mgt.addToken("[PAD]");
+        _ = try mgt.addToken("[UNK]");
+        _ = try mgt.addToken("[BOS]");
+        _ = try mgt.addToken("[EOS]");
 
         for (vocab) |word| {
             _ = try mgt.addToken(word);
