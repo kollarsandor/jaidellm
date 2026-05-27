@@ -320,8 +320,16 @@ def train_rank(
     local_batch_size: int,
     dataset_path: str,
 ) -> Dict[str, Any]:
+    import sys
+    import threading
+
+    def _log(msg: str) -> None:
+        print(f"[rank {rank}] {msg}", flush=True)
+
+    _log("container started")
     data_volume.reload()
     checkpoint_volume.reload()
+    _log("volumes reloaded")
 
     gpu_count, gpu_list = _detect_gpus()
     expected_gpus = _expected_gpu_count()
@@ -329,6 +337,7 @@ def train_rank(
         raise RuntimeError(f"No NVIDIA GPUs detected: {gpu_list}")
     if gpu_count != expected_gpus:
         raise RuntimeError(f"Expected {expected_gpus} GPUs from {GPU_SPEC}, detected {gpu_count}: {gpu_list}")
+    _log(f"detected {gpu_count} GPUs")
 
     os.chdir(str(PROJECT_MOUNT_PATH))
     _ensure_dir(CHECKPOINT_MOUNT_PATH)
@@ -340,6 +349,7 @@ def train_rank(
     local_binary = Path("/tmp/jaide-distributed-futhark")
     shutil.copy2(str(BINARY_CACHE_PATH), str(local_binary))
     local_binary.chmod(0o755)
+    _log(f"binary ready at {local_binary}")
 
     env = os.environ.copy()
     env["WORLD_SIZE"] = str(world_size)
@@ -364,21 +374,38 @@ def train_rank(
     stderr_tail = ""
     timed_out = False
 
+    def _tee(src, dst_file, prefix: str) -> None:
+        try:
+            for raw in iter(src.readline, b""):
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                print(f"[rank {rank} {prefix}] {line}", flush=True)
+                dst_file.write(line + "\n")
+                dst_file.flush()
+        except Exception as exc:  # pragma: no cover
+            print(f"[rank {rank} {prefix}] tee error: {exc}", flush=True)
+
+    _log("spawning binary")
     with open(stdout_path, "w", encoding="utf-8", errors="replace") as stdout_file, open(stderr_path, "w", encoding="utf-8", errors="replace") as stderr_file:
         try:
             proc = subprocess.Popen(
                 [str(local_binary)],
-                stdout=stdout_file,
-                stderr=stderr_file,
-                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=env,
                 cwd=str(PROJECT_MOUNT_PATH),
                 preexec_fn=os.setsid,
             )
+            t_out = threading.Thread(target=_tee, args=(proc.stdout, stdout_file, "out"), daemon=True)
+            t_err = threading.Thread(target=_tee, args=(proc.stderr, stderr_file, "err"), daemon=True)
+            t_out.start()
+            t_err.start()
             try:
                 return_code = proc.wait(timeout=TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 timed_out = True
+                _log("timeout, killing")
                 try:
                     os.killpg(proc.pid, 15)
                     proc.wait(timeout=30)
@@ -389,6 +416,8 @@ def train_rank(
                         pass
                     proc.wait()
                 return_code = -9
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
         except FileNotFoundError as e:
             stderr_file.write(str(e))
             return_code = 127
@@ -398,6 +427,7 @@ def train_rank(
     stderr_tail = _read_tail(stderr_path)
 
     loss = _extract_loss(stdout_tail) if rank == 0 else None
+    _log(f"finished rc={return_code} elapsed={elapsed_time:.1f}s loss={loss}")
 
     return {
         "rank": rank,
