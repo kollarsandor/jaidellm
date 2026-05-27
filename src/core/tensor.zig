@@ -7,7 +7,7 @@ const Error = types.Error;
 const Fixed32_32 = types.Fixed32_32;
 const memory = @import("memory.zig");
 
-const alignment = std.mem.Alignment.@"32";
+const alignment = 32;
 const vector_width = 8;
 const Vec8 = @Vector(vector_width, f32);
 
@@ -165,7 +165,7 @@ pub const Tensor = struct {
     pub fn init(allocator: Allocator, dims: []const usize) !Tensor {
         var shape = try Shape.init(allocator, dims);
         errdefer shape.deinit(allocator);
-        const data = try allocator.alignedAlloc(f32, alignment, shape.totalSize());
+        const data = try allocator.alignedAlloc(f32, @as(?u29, alignment), shape.totalSize());
         errdefer allocator.free(data);
         @memset(data, 0.0);
         const refcount = try allocator.create(usize);
@@ -226,7 +226,7 @@ pub const Tensor = struct {
     fn ensureWritable(self: *Tensor) !void {
         if (!self.cow.* and @atomicLoad(usize, self.refcount, .acquire) == 1) return;
         const total = self.shape.totalSize();
-        const new_data = try self.allocator.alignedAlloc(f32, alignment, total);
+        const new_data = try self.allocator.alignedAlloc(f32, @as(?u29, alignment), total);
         errdefer self.allocator.free(new_data);
         if (self.shape.isContiguous()) {
             @memcpy(new_data, self.data[0..total]);

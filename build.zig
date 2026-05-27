@@ -118,4 +118,39 @@ pub fn build(b: *std.Build) void {
     const run_memory_tests = b.addRunArtifact(memory_tests);
     const memory_test_step = b.step("test-memory", "Run memory tests");
     memory_test_step.dependOn(&run_memory_tests.step);
+
+    // Benchmark dependency module (rooted at src/ for Zig module path resolution)
+    const bench_deps = b.createModule(.{
+        .root_source_file = b.path("src/_bench_deps.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_deps.addOptions("build_options", build_options);
+
+    // Benchmark targets
+    const bench_step = b.step("bench", "Run all benchmarks");
+
+    const bench_sources = [_]struct { name: []const u8, path: []const u8 }{
+        .{ .name = "bench-rsf", .path = "src/tests/bench_rsf.zig" },
+        .{ .name = "bench-matmul", .path = "src/tests/bench_matmul.zig" },
+        .{ .name = "bench-tensor-ops", .path = "src/tests/bench_tensor_ops.zig" },
+        .{ .name = "bench-sfd", .path = "src/tests/bench_sfd.zig" },
+    };
+
+    inline for (bench_sources) |src| {
+        const exe = b.addExecutable(.{
+            .name = src.name,
+            .root_source_file = b.path(src.path),
+            .target = target,
+            .optimize = optimize,
+        });
+        exe.linkLibC();
+        exe.addCSourceFile(.{ .file = futhark_c, .flags = &.{"-O2"} });
+        exe.addIncludePath(futhark_include);
+        exe.root_module.addOptions("build_options", build_options);
+        exe.root_module.addImport("deps", bench_deps);
+        b.installArtifact(exe);
+        const run = b.addRunArtifact(exe);
+        bench_step.dependOn(&run.step);
+    }
 }
