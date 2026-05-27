@@ -25,11 +25,13 @@ entry rsf_backward [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2]f1
   (weights_s: [half][half]f16) (weights_t: [half][half]f16)
   (s_bias: [half]f16) (t_bias: [half]f16)
   (clip_min: f16) (clip_max: f16)
-  : (*[half][half]f16, *[half][half]f16, *[half]f16, *[half]f16) =
+  : ([half][half]f16, [half][half]f16, [half]f16, [half]f16) =
   let d = half * 2
-  let zero_mat = replicate half (replicate half (f16.i32 0))
-  let zero_vec = replicate half (f16.i32 0)
-  in loop (grad_ws, grad_wt, grad_sb, grad_tb) = (zero_mat, zero_mat, zero_vec, zero_vec) for i < n do
+  let zero_mat_ws = replicate half (replicate half (f16.i32 0))
+  let zero_mat_wt = replicate half (replicate half (f16.i32 0))
+  let zero_vec_sb = replicate half (f16.i32 0)
+  let zero_vec_tb = replicate half (f16.i32 0)
+  in loop (grad_ws, grad_wt, grad_sb, grad_tb) = (zero_mat_ws, zero_mat_wt, zero_vec_sb, zero_vec_tb) for i < n do
     let row = input[i]
     let g_row = grad_output[i]
     let x1 = row[0:half] :> [half]f16
@@ -67,12 +69,12 @@ entry rsf_backward [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2]f1
 
 entry sfd_update_half [d] (weights: *[d][d]f16) (gradients: [d][d]f16) (learning_rate: f16) (momentum: f16) (velocity: *[d][d]f16) : (*[d][d]f16, *[d][d]f16) =
   let new_velocity = map2 (map2 (\v g -> momentum f16.* v f16.+ learning_rate f16.* g)) velocity gradients
-  let new_weights = map2 (map2 (\w v -> w f16.- v)) weights new_velocity
+  let new_weights = map2 (map2 (\w v -> w f16.- v)) weights (copy new_velocity)
   in (new_weights, new_velocity)
 
 entry sfd_update_bias [d] (bias: *[d]f16) (gradients: [d]f16) (learning_rate: f16) (momentum: f16) (velocity: *[d]f16) : (*[d]f16, *[d]f16) =
   let new_velocity = map2 (\v g -> momentum f16.* v f16.+ learning_rate f16.* g) velocity gradients
-  let new_bias = map2 (\b v -> b f16.- v) bias new_velocity
+  let new_bias = map2 (\b v -> b f16.- v) bias (copy new_velocity)
   in (new_bias, new_velocity)
 
 entry compute_loss [n][d] (output: [n][d]f16) (target: [n][d]f16) : f16 =
@@ -98,18 +100,16 @@ entry batch_gradients [batch_size][seq_len][half] (inputs: [batch_size][seq_len]
   (weights_s: [half][half]f16) (weights_t: [half][half]f16)
   (s_bias: [half]f16) (t_bias: [half]f16)
   (clip_min: f16) (clip_max: f16)
-  : (*[half][half]f16, *[half][half]f16, *[half]f16, *[half]f16) =
-  let zero_mat = replicate half (replicate half (f16.i32 0))
-  let zero_vec = replicate half (f16.i32 0)
+  : ([half][half]f16, [half][half]f16, [half]f16, [half]f16) =
   let results = map2 (\inp g_out ->
     rsf_backward inp g_out weights_s weights_t s_bias t_bias clip_min clip_max
   ) inputs grad_outputs
   let (gs_list, gt_list, gsb_list, gtb_list) = unzip4 results
-  let gs_total = reduce (map2 (map2 (f16.+))) zero_mat gs_list
-  let gt_total = reduce (map2 (map2 (f16.+))) zero_mat gt_list
-  let gsb_total = reduce (map2 (f16.+)) zero_vec gsb_list
-  let gtb_total = reduce (map2 (f16.+)) zero_vec gtb_list
-  in (gs_total, gt_total, gsb_total, gtb_total)
+  let gs_total = reduce (map2 (map2 (f16.+))) (replicate half (replicate half (f16.i32 0))) gs_list
+  let gt_total = reduce (map2 (map2 (f16.+))) (replicate half (replicate half (f16.i32 0))) gt_list
+  let gsb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) gsb_list
+  let gtb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) gtb_list
+  in (copy gs_total, copy gt_total, copy gsb_total, copy gtb_total)
 
 entry xavier_fill_inplace [d] (weights: *[d][d]f16) (seed: i32) : *[d][d]f16 =
   let scale = f16.sqrt (f16.f32 2.0 f16./ f16.i64 d)
@@ -147,9 +147,13 @@ entry training_step [batch_size][seq_len][half]
   let loss = batch_compute_loss outputs targets
   let grad_outputs = map2 (map2 (map2 (\o t -> (f16.f32 2.0) f16.* (o f16.- t)))) outputs targets
   let (grad_s, grad_t, grad_sb, grad_tb) = batch_gradients inputs grad_outputs weights_s weights_t s_bias t_bias clip_min clip_max
-  let (new_weights_s, new_velocity_s) = sfd_update_half weights_s grad_s learning_rate momentum velocity_s
-  let (new_weights_t, new_velocity_t) = sfd_update_half weights_t grad_t learning_rate momentum velocity_t
-  let (new_s_bias, new_velocity_sb) = sfd_update_bias s_bias grad_sb learning_rate momentum velocity_sb
-  let (new_t_bias, new_velocity_tb) = sfd_update_bias t_bias grad_tb learning_rate momentum velocity_tb
+  let grad_s_c  = copy grad_s
+  let grad_t_c  = copy grad_t
+  let grad_sb_c = copy grad_sb
+  let grad_tb_c = copy grad_tb
+  let (new_weights_s, new_velocity_s) = sfd_update_half weights_s grad_s_c learning_rate momentum velocity_s
+  let (new_weights_t, new_velocity_t) = sfd_update_half weights_t grad_t_c learning_rate momentum velocity_t
+  let (new_s_bias, new_velocity_sb) = sfd_update_bias s_bias grad_sb_c learning_rate momentum velocity_sb
+  let (new_t_bias, new_velocity_tb) = sfd_update_bias t_bias grad_tb_c learning_rate momentum velocity_tb
 
   in (new_weights_s, new_weights_t, new_s_bias, new_t_bias, new_velocity_s, new_velocity_t, new_velocity_sb, new_velocity_tb, loss)
