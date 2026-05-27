@@ -158,7 +158,7 @@ pub const FutharkArray1DF16 = struct {
         return Self{ .arr = arr, .len = length };
     }
 
-    pub fn values1D(self: *Self, ctx: *FutharkContext, allocator: std.mem.Allocator) AccelError![]f16 {
+    pub fn values1D(self: *const Self, ctx: *FutharkContext, allocator: std.mem.Allocator) AccelError![]f16 {
         if (ctx.ctx == null) return AccelError.NullPointer;
         if (self.arr == null) return AccelError.NullPointer;
         if (self.len == 0) return AccelError.InvalidDimensions;
