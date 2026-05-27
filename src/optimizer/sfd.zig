@@ -934,7 +934,7 @@ pub const ReversibleOptimizerState = struct {
                 return residual;
             }
         }
-        var residual = try Tensor.zeros(self.allocator, input.shape.dims);
+        const residual = try Tensor.zeros(self.allocator, input.shape.dims);
         return residual;
     }
 
@@ -985,27 +985,27 @@ pub const LRScheduler = struct {
         var hi: usize = hess_values.len - 1;
         while (lo < hi) {
             const pivot = hess_values[(lo + hi) / 2];
-            var i2 = lo;
+            var @"i2" = lo;
             var j2 = hi;
-            while (i2 <= j2) {
-                while (hess_values[i2] < pivot) i2 += 1;
+            while (@"i2" <= j2) {
+                while (hess_values[@"i2"] < pivot) @"i2" += 1;
                 while (hess_values[j2] > pivot) {
                     if (j2 == 0) break;
                     j2 -= 1;
                 }
-                if (i2 <= j2) {
-                    const tmp = hess_values[i2];
-                    hess_values[i2] = hess_values[j2];
+                if (@"i2" <= j2) {
+                    const tmp = hess_values[@"i2"];
+                    hess_values[@"i2"] = hess_values[j2];
                     hess_values[j2] = tmp;
-                    i2 += 1;
+                    @"i2" += 1;
                     if (j2 == 0) break;
                     j2 -= 1;
                 }
             }
             if (target <= j2) {
                 hi = j2;
-            } else if (target >= i2) {
-                lo = i2;
+            } else if (target >= @"i2") {
+                lo = @"i2";
             } else {
                 break;
             }
@@ -2529,7 +2529,7 @@ test "SophiaSOAPOptimizer init" {
 }
 
 test "DynamicLossScaler custom max scale" {
-    var scaler = DynamicLossScaler.initWithMaxScale(1024.0, 32768.0);
+    const scaler = DynamicLossScaler.initWithMaxScale(1024.0, 32768.0);
     try std.testing.expectEqual(@as(f32, 32768.0), scaler.max_scale);
 }
 

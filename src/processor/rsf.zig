@@ -1030,7 +1030,7 @@ fn syncAllLayersGPU(core: *RSFCore) !void {
         try validateF16Convertible(layer.t_bias.data);
     }
 
-    var local_f16 = try core.allocator.alloc(f16, dim_sq);
+    const local_f16 = try core.allocator.alloc(f16, dim_sq);
     var local_f16_owned = true;
     errdefer if (local_f16_owned) core.allocator.free(local_f16);
 
