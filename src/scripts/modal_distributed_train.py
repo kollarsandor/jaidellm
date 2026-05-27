@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -9,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import modal
 
-APP_NAME = "jaide-v40-training"
+APP_NAME = "jaide-v40-distributed-training"
 GPU_SPEC = "B200:8"
 DATA_VOLUME_NAME = "jaide-training-data"
 CHECKPOINT_VOLUME_NAME = "jaide-checkpoints"
@@ -22,8 +21,7 @@ DATASET_DIR = DATA_MOUNT_PATH / "dataset"
 DATASET_FILE = DATASET_DIR / "train.jsonl"
 DATASET_METADATA_FILE = DATASET_DIR / "metadata.json"
 
-MODELS_DIR = PROJECT_MOUNT_PATH / "models"
-BINARY_PATH = PROJECT_MOUNT_PATH / "main"
+BINARY_PATH = PROJECT_MOUNT_PATH / "zig-out" / "bin" / "jaide-distributed-futhark"
 
 CPU_REQUEST = 64.0
 CPU_LIMIT = 80.0
@@ -60,13 +58,13 @@ jaide_image = (
     .pip_install("pyarrow", "requests", "zstandard", "datasets", "huggingface_hub", "hf_xet")
     .run_commands(
         "mkdir -p /opt",
-        "curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C /opt",
-        "ln -sf /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig",
+        "curl -sL https://ziglang.org/download/0.14.1/zig-linux-x86_64-0.14.1.tar.xz | tar -xJ -C /opt",
+        "ln -sf /opt/zig-linux-x86_64-0.14.1/zig /usr/local/bin/zig",
         "zig version",
     )
     .env(
         {
-            "PATH": "/opt/zig-linux-x86_64-0.13.0:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PATH": "/opt/zig-linux-x86_64-0.14.1:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HF_HOME": "/data/hf_home",
             "HF_DATASETS_CACHE": "/data/hf_datasets_cache",
             "HF_XET_HIGH_PERFORMANCE": "1",
@@ -180,17 +178,17 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     return str(DATASET_FILE), size, line_count
 
 
-def _build_zig(project_dir: str) -> None:
+def _build_zig_gpu(project_dir: str) -> None:
     if BINARY_PATH.is_file():
         return
     rc, out, err = _run_checked(
-        ["zig", "build-exe", "src/main.zig", "-O", "ReleaseFast", f"-femit-bin={BINARY_PATH}"],
+        ["zig", "build", "-Dgpu=true", "-Doptimize=ReleaseFast"],
         cwd=project_dir,
     )
     if rc != 0:
-        raise RuntimeError(f"Build failed with exit code {rc}: {(err or out)[-8000:]}")
+        raise RuntimeError(f"GPU build failed with exit code {rc}: {(err or out)[-8000:]}")
     if not BINARY_PATH.is_file():
-        raise FileNotFoundError(f"Built binary not found at {BINARY_PATH}")
+        raise FileNotFoundError(f"GPU binary not found at {BINARY_PATH}")
     BINARY_PATH.chmod(0o755)
 
 
@@ -240,17 +238,71 @@ def _read_tail(path: Path, max_chars: int = 8000) -> str:
     return data.decode("utf-8", errors="replace")[-max_chars:]
 
 
-def _run_training_command(cmd: List[str], env: Dict[str, str], timeout_seconds: int, epoch: int) -> Tuple[int, str, str, bool]:
+@app.function(
+    image=jaide_image,
+    gpu=GPU_SPEC,
+    cpu=(CPU_REQUEST, CPU_LIMIT),
+    memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
+    ephemeral_disk=EPHEMERAL_DISK_MB,
+    timeout=TIMEOUT_SECONDS,
+    volumes={
+        str(DATA_MOUNT_PATH): data_volume,
+        str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
+    },
+)
+def train_rank(
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: str,
+    epochs: int,
+    model_dim: int,
+    num_layers: int,
+    local_batch_size: int,
+    dataset_path: str,
+) -> Dict[str, Any]:
+    data_volume.reload()
+    checkpoint_volume.reload()
+
+    gpu_count, gpu_list = _detect_gpus()
+    expected_gpus = _expected_gpu_count()
+    if gpu_count < 1:
+        raise RuntimeError(f"No NVIDIA GPUs detected: {gpu_list}")
+    if gpu_count != expected_gpus:
+        raise RuntimeError(f"Expected {expected_gpus} GPUs from {GPU_SPEC}, detected {gpu_count}: {gpu_list}")
+
+    os.chdir(str(PROJECT_MOUNT_PATH))
+    _ensure_dir(CHECKPOINT_MOUNT_PATH)
+
+    _build_zig_gpu(str(PROJECT_MOUNT_PATH))
+
+    env = os.environ.copy()
+    env["WORLD_SIZE"] = str(world_size)
+    env["RANK"] = str(rank)
+    env["MASTER_ADDR"] = master_addr
+    env["MASTER_PORT"] = str(master_port)
+    env["JAIDE_EPOCHS"] = str(epochs)
+    env["JAIDE_DATASET"] = dataset_path
+    env["JAIDE_MODEL_DIM"] = str(model_dim)
+    env["JAIDE_LAYERS"] = str(num_layers)
+    env["JAIDE_BATCH_SIZE"] = str(local_batch_size)
+    env["CUDA_VISIBLE_DEVICES"] = str(rank % gpu_count)
+
     logs_dir = Path("/tmp/jaide_training_logs")
     _ensure_dir(logs_dir)
-    stdout_path = logs_dir / f"epoch_{epoch:03d}.stdout.log"
-    stderr_path = logs_dir / f"epoch_{epoch:03d}.stderr.log"
+    stdout_path = logs_dir / f"rank_{rank:03d}.stdout.log"
+    stderr_path = logs_dir / f"rank_{rank:03d}.stderr.log"
 
+    start_time = time.time()
+    return_code = -1
+    stdout_tail = ""
+    stderr_tail = ""
     timed_out = False
+
     with open(stdout_path, "w", encoding="utf-8", errors="replace") as stdout_file, open(stderr_path, "w", encoding="utf-8", errors="replace") as stderr_file:
         try:
             proc = subprocess.Popen(
-                cmd,
+                [str(BINARY_PATH)],
                 stdout=stdout_file,
                 stderr=stderr_file,
                 text=True,
@@ -259,7 +311,7 @@ def _run_training_command(cmd: List[str], env: Dict[str, str], timeout_seconds: 
                 preexec_fn=os.setsid,
             )
             try:
-                return_code = proc.wait(timeout=timeout_seconds)
+                return_code = proc.wait(timeout=TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 try:
@@ -276,174 +328,105 @@ def _run_training_command(cmd: List[str], env: Dict[str, str], timeout_seconds: 
             stderr_file.write(str(e))
             return_code = 127
 
+    elapsed_time = float(time.time() - start_time)
     stdout_tail = _read_tail(stdout_path)
     stderr_tail = _read_tail(stderr_path)
-    return int(return_code), stdout_tail, stderr_tail, timed_out
 
+    loss = _extract_loss(stdout_tail) if rank == 0 else None
 
-def _validate_positive_int(value: int, name: str) -> int:
-    converted = int(value)
-    if converted < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return converted
+    return {
+        "rank": rank,
+        "return_code": int(return_code),
+        "timed_out": bool(timed_out),
+        "elapsed_seconds": elapsed_time,
+        "loss": loss,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+    }
 
 
 @app.function(
     image=jaide_image,
-    gpu=GPU_SPEC,
-    cpu=(CPU_REQUEST, CPU_LIMIT),
-    memory=(MEMORY_REQUEST_MB, MEMORY_LIMIT_MB),
-    ephemeral_disk=EPHEMERAL_DISK_MB,
+    cpu=8.0,
+    memory=16384,
     timeout=TIMEOUT_SECONDS,
     volumes={
         str(DATA_MOUNT_PATH): data_volume,
         str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
     },
 )
-def train_jaide(
+def orchestrate_training(
     epochs: int = 20,
-    batch_size: int = 256,
-    per_epoch_timeout_seconds: int = 3600,
+    model_dim: int = 512,
+    num_layers: int = 16,
+    local_batch_size: int = 4,
+    world_size: int = 8,
 ) -> Dict[str, Any]:
-    num_epochs = _validate_positive_int(epochs, "epochs")
-    bs = _validate_positive_int(batch_size, "batch_size")
-    epoch_timeout = _validate_positive_int(per_epoch_timeout_seconds, "per_epoch_timeout_seconds")
-
     data_volume.reload()
     checkpoint_volume.reload()
-
-    gpu_count, gpu_list = _detect_gpus()
-    expected_gpus = _expected_gpu_count()
-    if gpu_count < 1:
-        raise RuntimeError(f"No NVIDIA GPUs detected: {gpu_list}")
-    if gpu_count != expected_gpus:
-        raise RuntimeError(f"Expected {expected_gpus} GPUs from {GPU_SPEC}, detected {gpu_count}: {gpu_list}")
 
     dataset_path, dataset_size, sample_count = download_finephrase_to_jsonl(data_volume)
     if sample_count <= 0:
         raise RuntimeError("Dataset contains zero samples")
 
-    os.chdir(str(PROJECT_MOUNT_PATH))
-    _ensure_dir(MODELS_DIR)
-    _ensure_dir(CHECKPOINT_MOUNT_PATH)
+    master_addr = "localhost"
+    master_port = "29500"
 
-    _build_zig(str(PROJECT_MOUNT_PATH))
+    print(f"Starting distributed training with {world_size} ranks")
+    print(f"Model: dim={model_dim}, layers={num_layers}, batch={local_batch_size}")
+    print(f"Dataset: {sample_count} samples, {dataset_size / 1e6:.2f} MB")
+    print(f"Epochs: {epochs}")
 
-    total_start = time.time()
-    training_results: List[Dict[str, Any]] = []
-    aborted = False
-
-    for epoch in range(1, num_epochs + 1):
-        epoch_start = time.time()
-
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpu_count))
-
-        cmd = [
-            str(BINARY_PATH),
-            "--mode", "train",
-            "--epochs", "1",
-            "--batch-size", str(bs),
-            "--dataset-path", str(dataset_path),
-            "--samples", str(sample_count),
-            "--output-dir", str(MODELS_DIR),
-        ]
-
-        return_code, stdout_tail, stderr_tail, timed_out = _run_training_command(cmd, env, epoch_timeout, epoch)
-
-        epoch_time = float(time.time() - epoch_start)
-        loss = _extract_loss(stdout_tail)
-        if loss is None:
-            loss = 0.0
-
-        checkpoint_dir = CHECKPOINT_MOUNT_PATH / f"epoch_{epoch:03d}"
-        if checkpoint_dir.exists():
-            shutil.rmtree(checkpoint_dir)
-        _ensure_dir(checkpoint_dir)
-
-        model_files = sorted(MODELS_DIR.glob("*.bin"))
-        for model_file in model_files:
-            shutil.copy2(model_file, checkpoint_dir / model_file.name)
-
-        ckpt_files = list(checkpoint_dir.glob("*.bin"))
-        ckpt_size = int(sum(f.stat().st_size for f in ckpt_files)) if ckpt_files else 0
-
-        _write_json_file(
-            checkpoint_dir / "metadata.json",
-            {
-                "epoch": epoch,
-                "loss": loss,
-                "duration_seconds": epoch_time,
-                "batch_size": bs,
-                "dataset_samples": sample_count,
-                "dataset_size_mb": float(dataset_size) / 1e6,
-                "gpu_config": f"{gpu_count}x NVIDIA B200",
-                "return_code": int(return_code),
-                "timed_out": bool(timed_out),
-                "stdout_tail": stdout_tail,
-                "stderr_tail": stderr_tail,
-                "checkpoint_bytes": ckpt_size,
-                "checkpoint_files": len(ckpt_files),
-            },
+    rank_futures = []
+    for rank in range(world_size):
+        future = train_rank.spawn(
+            rank=rank,
+            world_size=world_size,
+            master_addr=master_addr,
+            master_port=master_port,
+            epochs=epochs,
+            model_dim=model_dim,
+            num_layers=num_layers,
+            local_batch_size=local_batch_size,
+            dataset_path=dataset_path,
         )
+        rank_futures.append(future)
 
-        checkpoint_volume.commit()
-
-        training_results.append(
-            {
-                "epoch": epoch,
-                "loss": loss,
-                "time_seconds": epoch_time,
-                "checkpoint_mb": float(ckpt_size) / 1e6,
-                "files": len(ckpt_files),
-                "return_code": int(return_code),
-                "timed_out": bool(timed_out),
-            }
-        )
-
-        if return_code != 0 or timed_out:
-            aborted = True
-            break
-
-    total_time = float(time.time() - total_start)
-
-    successful_results = [r for r in training_results if int(r["return_code"]) == 0 and not r.get("timed_out", False)]
-
-    latest_dir = CHECKPOINT_MOUNT_PATH / "latest"
-    if latest_dir.is_symlink():
-        latest_dir.unlink()
-    elif latest_dir.exists():
+    results = []
+    for future in rank_futures:
         try:
-            shutil.rmtree(latest_dir)
-        except OSError:
-            pass
+            result = future.get(timeout=TIMEOUT_SECONDS + 300)
+            results.append(result)
+        except Exception as e:
+            results.append({
+                "rank": len(results),
+                "return_code": -1,
+                "error": str(e),
+            })
 
-    if successful_results:
-        last_ok_epoch = int(successful_results[-1]["epoch"])
-        src = CHECKPOINT_MOUNT_PATH / f"epoch_{last_ok_epoch:03d}"
-        if src.is_dir():
-            shutil.copytree(src, latest_dir)
+    successful_ranks = [r for r in results if int(r.get("return_code", -1)) == 0 and not r.get("timed_out", False)]
+    rank_0_result = next((r for r in results if r.get("rank") == 0), None)
 
-    final_loss = float(successful_results[-1]["loss"]) if successful_results else 0.0
-    completed_epochs = len(successful_results)
-    status = "completed" if (not aborted and completed_epochs == num_epochs) else "failed"
+    final_loss = rank_0_result.get("loss") if rank_0_result else 0.0
+    completed_epochs = epochs if len(successful_ranks) == world_size else 0
+    status = "completed" if len(successful_ranks) == world_size else "failed"
 
     _write_json_file(
         CHECKPOINT_MOUNT_PATH / "training_complete.json",
         {
             "status": status,
-            "total_epochs": num_epochs,
+            "total_epochs": epochs,
             "completed_epochs": completed_epochs,
-            "attempted_epochs": len(training_results),
-            "total_time_seconds": total_time,
-            "total_time_minutes": total_time / 60.0,
             "final_loss": final_loss,
             "dataset_path": str(dataset_path),
             "dataset_size_mb": float(dataset_size) / 1e6,
             "sample_count": sample_count,
-            "gpu_config": f"{gpu_count}x NVIDIA B200",
-            "gpu_list": gpu_list,
-            "epochs": training_results,
+            "gpu_config": f"{world_size}x NVIDIA B200",
+            "model_dim": model_dim,
+            "num_layers": num_layers,
+            "local_batch_size": local_batch_size,
+            "world_size": world_size,
+            "rank_results": results,
         },
     )
 
@@ -451,26 +434,32 @@ def train_jaide(
 
     return {
         "status": status,
-        "epochs": num_epochs,
+        "epochs": epochs,
         "completed_epochs": completed_epochs,
         "final_loss": final_loss,
-        "total_time_minutes": total_time / 60.0,
         "dataset_size_mb": float(dataset_size) / 1e6,
         "sample_count": sample_count,
-        "gpu_config": f"{gpu_count}x NVIDIA B200",
-        "checkpoints": completed_epochs,
+        "gpu_config": f"{world_size}x NVIDIA B200",
+        "model_dim": model_dim,
+        "num_layers": num_layers,
+        "successful_ranks": len(successful_ranks),
+        "rank_results": results,
     }
 
 
 @app.local_entrypoint()
 def main(
     epochs: int = 20,
-    batch_size: int = 256,
-    per_epoch_timeout_seconds: int = 3600,
+    model_dim: int = 512,
+    num_layers: int = 16,
+    local_batch_size: int = 4,
+    world_size: int = 8,
 ) -> None:
-    result = train_jaide.remote(
+    result = orchestrate_training.remote(
         epochs=epochs,
-        batch_size=batch_size,
-        per_epoch_timeout_seconds=per_epoch_timeout_seconds,
+        model_dim=model_dim,
+        num_layers=num_layers,
+        local_batch_size=local_batch_size,
+        world_size=world_size,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))

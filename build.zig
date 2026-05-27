@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "gpu_acceleration", gpu_enabled);
 
     const futhark_c = b.path("src/hw/accel/futhark_kernels.c");
+    const futhark_gpu_c = b.path("src/hw/accel/main_gpu.c");
     const futhark_include = b.path("src/hw/accel");
 
     const main_exe = b.addExecutable(.{
@@ -62,6 +63,7 @@ pub fn build(b: *std.Build) void {
         });
         distributed_futhark_exe.linkLibC();
         distributed_futhark_exe.addCSourceFile(.{ .file = futhark_c, .flags = &.{"-O2"} });
+        distributed_futhark_exe.addCSourceFile(.{ .file = futhark_gpu_c, .flags = &.{"-O2"} });
         distributed_futhark_exe.addIncludePath(futhark_include);
         distributed_futhark_exe.root_module.addOptions("build_options", build_options);
         b.installArtifact(distributed_futhark_exe);
