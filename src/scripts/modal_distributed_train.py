@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import modal
 
 APP_NAME = "jaide-v40-distributed-training"
-GPU_SPEC = "B200:8"
+GPU_SPEC = "B200:1"
 DATA_VOLUME_NAME = "jaide-training-data"
 CHECKPOINT_VOLUME_NAME = "jaide-checkpoints"
 
@@ -23,11 +23,11 @@ DATASET_METADATA_FILE = DATASET_DIR / "metadata.json"
 
 BINARY_PATH = PROJECT_MOUNT_PATH / "zig-out" / "bin" / "jaide-distributed-futhark"
 
-CPU_REQUEST = 64.0
-CPU_LIMIT = 80.0
-MEMORY_REQUEST_MB = 262144
-MEMORY_LIMIT_MB = 262144
-EPHEMERAL_DISK_MB = 3145728
+CPU_REQUEST = 8.0
+CPU_LIMIT = 16.0
+MEMORY_REQUEST_MB = 65536
+MEMORY_LIMIT_MB = 131072
+EPHEMERAL_DISK_MB = 524288
 TIMEOUT_SECONDS = 86400
 
 LOCAL_PROJECT_DIR = (Path(__file__).resolve().parent / "../..").resolve()
