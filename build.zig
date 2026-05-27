@@ -65,6 +65,13 @@ pub fn build(b: *std.Build) void {
         distributed_futhark_exe.addCSourceFile(.{ .file = futhark_c, .flags = &.{"-O2"} });
         distributed_futhark_exe.addCSourceFile(.{ .file = futhark_gpu_c, .flags = &.{"-O2"} });
         distributed_futhark_exe.addIncludePath(futhark_include);
+        distributed_futhark_exe.addIncludePath(.{ .cwd_relative = "/usr/local/cuda/include" });
+        distributed_futhark_exe.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64" });
+        distributed_futhark_exe.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64/stubs" });
+        distributed_futhark_exe.linkSystemLibrary("cuda");
+        distributed_futhark_exe.linkSystemLibrary("cudart");
+        distributed_futhark_exe.linkSystemLibrary("nvrtc");
+        distributed_futhark_exe.linkSystemLibrary("nccl");
         distributed_futhark_exe.root_module.addOptions("build_options", build_options);
         b.installArtifact(distributed_futhark_exe);
 

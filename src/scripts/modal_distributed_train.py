@@ -52,7 +52,7 @@ jaide_image = (
     .entrypoint([])
     .run_commands(
         "DEBIAN_FRONTEND=noninteractive apt-get update",
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages git curl xz-utils build-essential wget ca-certificates",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages git curl xz-utils build-essential wget ca-certificates libnccl2 libnccl-dev",
         "rm -rf /var/lib/apt/lists/*",
     )
     .pip_install("pyarrow", "requests", "zstandard", "datasets", "huggingface_hub", "hf_xet")

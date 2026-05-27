@@ -199,7 +199,6 @@ pub const MGT = struct {
     }
 
     fn emitToken(self: *const MGT, tid: u32, byte_pos: usize, out_tokens: *std.ArrayList(u32), out_anchors: ?*std.ArrayList(usize)) !void {
-        _ = self;
         try out_tokens.append(tid);
         if (out_anchors) |anchors_out| {
             if (self.id_to_token.get(tid)) |token_str| {
@@ -889,7 +888,7 @@ pub const MGT = struct {
         }
     }
 
-    pub fn unknownReplacement(self: *MGT, context: []const u8) u32 {
+    pub fn unknownReplacement(self: *const MGT, context: []const u8) u32 {
         _ = self;
         _ = context;
         return SPECIAL_TOKENS.UNK;

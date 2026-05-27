@@ -468,7 +468,7 @@ pub const DistributedTrainerFuthark = struct {
     }
 
     pub fn trainStepFuthark(self: *DistributedTrainerFuthark, batch: [][]const u8) !f32 {
-        var local_active_f: f32 = if (batch.len > 0) 1.0 else 0.0;
+        const local_active_f: f32 = if (batch.len > 0) 1.0 else 0.0;
         if (self.coordinator.world_size > 1) {
             const active_count = try self.allReduceScalarF32(local_active_f);
             if (active_count == 0.0) return 0.0;
