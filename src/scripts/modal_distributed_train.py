@@ -135,6 +135,11 @@ def _extract_text_from_row(row: Any) -> str:
     return ""
 
 
+DATASET_NAME = "HuggingFaceFW/finephrase"
+DATASET_CONFIG = "faq"
+DATASET_MAX_SAMPLES = 100_000
+
+
 def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     from datasets import load_dataset
 
@@ -156,7 +161,7 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     if tmp_file.exists():
         tmp_file.unlink()
 
-    ds = load_dataset("HuggingFaceFW/finephrase", "all", split="train")
+    ds = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train", streaming=True)
 
     line_count = 0
     with open(tmp_file, "w", encoding="utf-8") as f_out:
@@ -165,6 +170,8 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
             if text and len(text) > 20:
                 f_out.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
                 line_count += 1
+                if line_count >= DATASET_MAX_SAMPLES:
+                    break
 
     if line_count <= 0:
         if tmp_file.exists():
