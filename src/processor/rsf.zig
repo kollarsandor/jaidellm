@@ -145,8 +145,6 @@ const LayerCore = struct {
     clip_max: f32,
     grad_mean: bool,
     rwlock: Thread.RwLock,
-    scratch_scale: []f32,
-    scratch_trans: []f32,
 
     fn initOwned(allocator: Allocator, dim: usize, config: RSFLayerConfig) !LayerCore {
         if (dim == 0) return error.InvalidDimension;
@@ -178,11 +176,6 @@ const LayerCore = struct {
         var t_b = try Tensor.zeros(allocator, &bias_shape);
         errdefer t_b.deinit();
 
-        const scratch_s = try allocator.alloc(f32, dim);
-        errdefer allocator.free(scratch_s);
-        const scratch_t = try allocator.alloc(f32, dim);
-        errdefer allocator.free(scratch_t);
-
         return LayerCore{
             .s_weight = s_w,
             .t_weight = t_w,
@@ -198,14 +191,10 @@ const LayerCore = struct {
             .clip_max = config.clip_max,
             .grad_mean = config.grad_mean,
             .rwlock = .{},
-            .scratch_scale = scratch_s,
-            .scratch_trans = scratch_t,
         };
     }
 
     fn deinitOwned(self: *LayerCore) void {
-        self.allocator.free(self.scratch_scale);
-        self.allocator.free(self.scratch_trans);
         self.s_weight.deinit();
         self.t_weight.deinit();
         self.s_bias.deinit();
@@ -302,12 +291,9 @@ const LayerCore = struct {
         }
     }
 
-    fn forwardInPlace(self: *const LayerCore, x1: *Tensor, x2: *Tensor) !void {
+    fn forwardInPlace(self: *const LayerCore, x1: *Tensor, x2: *Tensor, scale: []f32, trans: []f32) !void {
         if (tensorsOverlap(x1, x2)) return error.AliasedBuffers;
         const batch_size = try self.validatePair(x1, x2);
-
-        const scale = self.scratch_scale;
-        const trans = self.scratch_trans;
 
         var b: usize = 0;
         while (b < batch_size) : (b += 1) {
@@ -326,12 +312,9 @@ const LayerCore = struct {
         }
     }
 
-    fn inverseInPlace(self: *const LayerCore, y1: *Tensor, y2: *Tensor) !void {
+    fn inverseInPlace(self: *const LayerCore, y1: *Tensor, y2: *Tensor, scale: []f32, trans: []f32) !void {
         if (tensorsOverlap(y1, y2)) return error.AliasedBuffers;
         const batch_size = try self.validatePair(y1, y2);
-
-        const trans = self.scratch_trans;
-        const scale = self.scratch_scale;
 
         var b: usize = 0;
         while (b < batch_size) : (b += 1) {
@@ -638,7 +621,12 @@ pub const RSFLayer = struct {
         defer releaseLayerCore(id);
         core.rwlock.lockShared();
         defer core.rwlock.unlockShared();
-        try core.forwardInPlace(x1, x2);
+        const allocator = scratchAllocator();
+        const scale = try allocator.alloc(f32, core.dim);
+        defer allocator.free(scale);
+        const trans = try allocator.alloc(f32, core.dim);
+        defer allocator.free(trans);
+        try core.forwardInPlace(x1, x2, scale, trans);
     }
 
     pub fn inverse(self: *const RSFLayer, y1: *Tensor, y2: *Tensor) !void {
@@ -647,7 +635,12 @@ pub const RSFLayer = struct {
         defer releaseLayerCore(id);
         core.rwlock.lockShared();
         defer core.rwlock.unlockShared();
-        try core.inverseInPlace(y1, y2);
+        const allocator = scratchAllocator();
+        const scale = try allocator.alloc(f32, core.dim);
+        defer allocator.free(scale);
+        const trans = try allocator.alloc(f32, core.dim);
+        defer allocator.free(trans);
+        try core.inverseInPlace(y1, y2, scale, trans);
     }
 
     pub fn verifyInvertible(self: *const RSFLayer, x1: *const Tensor, x2: *const Tensor, abs_tol: f32, rel_tol: f32) !bool {
@@ -664,8 +657,12 @@ pub const RSFLayer = struct {
         var fx2 = try tensorClone(allocator, x2);
         defer fx2.deinit();
 
-        try core.forwardInPlace(&fx1, &fx2);
-        try core.inverseInPlace(&fx1, &fx2);
+        const scale = try allocator.alloc(f32, core.dim);
+        defer allocator.free(scale);
+        const trans = try allocator.alloc(f32, core.dim);
+        defer allocator.free(trans);
+        try core.forwardInPlace(&fx1, &fx2, scale, trans);
+        try core.inverseInPlace(&fx1, &fx2, scale, trans);
 
         const ok1 = try tensorAllCloseEq(x1, &fx1, abs_tol, rel_tol);
         if (!ok1) return false;
@@ -1598,11 +1595,6 @@ pub const RSF = struct {
             hashTensorDataVersion4(&hasher, &s_b_new);
             hashTensorDataVersion4(&hasher, &t_b_new);
 
-            const load_scratch_s = try allocator.alloc(f32, dim);
-            errdefer allocator.free(load_scratch_s);
-            const load_scratch_t = try allocator.alloc(f32, dim);
-            errdefer allocator.free(load_scratch_t);
-
             core.layers[i] = .{
                 .s_weight = s_w_new,
                 .t_weight = t_w_new,
@@ -1618,8 +1610,6 @@ pub const RSF = struct {
                 .clip_max = layer_clip_max,
                 .grad_mean = layer_grad_mean,
                 .rwlock = .{},
-                .scratch_scale = load_scratch_s,
-                .scratch_trans = load_scratch_t,
             };
             initialized += 1;
         }
