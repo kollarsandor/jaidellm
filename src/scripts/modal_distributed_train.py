@@ -156,7 +156,7 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     if tmp_file.exists():
         tmp_file.unlink()
 
-    ds = load_dataset("HuggingFaceFW/finephrase", split="train")
+    ds = load_dataset("HuggingFaceFW/finephrase", "all", split="train")
 
     line_count = 0
     with open(tmp_file, "w", encoding="utf-8") as f_out:
