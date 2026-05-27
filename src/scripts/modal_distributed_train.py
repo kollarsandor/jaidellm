@@ -58,13 +58,13 @@ jaide_image = (
     .pip_install("pyarrow", "requests", "zstandard", "datasets", "huggingface_hub", "hf_xet")
     .run_commands(
         "mkdir -p /opt",
-        "curl -sL https://ziglang.org/download/0.14.1/zig-linux-x86_64-0.14.1.tar.xz | tar -xJ -C /opt",
-        "ln -sf /opt/zig-linux-x86_64-0.14.1/zig /usr/local/bin/zig",
+        "curl -sL https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz | tar -xJ -C /opt",
+        "ln -sf /opt/zig-x86_64-linux-0.14.1/zig /usr/local/bin/zig",
         "zig version",
     )
     .env(
         {
-            "PATH": "/opt/zig-linux-x86_64-0.14.1:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PATH": "/opt/zig-x86_64-linux-0.14.1:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HF_HOME": "/data/hf_home",
             "HF_DATASETS_CACHE": "/data/hf_datasets_cache",
             "HF_XET_HIGH_PERFORMANCE": "1",
