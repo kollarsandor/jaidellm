@@ -145,6 +145,8 @@ const LayerCore = struct {
     clip_max: f32,
     grad_mean: bool,
     rwlock: Thread.RwLock,
+    scratch_scale: []f32,
+    scratch_trans: []f32,
 
     fn initOwned(allocator: Allocator, dim: usize, config: RSFLayerConfig) !LayerCore {
         if (dim == 0) return error.InvalidDimension;
@@ -176,6 +178,11 @@ const LayerCore = struct {
         var t_b = try Tensor.zeros(allocator, &bias_shape);
         errdefer t_b.deinit();
 
+        const scratch_s = try allocator.alloc(f32, dim);
+        errdefer allocator.free(scratch_s);
+        const scratch_t = try allocator.alloc(f32, dim);
+        errdefer allocator.free(scratch_t);
+
         return LayerCore{
             .s_weight = s_w,
             .t_weight = t_w,
@@ -191,10 +198,14 @@ const LayerCore = struct {
             .clip_max = config.clip_max,
             .grad_mean = config.grad_mean,
             .rwlock = .{},
+            .scratch_scale = scratch_s,
+            .scratch_trans = scratch_t,
         };
     }
 
     fn deinitOwned(self: *LayerCore) void {
+        self.allocator.free(self.scratch_scale);
+        self.allocator.free(self.scratch_trans);
         self.s_weight.deinit();
         self.t_weight.deinit();
         self.s_bias.deinit();
@@ -294,13 +305,9 @@ const LayerCore = struct {
     fn forwardInPlace(self: *const LayerCore, x1: *Tensor, x2: *Tensor) !void {
         if (tensorsOverlap(x1, x2)) return error.AliasedBuffers;
         const batch_size = try self.validatePair(x1, x2);
-        const allocator = scratchAllocator();
 
-        const scale = try allocator.alloc(f32, self.dim);
-        defer allocator.free(scale);
-
-        const trans = try allocator.alloc(f32, self.dim);
-        defer allocator.free(trans);
+        const scale = self.scratch_scale;
+        const trans = self.scratch_trans;
 
         var b: usize = 0;
         while (b < batch_size) : (b += 1) {
@@ -322,13 +329,9 @@ const LayerCore = struct {
     fn inverseInPlace(self: *const LayerCore, y1: *Tensor, y2: *Tensor) !void {
         if (tensorsOverlap(y1, y2)) return error.AliasedBuffers;
         const batch_size = try self.validatePair(y1, y2);
-        const allocator = scratchAllocator();
 
-        const trans = try allocator.alloc(f32, self.dim);
-        defer allocator.free(trans);
-
-        const scale = try allocator.alloc(f32, self.dim);
-        defer allocator.free(scale);
+        const trans = self.scratch_trans;
+        const scale = self.scratch_scale;
 
         var b: usize = 0;
         while (b < batch_size) : (b += 1) {
@@ -869,7 +872,7 @@ fn inverseOnCore(core: *const RSFCore, y: *Tensor) !void {
     }
 }
 
-fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tensor, grad_input_out: *Tensor) !void {
+fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tensor, output: *const Tensor, grad_input_out: *Tensor) !void {
     try validateTensor2D(grad_output);
     try validateTensor2D(input);
     try validateTensor2D(grad_input_out);
@@ -896,8 +899,6 @@ fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tens
 
     const allocator = scratchAllocator();
 
-    const row_buf = try allocator.alloc(f32, dim2);
-    defer allocator.free(row_buf);
     const y1_row = try allocator.alloc(f32, dim);
     defer allocator.free(y1_row);
     const y2_row = try allocator.alloc(f32, dim);
@@ -918,26 +919,10 @@ fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tens
     defer allocator.free(dy1_total);
     const ds = try allocator.alloc(f32, dim);
     defer allocator.free(ds);
-    const scale_tmp = try allocator.alloc(f32, dim);
-    defer allocator.free(scale_tmp);
-    const trans_tmp = try allocator.alloc(f32, dim);
-    defer allocator.free(trans_tmp);
-
     var b: usize = 0;
     while (b < batch_size) : (b += 1) {
-        @memcpy(row_buf, input.data[b * dim2 .. b * dim2 + dim2]);
-        for (core.layers) |*layer| {
-            const r_x1 = row_buf[0..dim];
-            const r_x2 = row_buf[dim..dim2];
-            layer.computeScaleRow(r_x2, scale_tmp);
-            var d: usize = 0;
-            while (d < dim) : (d += 1) r_x1[d] *= scale_tmp[d];
-            layer.computeTranslationRow(r_x1, trans_tmp);
-            d = 0;
-            while (d < dim) : (d += 1) r_x2[d] += trans_tmp[d];
-        }
-        @memcpy(y1_row, row_buf[0..dim]);
-        @memcpy(y2_row, row_buf[dim..dim2]);
+        @memcpy(y1_row, output.data[b * dim2 .. b * dim2 + dim]);
+        @memcpy(y2_row, output.data[b * dim2 + dim .. b * dim2 + dim2]);
 
         @memcpy(dy1_row, grad_output.data[b * dim2 .. b * dim2 + dim]);
         @memcpy(dy2_row, grad_output.data[b * dim2 + dim .. b * dim2 + dim2]);
@@ -1422,13 +1407,13 @@ pub const RSF = struct {
         try inverseOnCore(core, y);
     }
 
-    pub fn backward(self: *RSF, grad_output: *const Tensor, input: *const Tensor, grad_input_out: *Tensor) !void {
+    pub fn backward(self: *RSF, grad_output: *const Tensor, input: *const Tensor, output: *const Tensor, grad_input_out: *Tensor) !void {
         const id = try bindModelHandle(self);
         const core = try acquireModelCore(id);
         defer releaseModelCore(id);
         core.rwlock.lock();
         defer core.rwlock.unlock();
-        try backwardOnCore(core, grad_output, input, grad_input_out);
+        try backwardOnCore(core, grad_output, input, output, grad_input_out);
     }
 
     pub fn notifyWeightsChanged(self: *RSF) !void {
@@ -1613,6 +1598,11 @@ pub const RSF = struct {
             hashTensorDataVersion4(&hasher, &s_b_new);
             hashTensorDataVersion4(&hasher, &t_b_new);
 
+            const load_scratch_s = try allocator.alloc(f32, dim);
+            errdefer allocator.free(load_scratch_s);
+            const load_scratch_t = try allocator.alloc(f32, dim);
+            errdefer allocator.free(load_scratch_t);
+
             core.layers[i] = .{
                 .s_weight = s_w_new,
                 .t_weight = t_w_new,
@@ -1628,6 +1618,8 @@ pub const RSF = struct {
                 .clip_max = layer_clip_max,
                 .grad_mean = layer_grad_mean,
                 .rwlock = .{},
+                .scratch_scale = load_scratch_s,
+                .scratch_trans = load_scratch_t,
             };
             initialized += 1;
         }

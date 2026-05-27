@@ -413,6 +413,13 @@ pub const Tensor = struct {
     pub fn fill(self: *Tensor, value: f32) !void {
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] = value;
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -446,6 +453,13 @@ pub const Tensor = struct {
         if (!self.shape.equals(&other.shape)) return Error.ShapeMismatch;
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and other.shape.isContiguous() and self.offset == 0 and other.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] += other.data.ptr[i];
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -481,6 +495,13 @@ pub const Tensor = struct {
         if (!self.shape.equals(&other.shape)) return Error.ShapeMismatch;
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and other.shape.isContiguous() and self.offset == 0 and other.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] -= other.data.ptr[i];
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -516,6 +537,13 @@ pub const Tensor = struct {
         if (!self.shape.equals(&other.shape)) return Error.ShapeMismatch;
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and other.shape.isContiguous() and self.offset == 0 and other.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] *= other.data.ptr[i];
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -551,6 +579,14 @@ pub const Tensor = struct {
         if (!self.shape.equals(&other.shape)) return Error.ShapeMismatch;
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and other.shape.isContiguous() and self.offset == 0 and other.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                if (other.data.ptr[i] == 0.0) return Error.DivideByZero;
+                self.data.ptr[i] /= other.data.ptr[i];
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -586,6 +622,13 @@ pub const Tensor = struct {
     pub fn addScalar(self: *Tensor, scalar: f32) !void {
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] += scalar;
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -618,6 +661,13 @@ pub const Tensor = struct {
     pub fn subScalar(self: *Tensor, scalar: f32) !void {
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] -= scalar;
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -650,6 +700,13 @@ pub const Tensor = struct {
     pub fn mulScalar(self: *Tensor, scalar: f32) !void {
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] *= scalar;
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -683,6 +740,13 @@ pub const Tensor = struct {
         if (scalar == 0.0) return Error.DivideByZero;
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] /= scalar;
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -715,6 +779,13 @@ pub const Tensor = struct {
     pub fn exp(self: *Tensor) !void {
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] = @exp(self.data.ptr[i]);
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -747,6 +818,14 @@ pub const Tensor = struct {
     pub fn log(self: *Tensor) !void {
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                const val = self.data.ptr[i];
+                self.data.ptr[i] = if (val > 0.0) @log(val) else -math.inf(f32);
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -780,6 +859,13 @@ pub const Tensor = struct {
     pub fn sin(self: *Tensor) !void {
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] = @sin(self.data.ptr[i]);
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);
@@ -812,6 +898,13 @@ pub const Tensor = struct {
     pub fn cos(self: *Tensor) !void {
         try ensureWritable(self);
         const total_size = try self.shape.totalSize();
+        if (self.shape.isContiguous() and self.offset == 0) {
+            var i: usize = 0;
+            while (i < total_size) : (i += 1) {
+                self.data.ptr[i] = @cos(self.data.ptr[i]);
+            }
+            return;
+        }
         var indices = try self.data.allocator.alloc(usize, self.shape.dims.len);
         defer self.data.allocator.free(indices);
         @memset(indices, 0);

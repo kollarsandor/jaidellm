@@ -29,16 +29,14 @@ fn quantizeValue(value: f32, precision: Precision) f32 {
             const clamped = std.math.clamp(value, -6.0, 6.0);
             const abs_v = if (clamped < 0) -clamped else clamped;
             const sign: f32 = if (clamped < 0) -1.0 else 1.0;
-            const levels = [_]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 };
-            var best: f32 = levels[0];
-            var best_dist: f32 = abs_v;
-            for (levels[1..]) |lv| {
-                const d = if (abs_v > lv) abs_v - lv else lv - abs_v;
-                if (d < best_dist) {
-                    best_dist = d;
-                    best = lv;
-                }
-            }
+            const best: f32 = if (abs_v < 0.25) 0.0
+                else if (abs_v < 0.75) 0.5
+                else if (abs_v < 1.25) 1.0
+                else if (abs_v < 1.75) 1.5
+                else if (abs_v < 2.5) 2.0
+                else if (abs_v < 3.5) 3.0
+                else if (abs_v < 5.0) 4.0
+                else 6.0;
             break :blk sign * best;
         },
         .fp8 => blk: {
@@ -356,14 +354,13 @@ pub const Tensor = struct {
 
         var i: usize = 0;
         while (i < m) : (i += 1) {
-            var j: usize = 0;
-            while (j < n) : (j += 1) {
-                var sum: f64 = 0.0;
-                var p: usize = 0;
-                while (p < k) : (p += 1) {
-                    sum += @as(f64, A.data[i * k + p]) * @as(f64, B.data[p * n + j]);
+            var p: usize = 0;
+            while (p < k) : (p += 1) {
+                const a_val: f64 = @as(f64, A.data[i * k + p]);
+                var j: usize = 0;
+                while (j < n) : (j += 1) {
+                    self.data[i * n + j] += @floatCast(a_val * @as(f64, B.data[p * n + j]));
                 }
-                self.data[i * n + j] = @floatCast(sum);
             }
         }
     }
@@ -613,7 +610,7 @@ pub const KFACBlock = struct {
 };
 
 pub const SpectralNormalizerConfig = struct {
-    power_iterations: usize = 20,
+    power_iterations: usize = 5,
     eps: f32 = 1e-12,
     max_singular_value: f32 = 1.0,
 };
@@ -661,19 +658,21 @@ pub const SpectralNormalizer = struct {
 pub const GradientFlowConfig = struct {
     gradient_clip_norm: f32 = 1.0,
     use_normalized_gradient_flow: bool = true,
-    spectral_power_iterations: usize = 20,
+    spectral_power_iterations: usize = 5,
 };
 
 pub const GradientFlowController = struct {
     spectral_normalizer: SpectralNormalizer,
     gradient_clip_norm: f32,
     use_normalized_gradient_flow: bool,
+    step_counter: usize,
 
     pub fn init() GradientFlowController {
         return GradientFlowController{
-            .spectral_normalizer = SpectralNormalizer.init(20),
+            .spectral_normalizer = SpectralNormalizer.init(5),
             .gradient_clip_norm = 1.0,
             .use_normalized_gradient_flow = true,
+            .step_counter = 0,
         };
     }
 
@@ -682,12 +681,16 @@ pub const GradientFlowController = struct {
             .spectral_normalizer = SpectralNormalizer.init(config.spectral_power_iterations),
             .gradient_clip_norm = config.gradient_clip_norm,
             .use_normalized_gradient_flow = config.use_normalized_gradient_flow,
+            .step_counter = 0,
         };
     }
 
     pub fn stabilizeGradients(self: *GradientFlowController, gradients: []*Tensor, weights: []*Tensor, allocator: Allocator) !void {
-        for (weights) |w| {
-            try self.spectral_normalizer.normalizeWeights(w, allocator);
+        self.step_counter += 1;
+        if (self.step_counter % 10 == 0) {
+            for (weights) |w| {
+                try self.spectral_normalizer.normalizeWeights(w, allocator);
+            }
         }
 
         if (self.use_normalized_gradient_flow) {
