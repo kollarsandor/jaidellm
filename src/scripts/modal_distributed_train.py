@@ -189,7 +189,7 @@ def _build_zig_gpu(project_dir: str) -> None:
     if BINARY_PATH.is_file():
         return
     rc, out, err = _run_checked(
-        ["zig", "build", "-Dgpu=true", "-Doptimize=ReleaseFast"],
+        ["zig", "build", "distributed-futhark", "-Dgpu=true", "-Doptimize=ReleaseFast"],
         cwd=project_dir,
     )
     if rc != 0:

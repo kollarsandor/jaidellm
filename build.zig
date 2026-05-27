@@ -68,6 +68,10 @@ pub fn build(b: *std.Build) void {
         distributed_futhark_exe.root_module.addOptions("build_options", build_options);
         b.installArtifact(distributed_futhark_exe);
 
+        const distributed_futhark_install = b.addInstallArtifact(distributed_futhark_exe, .{});
+        const distributed_futhark_step = b.step("distributed-futhark", "Build only the Futhark-accelerated distributed trainer");
+        distributed_futhark_step.dependOn(&distributed_futhark_install.step);
+
         const gpu_exe = b.addExecutable(.{
             .name = "jaide-gpu",
             .root_source_file = b.path("src/main_gpu.zig"),
