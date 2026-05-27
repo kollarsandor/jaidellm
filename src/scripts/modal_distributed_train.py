@@ -22,6 +22,8 @@ DATASET_FILE = DATASET_DIR / "train.jsonl"
 DATASET_METADATA_FILE = DATASET_DIR / "metadata.json"
 
 BINARY_PATH = PROJECT_MOUNT_PATH / "zig-out" / "bin" / "jaide-distributed-futhark"
+BINARY_CACHE_PATH = CHECKPOINT_MOUNT_PATH / "jaide-distributed-futhark"
+BUILD_VERSION_FILE = CHECKPOINT_MOUNT_PATH / "build_version.txt"
 
 CPU_REQUEST = 64.0
 CPU_LIMIT = 80.0
@@ -185,8 +187,8 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     return str(DATASET_FILE), size, line_count
 
 
-def _build_zig_gpu(project_dir: str) -> None:
-    if BINARY_PATH.is_file():
+def _build_zig_gpu(project_dir: str, force: bool = False) -> None:
+    if BINARY_PATH.is_file() and not force:
         return
     rc, out, err = _run_checked(
         ["zig", "build", "distributed-futhark", "-Dgpu=true", "-Doptimize=ReleaseFast"],
@@ -197,6 +199,55 @@ def _build_zig_gpu(project_dir: str) -> None:
     if not BINARY_PATH.is_file():
         raise FileNotFoundError(f"GPU binary not found at {BINARY_PATH}")
     BINARY_PATH.chmod(0o755)
+
+
+def _ensure_binary_in_cache(volume: modal.Volume) -> str:
+    """Build the GPU binary on a CPU container, then cache it in checkpoint volume.
+
+    Returns the build_version (git-like hash of source) of the cached binary.
+    """
+    import hashlib
+
+    def _source_hash() -> str:
+        h = hashlib.sha256()
+        for sub in ("src", "build.zig"):
+            base = PROJECT_MOUNT_PATH / sub
+            if base.is_file():
+                with open(base, "rb") as f:
+                    h.update(f.read())
+            else:
+                for p in sorted(base.rglob("*")):
+                    if not p.is_file():
+                        continue
+                    if any(part in {".zig-cache", "zig-out"} for part in p.parts):
+                        continue
+                    with open(p, "rb") as f:
+                        h.update(p.name.encode())
+                        h.update(f.read())
+        return h.hexdigest()
+
+    expected_version = _source_hash()
+    cached_version = ""
+    if BUILD_VERSION_FILE.is_file():
+        try:
+            cached_version = BUILD_VERSION_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            cached_version = ""
+
+    if BINARY_CACHE_PATH.is_file() and cached_version == expected_version:
+        print(f"Reusing cached GPU binary ({expected_version[:12]})")
+        return expected_version
+
+    print(f"Building GPU binary (version {expected_version[:12]})...")
+    os.chdir(str(PROJECT_MOUNT_PATH))
+    _build_zig_gpu(str(PROJECT_MOUNT_PATH), force=True)
+    _ensure_dir(CHECKPOINT_MOUNT_PATH)
+    shutil.copy2(str(BINARY_PATH), str(BINARY_CACHE_PATH))
+    BINARY_CACHE_PATH.chmod(0o755)
+    BUILD_VERSION_FILE.write_text(expected_version, encoding="utf-8")
+    volume.commit()
+    print(f"Cached GPU binary at {BINARY_CACHE_PATH}")
+    return expected_version
 
 
 def _detect_gpus() -> Tuple[int, str]:
@@ -281,7 +332,13 @@ def train_rank(
     os.chdir(str(PROJECT_MOUNT_PATH))
     _ensure_dir(CHECKPOINT_MOUNT_PATH)
 
-    _build_zig_gpu(str(PROJECT_MOUNT_PATH))
+    if not BINARY_CACHE_PATH.is_file():
+        raise FileNotFoundError(
+            f"Pre-built GPU binary missing from {BINARY_CACHE_PATH}; orchestrator must build first"
+        )
+    local_binary = Path("/tmp/jaide-distributed-futhark")
+    shutil.copy2(str(BINARY_CACHE_PATH), str(local_binary))
+    local_binary.chmod(0o755)
 
     env = os.environ.copy()
     env["WORLD_SIZE"] = str(world_size)
@@ -309,7 +366,7 @@ def train_rank(
     with open(stdout_path, "w", encoding="utf-8", errors="replace") as stdout_file, open(stderr_path, "w", encoding="utf-8", errors="replace") as stderr_file:
         try:
             proc = subprocess.Popen(
-                [str(BINARY_PATH)],
+                [str(local_binary)],
                 stdout=stdout_file,
                 stderr=stderr_file,
                 text=True,
@@ -354,8 +411,9 @@ def train_rank(
 
 @app.function(
     image=jaide_image,
-    cpu=8.0,
-    memory=16384,
+    cpu=(8.0, 16.0),
+    memory=32768,
+    ephemeral_disk=20480,
     timeout=TIMEOUT_SECONDS,
     volumes={
         str(DATA_MOUNT_PATH): data_volume,
@@ -375,6 +433,9 @@ def orchestrate_training(
     dataset_path, dataset_size, sample_count = download_finephrase_to_jsonl(data_volume)
     if sample_count <= 0:
         raise RuntimeError("Dataset contains zero samples")
+
+    build_version = _ensure_binary_in_cache(checkpoint_volume)
+    print(f"GPU binary ready (build_version={build_version[:12]})")
 
     master_addr = "localhost"
     master_port = "29500"
