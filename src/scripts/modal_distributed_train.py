@@ -413,7 +413,7 @@ def train_rank(
     image=jaide_image,
     cpu=(8.0, 16.0),
     memory=32768,
-    ephemeral_disk=20480,
+    ephemeral_disk=524288,
     timeout=TIMEOUT_SECONDS,
     volumes={
         str(DATA_MOUNT_PATH): data_volume,
