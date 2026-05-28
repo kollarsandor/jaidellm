@@ -240,17 +240,18 @@ pub const DistributedTrainerFuthark = struct {
             self.allocator.free(rows);
         }
 
-        if (rows.len != self.model_dim) {
+        const half: usize = self.model_dim / 2;
+        if (rows.len != half) {
             return error.InvalidWeightsShape;
         }
 
-        const weight_count = try std.math.mul(usize, self.model_dim, self.model_dim);
+        const weight_count = try std.math.mul(usize, half, half);
         var flat = try self.allocator.alloc(f16, weight_count);
         errdefer self.allocator.free(flat);
 
         var idx: usize = 0;
         for (rows) |row| {
-            if (row.len != self.model_dim) {
+            if (row.len != half) {
                 return error.InvalidWeightsShape;
             }
             for (row) |value| {
@@ -269,7 +270,8 @@ pub const DistributedTrainerFuthark = struct {
     fn readBiasFlat(self: *DistributedTrainerFuthark, bias: anytype) ![]f16 {
         const values = try bias.values1D(&self.accelerator.ctx, self.allocator);
         errdefer self.allocator.free(values);
-        if (values.len != self.model_dim) {
+        const half: usize = self.model_dim / 2;
+        if (values.len != half) {
             self.allocator.free(values);
             return error.InvalidBiasShape;
         }
