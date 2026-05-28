@@ -515,8 +515,8 @@ pub const RSFAccelerator = struct {
             .velocity_sb = velocity_sb,
             .velocity_tb = velocity_tb,
             .model_dim = model_dim,
-            .clip_min = @as(f16, -5.0),
-            .clip_max = @as(f16, 5.0),
+            .clip_min = @as(f16, -2.0),
+            .clip_max = @as(f16, 2.0),
             .initialized = true,
         };
     }
