@@ -8,6 +8,7 @@ pub const struct_futhark_f32_2d = opaque {};
 pub const struct_futhark_f32_3d = opaque {};
 pub const struct_futhark_u64_1d = opaque {};
 pub const struct_futhark_i64_1d = opaque {};
+pub const struct_futhark_opaque_tup9 = opaque {};
 
 pub extern "c" fn futhark_context_config_new() ?*struct_futhark_context_config;
 pub extern "c" fn futhark_context_config_free(cfg: ?*struct_futhark_context_config) void;
@@ -21,6 +22,7 @@ pub extern "c" fn futhark_context_new(cfg: ?*struct_futhark_context_config) ?*st
 pub extern "c" fn futhark_context_free(ctx: ?*struct_futhark_context) void;
 pub extern "c" fn futhark_context_sync(ctx: ?*struct_futhark_context) c_int;
 pub extern "c" fn futhark_context_get_error(ctx: ?*struct_futhark_context) ?[*:0]const u8;
+pub extern "c" fn futhark_context_clear_caches(ctx: ?*struct_futhark_context) c_int;
 
 pub extern "c" fn futhark_new_f16_1d(ctx: ?*struct_futhark_context, data: ?[*]const u16, dim0: i64) ?*struct_futhark_f16_1d;
 pub extern "c" fn futhark_new_f16_2d(ctx: ?*struct_futhark_context, data: ?[*]const u16, dim0: i64, dim1: i64) ?*struct_futhark_f16_2d;
@@ -96,29 +98,80 @@ pub extern "c" fn futhark_entry_rsf_backward(
 
 pub extern "c" fn futhark_entry_scale_weights_inplace(ctx: ?*struct_futhark_context, out: ?*?*struct_futhark_f16_2d, weights: ?*struct_futhark_f16_2d, scale: u16) c_int;
 
+pub extern "c" fn futhark_free_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16(
+    ctx: ?*struct_futhark_context,
+    obj: ?*struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_0(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_2d,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_1(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_2d,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_2(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_1d,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_3(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_1d,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_4(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_2d,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_5(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_2d,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_6(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_1d,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_7(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_1d,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup9_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_f16_8(
+    ctx: ?*struct_futhark_context,
+    out: ?*u16,
+    obj: ?*const struct_futhark_opaque_tup9,
+) c_int;
+
 pub extern "c" fn futhark_entry_training_step(
     ctx: ?*struct_futhark_context,
-    new_weights_s: ?*?*struct_futhark_f16_2d,
-    new_weights_t: ?*?*struct_futhark_f16_2d,
-    new_s_bias: ?*?*struct_futhark_f16_1d,
-    new_t_bias: ?*?*struct_futhark_f16_1d,
-    new_velocity_s: ?*?*struct_futhark_f16_2d,
-    new_velocity_t: ?*?*struct_futhark_f16_2d,
-    new_velocity_sb: ?*?*struct_futhark_f16_1d,
-    new_velocity_tb: ?*?*struct_futhark_f16_1d,
-    loss: ?*u16,
-    inputs: ?*struct_futhark_f16_2d,
-    targets: ?*struct_futhark_f16_2d,
-    weights_s: ?*struct_futhark_f16_2d,
-    weights_t: ?*struct_futhark_f16_2d,
-    s_bias: ?*struct_futhark_f16_1d,
-    t_bias: ?*struct_futhark_f16_1d,
-    velocity_s: ?*struct_futhark_f16_2d,
-    velocity_t: ?*struct_futhark_f16_2d,
-    velocity_sb: ?*struct_futhark_f16_1d,
-    velocity_tb: ?*struct_futhark_f16_1d,
-    learning_rate: u16,
-    momentum: u16,
-    clip_min: u16,
-    clip_max: u16,
+    out: ?*?*struct_futhark_opaque_tup9,
+    in0_inputs: ?*const struct_futhark_f16_3d,
+    in1_targets: ?*const struct_futhark_f16_3d,
+    in2_weights_s: ?*const struct_futhark_f16_2d,
+    in3_weights_t: ?*const struct_futhark_f16_2d,
+    in4_s_bias: ?*const struct_futhark_f16_1d,
+    in5_t_bias: ?*const struct_futhark_f16_1d,
+    in6_velocity_s: ?*const struct_futhark_f16_2d,
+    in7_velocity_t: ?*const struct_futhark_f16_2d,
+    in8_velocity_sb: ?*const struct_futhark_f16_1d,
+    in9_velocity_tb: ?*const struct_futhark_f16_1d,
+    in10_lr: u16,
+    in11_momentum: u16,
+    in12_clip_min: u16,
+    in13_clip_max: u16,
 ) c_int;
