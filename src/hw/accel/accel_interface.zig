@@ -33,7 +33,7 @@ pub const FutharkContext = struct {
         const cfg = futhark.futhark_context_config_new();
         if (cfg == null) return AccelError.FutharkConfigFailed;
 
-        futhark.futhark_context_config_set_device(cfg, 0);
+        futhark.futhark_context_config_set_device(cfg, "");
         futhark.futhark_context_config_set_default_group_size(cfg, 256);
         futhark.futhark_context_config_set_default_num_groups(cfg, 128);
         futhark.futhark_context_config_set_default_tile_size(cfg, 32);
