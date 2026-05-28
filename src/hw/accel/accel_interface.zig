@@ -286,12 +286,8 @@ pub const FutharkArray2DF16 = struct {
         if (ctx.ctx == null) return AccelError.NullPointer;
         if (self.arr == null) return AccelError.NullPointer;
 
-        var dims: [2]i64 = undefined;
-        if (futhark.futhark_shape_f16_2d(ctx.ctx, self.arr, &dims) != 0) {
-            return AccelError.FutharkShapeFailed;
-        }
-        const rows = @as(usize, @intCast(dims[0]));
-        const cols = @as(usize, @intCast(dims[1]));
+        const rows = self.rows;
+        const cols = self.cols;
 
         if (rows == 0 or cols == 0) {
             return allocator.alloc([]f16, 0) catch return AccelError.AllocationFailed;
