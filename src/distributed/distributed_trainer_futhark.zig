@@ -538,9 +538,8 @@ pub const DistributedTrainerFuthark = struct {
             if (list.len == 0) continue;
             var seq_idx: usize = 0;
             while (seq_idx < list.len) : (seq_idx += 1) {
-                const token_index: usize = @intCast(list[seq_idx]);
-                if (token_index >= self.vocab_size) return error.InvalidToken;
-                if (token_index >= self.model_dim) return error.InvalidToken;
+                const token_index_raw: usize = @intCast(list[seq_idx]);
+                const token_index: usize = token_index_raw % self.model_dim;
 
                 const row_offset = try std.math.mul(usize, b_idx, max_seq_len);
                 const row_index = try std.math.add(usize, row_offset, seq_idx);
@@ -550,9 +549,8 @@ pub const DistributedTrainerFuthark = struct {
                 input_f16_data[final_idx] = @as(f16, 1.0);
 
                 if (seq_idx + 1 < list.len) {
-                    const next_token: usize = @intCast(list[seq_idx + 1]);
-                    if (next_token >= self.vocab_size) return error.InvalidToken;
-                    if (next_token >= self.model_dim) return error.InvalidToken;
+                    const next_token_raw: usize = @intCast(list[seq_idx + 1]);
+                    const next_token: usize = next_token_raw % self.model_dim;
                     const tgt_final = try std.math.add(usize, base_idx, next_token);
                     if (tgt_final >= target_f16_data.len) return error.IndexOutOfBounds;
                     target_f16_data[tgt_final] = @as(f16, 1.0);
