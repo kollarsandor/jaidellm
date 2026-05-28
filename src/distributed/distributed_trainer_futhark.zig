@@ -441,7 +441,10 @@ pub const DistributedTrainerFuthark = struct {
                 batch_start = batch_end;
             }
 
-            const loss = try self.trainStepFuthark(batch);
+            const loss = self.trainStepFuthark(batch) catch |err| {
+                std.debug.print("[Rank {d}] trainStepFuthark ERROR at step {d}: {}\n", .{ self.coordinator.rank, self.global_step, err });
+                return err;
+            };
             if (!std.math.isFinite(loss)) return error.InvalidLoss;
             if (batch.len > 0) {
                 total_loss += loss;

@@ -173,7 +173,10 @@ pub fn main() !void {
     while (epoch < num_epochs) : (epoch += 1) {
         const start_time = std.time.milliTimestamp();
 
-        const avg_loss = try trainer.trainEpoch(samples);
+        const avg_loss = trainer.trainEpoch(samples) catch |err| {
+            std.debug.print("[Rank {d}] trainEpoch ERROR (epoch={d}): {}\n", .{ rank, epoch + 1, err });
+            return err;
+        };
 
         const end_time = std.time.milliTimestamp();
         const elapsed = @as(f64, @floatFromInt(end_time - start_time)) / 1000.0;
