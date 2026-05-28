@@ -592,6 +592,12 @@ pub const RSFAccelerator = struct {
         );
 
         if (result != 0) {
+            const err_str = futhark.futhark_context_get_error(self.ctx.ctx);
+            if (err_str) |s| {
+                std.debug.print("[Futhark trainingStep error] {s}\n", .{std.mem.span(s)});
+            } else {
+                std.debug.print("[Futhark trainingStep error] (no error string, code={d})\n", .{result});
+            }
             return AccelError.FutharkTrainingStepFailed;
         }
 
