@@ -310,12 +310,11 @@ def _read_tail(path: Path, max_chars: int = 8000) -> str:
     },
 )
 def train_all_ranks(
-    world_size: int,
-    epochs: int,
-    model_dim: int,
-    num_layers: int,
-    local_batch_size: int,
-    dataset_path: str,
+    epochs: int = 20,
+    model_dim: int = 512,
+    num_layers: int = 16,
+    local_batch_size: int = 4,
+    world_size: int = 8,
 ) -> Dict[str, Any]:
     """Run all `world_size` ranks inside one B200+:8 container.
 
@@ -339,9 +338,18 @@ def train_all_ranks(
         )
     _log(f"detected {gpu_count} GPUs (expected {expected_gpus})")
 
+    dataset_path_s, dataset_size, sample_count = download_finephrase_to_jsonl(data_volume)
+    if sample_count <= 0:
+        raise RuntimeError("Dataset contains zero samples")
+    dataset_path = str(dataset_path_s)
+    _log(f"dataset {sample_count} samples, {dataset_size / 1e6:.2f} MB")
+
+    build_version = _ensure_binary_in_cache(checkpoint_volume)
+    _log(f"GPU binary ready (build_version={build_version[:12]})")
+
     if not BINARY_CACHE_PATH.is_file():
         raise FileNotFoundError(
-            f"Pre-built GPU binary missing from {BINARY_CACHE_PATH}; orchestrator must build first"
+            f"Pre-built GPU binary missing from {BINARY_CACHE_PATH}"
         )
     local_binary = Path("/tmp/jaide-distributed-futhark")
     shutil.copy2(str(BINARY_CACHE_PATH), str(local_binary))
@@ -468,58 +476,8 @@ def train_all_ranks(
             }
         )
 
-    return {
-        "results": rank_results,
-        "elapsed_seconds": elapsed,
-    }
-
-
-
-@app.function(
-    image=jaide_image,
-    cpu=(8.0, 16.0),
-    memory=32768,
-    ephemeral_disk=524288,
-    timeout=TIMEOUT_SECONDS,
-    volumes={
-        str(DATA_MOUNT_PATH): data_volume,
-        str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
-    },
-)
-def orchestrate_training(
-    epochs: int = 20,
-    model_dim: int = 512,
-    num_layers: int = 16,
-    local_batch_size: int = 4,
-    world_size: int = 8,
-) -> Dict[str, Any]:
-    data_volume.reload()
-    checkpoint_volume.reload()
-
-    dataset_path, dataset_size, sample_count = download_finephrase_to_jsonl(data_volume)
-    if sample_count <= 0:
-        raise RuntimeError("Dataset contains zero samples")
-
-    build_version = _ensure_binary_in_cache(checkpoint_volume)
-    print(f"GPU binary ready (build_version={build_version[:12]})")
-
-    print(f"Starting distributed training with {world_size} ranks (single container, intra-node NCCL P2P)")
-    print(f"Model: dim={model_dim}, layers={num_layers}, batch={local_batch_size}")
-    print(f"Dataset: {sample_count} samples, {dataset_size / 1e6:.2f} MB")
-    print(f"Epochs: {epochs}")
-
-    training_result = train_all_ranks.remote(
-        world_size=world_size,
-        epochs=epochs,
-        model_dim=model_dim,
-        num_layers=num_layers,
-        local_batch_size=local_batch_size,
-        dataset_path=dataset_path,
-    )
-    results = training_result.get("results", [])
-
-    successful_ranks = [r for r in results if int(r.get("return_code", -1)) == 0 and not r.get("timed_out", False)]
-    rank_0_result = next((r for r in results if r.get("rank") == 0), None)
+    successful_ranks = [r for r in rank_results if int(r.get("return_code", -1)) == 0 and not r.get("timed_out", False)]
+    rank_0_result = next((r for r in rank_results if r.get("rank") == 0), None)
 
     final_loss = rank_0_result.get("loss") if rank_0_result else 0.0
     completed_epochs = epochs if len(successful_ranks) == world_size else 0
@@ -532,7 +490,7 @@ def orchestrate_training(
             "total_epochs": epochs,
             "completed_epochs": completed_epochs,
             "final_loss": final_loss,
-            "dataset_path": str(dataset_path),
+            "dataset_path": dataset_path,
             "dataset_size_mb": float(dataset_size) / 1e6,
             "sample_count": sample_count,
             "gpu_config": f"{world_size}x NVIDIA B200",
@@ -540,10 +498,9 @@ def orchestrate_training(
             "num_layers": num_layers,
             "local_batch_size": local_batch_size,
             "world_size": world_size,
-            "rank_results": results,
+            "rank_results": rank_results,
         },
     )
-
     checkpoint_volume.commit()
 
     return {
@@ -557,8 +514,10 @@ def orchestrate_training(
         "model_dim": model_dim,
         "num_layers": num_layers,
         "successful_ranks": len(successful_ranks),
-        "rank_results": results,
+        "elapsed_seconds": elapsed,
+        "rank_results": rank_results,
     }
+
 
 
 @app.local_entrypoint()
@@ -569,7 +528,7 @@ def main(
     local_batch_size: int = 4,
     world_size: int = 8,
 ) -> None:
-    result = orchestrate_training.remote(
+    result = train_all_ranks.remote(
         epochs=epochs,
         model_dim=model_dim,
         num_layers=num_layers,
