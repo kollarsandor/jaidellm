@@ -326,8 +326,10 @@ pub const DistributedTrainerFuthark = struct {
         if (base.len != delta.len) {
             return error.InvalidWeightsShape;
         }
-        const expected_len = try std.math.mul(usize, self.model_dim, self.model_dim);
+        const half: usize = self.model_dim / 2;
+        const expected_len = try std.math.mul(usize, half, half);
         if (base.len != expected_len) {
+            std.debug.print("[Rank {d}] applyDelta: base.len={d}, expected half*half={d}, model_dim={d}\n", .{ self.coordinator.rank, base.len, expected_len, self.model_dim });
             return error.InvalidWeightsShape;
         }
 
@@ -340,8 +342,8 @@ pub const DistributedTrainerFuthark = struct {
         }
 
         switch (which) {
-            .s => try self.accelerator.setWeightsS(merged, self.model_dim, self.model_dim),
-            .t => try self.accelerator.setWeightsT(merged, self.model_dim, self.model_dim),
+            .s => try self.accelerator.setWeightsS(merged, half, half),
+            .t => try self.accelerator.setWeightsT(merged, half, half),
         }
     }
 
@@ -748,7 +750,8 @@ pub const DistributedTrainerFuthark = struct {
         self.momentum = saved_momentum;
         self.global_step = saved_global_step;
 
-        const weight_count = try std.math.mul(usize, self.model_dim, self.model_dim);
+        const half: usize = self.model_dim / 2;
+        const weight_count = try std.math.mul(usize, half, half);
 
         const s_weights = try self.allocator.alloc(f16, weight_count);
         defer self.allocator.free(s_weights);
@@ -766,10 +769,10 @@ pub const DistributedTrainerFuthark = struct {
             w.* = @floatCast(v);
         }
 
-        try self.accelerator.setWeightsS(s_weights, self.model_dim, self.model_dim);
-        try self.accelerator.setWeightsT(t_weights, self.model_dim, self.model_dim);
+        try self.accelerator.setWeightsS(s_weights, half, half);
+        try self.accelerator.setWeightsT(t_weights, half, half);
 
-        const s_bias_data = try self.allocator.alloc(f16, self.model_dim);
+        const s_bias_data = try self.allocator.alloc(f16, half);
         defer self.allocator.free(s_bias_data);
         for (s_bias_data) |*b| {
             const v = try readF32(reader);
@@ -777,7 +780,7 @@ pub const DistributedTrainerFuthark = struct {
             b.* = @floatCast(v);
         }
 
-        const t_bias_data = try self.allocator.alloc(f16, self.model_dim);
+        const t_bias_data = try self.allocator.alloc(f16, half);
         defer self.allocator.free(t_bias_data);
         for (t_bias_data) |*b| {
             const v = try readF32(reader);
@@ -785,8 +788,8 @@ pub const DistributedTrainerFuthark = struct {
             b.* = @floatCast(v);
         }
 
-        try self.accelerator.setSBias(s_bias_data, self.model_dim);
-        try self.accelerator.setTBias(t_bias_data, self.model_dim);
+        try self.accelerator.setSBias(s_bias_data, half);
+        try self.accelerator.setTBias(t_bias_data, half);
 
         const vel_s = try self.allocator.alloc(f16, weight_count);
         defer self.allocator.free(vel_s);
@@ -804,7 +807,7 @@ pub const DistributedTrainerFuthark = struct {
             w.* = @floatCast(v);
         }
 
-        const vel_sb = try self.allocator.alloc(f16, self.model_dim);
+        const vel_sb = try self.allocator.alloc(f16, half);
         defer self.allocator.free(vel_sb);
         for (vel_sb) |*w| {
             const v = try readF32(reader);
@@ -812,7 +815,7 @@ pub const DistributedTrainerFuthark = struct {
             w.* = @floatCast(v);
         }
 
-        const vel_tb = try self.allocator.alloc(f16, self.model_dim);
+        const vel_tb = try self.allocator.alloc(f16, half);
         defer self.allocator.free(vel_tb);
         for (vel_tb) |*w| {
             const v = try readF32(reader);
@@ -820,10 +823,10 @@ pub const DistributedTrainerFuthark = struct {
             w.* = @floatCast(v);
         }
 
-        try self.accelerator.setVelocityS(vel_s, self.model_dim, self.model_dim);
-        try self.accelerator.setVelocityT(vel_t, self.model_dim, self.model_dim);
-        try self.accelerator.setVelocitySB(vel_sb, self.model_dim);
-        try self.accelerator.setVelocityTB(vel_tb, self.model_dim);
+        try self.accelerator.setVelocityS(vel_s, half, half);
+        try self.accelerator.setVelocityT(vel_t, half, half);
+        try self.accelerator.setVelocitySB(vel_sb, half);
+        try self.accelerator.setVelocityTB(vel_tb, half);
 
         const clip_min_f32 = try readF32(reader);
         const clip_max_f32 = try readF32(reader);
