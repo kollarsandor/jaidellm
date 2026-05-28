@@ -242,6 +242,7 @@ pub const DistributedTrainerFuthark = struct {
 
         const half: usize = self.model_dim / 2;
         if (rows.len != half) {
+            std.debug.print("[Rank {d}] readWeightsFlat: rows.len={d}, expected half={d}, model_dim={d}\n", .{ self.coordinator.rank, rows.len, half, self.model_dim });
             return error.InvalidWeightsShape;
         }
 
@@ -252,6 +253,7 @@ pub const DistributedTrainerFuthark = struct {
         var idx: usize = 0;
         for (rows) |row| {
             if (row.len != half) {
+                std.debug.print("[Rank {d}] readWeightsFlat: row.len={d}, expected half={d}\n", .{ self.coordinator.rank, row.len, half });
                 return error.InvalidWeightsShape;
             }
             for (row) |value| {
