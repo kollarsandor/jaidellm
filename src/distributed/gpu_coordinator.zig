@@ -6,14 +6,14 @@ fn constOpaquePtrFrom(value: anytype) !*const anyopaque {
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
         .pointer => |ptr_info| switch (ptr_info.size) {
-            .One => @ptrCast(value),
-            .Slice => blk: {
+            .one => @ptrCast(value),
+            .slice => blk: {
                 if (value.len == 0) {
                     return error.EmptyBuffer;
                 }
                 break :blk @ptrCast(&value[0]);
             },
-            .Many, .C => @compileError("constOpaquePtrFrom: expected single pointer or slice, got unbounded pointer type " ++ @typeName(T)),
+            .many, .c => @compileError("constOpaquePtrFrom: expected single pointer or slice, got unbounded pointer type " ++ @typeName(T)),
         },
         else => @compileError("constOpaquePtrFrom: expected pointer or slice, got " ++ @typeName(T)),
     };
@@ -23,13 +23,13 @@ fn opaquePtrFrom(value: anytype) !*anyopaque {
     const T = @TypeOf(value);
     return switch (@typeInfo(T)) {
         .pointer => |ptr_info| switch (ptr_info.size) {
-            .One => blk: {
+            .one => blk: {
                 if (ptr_info.is_const) {
                     @compileError("opaquePtrFrom: expected mutable pointer, got " ++ @typeName(T));
                 }
                 break :blk @ptrCast(value);
             },
-            .Slice => blk: {
+            .slice => blk: {
                 if (ptr_info.is_const) {
                     @compileError("opaquePtrFrom: expected mutable slice, got " ++ @typeName(T));
                 }
@@ -38,7 +38,7 @@ fn opaquePtrFrom(value: anytype) !*anyopaque {
                 }
                 break :blk @ptrCast(&value[0]);
             },
-            .Many, .C => @compileError("opaquePtrFrom: expected single pointer or slice, got unbounded pointer type " ++ @typeName(T)),
+            .many, .c => @compileError("opaquePtrFrom: expected single pointer or slice, got unbounded pointer type " ++ @typeName(T)),
         },
         else => @compileError("opaquePtrFrom: expected pointer or slice, got " ++ @typeName(T)),
     };

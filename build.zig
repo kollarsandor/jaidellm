@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "gpu_acceleration", gpu_enabled);
 
     const futhark_c = b.path("src/hw/accel/futhark_kernels.c");
+    const futhark_gpu_c = b.path("src/hw/accel/main_gpu.c");
     const futhark_include = b.path("src/hw/accel");
 
     const main_exe = b.addExecutable(.{
@@ -61,10 +62,21 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         distributed_futhark_exe.linkLibC();
-        distributed_futhark_exe.addCSourceFile(.{ .file = futhark_c, .flags = &.{"-O2"} });
+        distributed_futhark_exe.addCSourceFile(.{ .file = futhark_gpu_c, .flags = &.{"-O2"} });
         distributed_futhark_exe.addIncludePath(futhark_include);
+        distributed_futhark_exe.addIncludePath(.{ .cwd_relative = "/usr/local/cuda/include" });
+        distributed_futhark_exe.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64" });
+        distributed_futhark_exe.addLibraryPath(.{ .cwd_relative = "/usr/local/cuda/lib64/stubs" });
+        distributed_futhark_exe.linkSystemLibrary("cuda");
+        distributed_futhark_exe.linkSystemLibrary("cudart");
+        distributed_futhark_exe.linkSystemLibrary("nvrtc");
+        distributed_futhark_exe.linkSystemLibrary("nccl");
         distributed_futhark_exe.root_module.addOptions("build_options", build_options);
         b.installArtifact(distributed_futhark_exe);
+
+        const distributed_futhark_install = b.addInstallArtifact(distributed_futhark_exe, .{});
+        const distributed_futhark_step = b.step("distributed-futhark", "Build only the Futhark-accelerated distributed trainer");
+        distributed_futhark_step.dependOn(&distributed_futhark_install.step);
 
         const gpu_exe = b.addExecutable(.{
             .name = "jaide-gpu",

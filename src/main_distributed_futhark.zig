@@ -32,11 +32,15 @@ pub fn main() !void {
     std.debug.print("NVLink: Enabled (NCCL P2P)\n", .{});
     std.debug.print("============================================================\n\n", .{});
 
-    const pid = std.os.linux.getpid();
-    var nccl_id_path_buf: [256]u8 = undefined;
+    var nccl_id_path_owned: ?[]u8 = null;
+    const nccl_id_path: []const u8 = blk: {
+        nccl_id_path_owned = std.process.getEnvVarOwned(allocator, "JAIDE_NCCL_ID_PATH") catch null;
+        break :blk nccl_id_path_owned orelse "/tmp/jaide_nccl_id";
+    };
+    defer if (nccl_id_path_owned) |owned| allocator.free(owned);
+
     var nccl_ready_path_buf: [256]u8 = undefined;
-    const nccl_id_path = try std.fmt.bufPrint(&nccl_id_path_buf, "/tmp/nccl_id_{d}", .{pid});
-    const nccl_ready_path = try std.fmt.bufPrint(&nccl_ready_path_buf, "/tmp/nccl_ready_{d}", .{pid});
+    const nccl_ready_path = try std.fmt.bufPrint(&nccl_ready_path_buf, "{s}.ready", .{nccl_id_path});
 
     var nccl_id: nccl.ncclUniqueId = undefined;
 
@@ -94,9 +98,29 @@ pub fn main() !void {
 
     std.debug.print("[Rank {d}] GPU coordinator initialized\n", .{rank});
 
-    const model_dim: usize = 2048;
-    const num_layers: usize = 48;
-    const local_batch_size: usize = 4;
+    var model_dim_str_owned: ?[]u8 = null;
+    const model_dim_str: []const u8 = blk: {
+        model_dim_str_owned = std.process.getEnvVarOwned(allocator, "JAIDE_MODEL_DIM") catch null;
+        break :blk model_dim_str_owned orelse "2048";
+    };
+    defer if (model_dim_str_owned) |owned| allocator.free(owned);
+    const model_dim = std.fmt.parseInt(usize, model_dim_str, 10) catch 2048;
+
+    var num_layers_str_owned: ?[]u8 = null;
+    const num_layers_str: []const u8 = blk: {
+        num_layers_str_owned = std.process.getEnvVarOwned(allocator, "JAIDE_LAYERS") catch null;
+        break :blk num_layers_str_owned orelse "48";
+    };
+    defer if (num_layers_str_owned) |owned| allocator.free(owned);
+    const num_layers = std.fmt.parseInt(usize, num_layers_str, 10) catch 48;
+
+    var local_batch_size_str_owned: ?[]u8 = null;
+    const local_batch_size_str: []const u8 = blk: {
+        local_batch_size_str_owned = std.process.getEnvVarOwned(allocator, "JAIDE_BATCH_SIZE") catch null;
+        break :blk local_batch_size_str_owned orelse "4";
+    };
+    defer if (local_batch_size_str_owned) |owned| allocator.free(owned);
+    const local_batch_size = std.fmt.parseInt(usize, local_batch_size_str, 10) catch 4;
 
     var epochs_env_owned: ?[]u8 = null;
     const epochs_env: []const u8 = blk: {
@@ -120,7 +144,7 @@ pub fn main() !void {
     var dataset_path_owned: ?[]u8 = null;
     const dataset_path: []const u8 = blk: {
         dataset_path_owned = std.process.getEnvVarOwned(allocator, "JAIDE_DATASET") catch null;
-        break :blk dataset_path_owned orelse "/data/tower9b/hun_Latn_full.jsonl";
+        break :blk dataset_path_owned orelse "/data/dataset/train.jsonl";
     };
     defer if (dataset_path_owned) |owned| allocator.free(owned);
 
@@ -149,7 +173,10 @@ pub fn main() !void {
     while (epoch < num_epochs) : (epoch += 1) {
         const start_time = std.time.milliTimestamp();
 
-        const avg_loss = try trainer.trainEpoch(samples);
+        const avg_loss = trainer.trainEpoch(samples) catch |err| {
+            std.debug.print("[Rank {d}] trainEpoch ERROR (epoch={d}): {}\n", .{ rank, epoch + 1, err });
+            return err;
+        };
 
         const end_time = std.time.milliTimestamp();
         const elapsed = @as(f64, @floatFromInt(end_time - start_time)) / 1000.0;

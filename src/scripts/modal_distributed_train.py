@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import modal
 
-APP_NAME = "jaide-v40-training"
-GPU_SPEC = "B200:8"
+APP_NAME = "jaide-v40-distributed-training"
+GPU_SPEC = "B200+:8"
 DATA_VOLUME_NAME = "jaide-training-data"
 CHECKPOINT_VOLUME_NAME = "jaide-checkpoints"
 
@@ -22,8 +22,9 @@ DATASET_DIR = DATA_MOUNT_PATH / "dataset"
 DATASET_FILE = DATASET_DIR / "train.jsonl"
 DATASET_METADATA_FILE = DATASET_DIR / "metadata.json"
 
-MODELS_DIR = PROJECT_MOUNT_PATH / "models"
-BINARY_PATH = PROJECT_MOUNT_PATH / "main"
+BINARY_PATH = PROJECT_MOUNT_PATH / "zig-out" / "bin" / "jaide-distributed-futhark"
+BINARY_CACHE_PATH = CHECKPOINT_MOUNT_PATH / "jaide-distributed-futhark"
+BUILD_VERSION_FILE = CHECKPOINT_MOUNT_PATH / "build_version.txt"
 
 CPU_REQUEST = 64.0
 CPU_LIMIT = 80.0
@@ -54,19 +55,19 @@ jaide_image = (
     .entrypoint([])
     .run_commands(
         "DEBIAN_FRONTEND=noninteractive apt-get update",
-        "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages git curl xz-utils build-essential wget ca-certificates",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-change-held-packages git curl xz-utils build-essential wget ca-certificates libnccl2 libnccl-dev",
         "rm -rf /var/lib/apt/lists/*",
     )
     .pip_install("pyarrow", "requests", "zstandard", "datasets", "huggingface_hub", "hf_xet")
     .run_commands(
         "mkdir -p /opt",
-        "curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C /opt",
-        "ln -sf /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig",
+        "curl -sL https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz | tar -xJ -C /opt",
+        "ln -sf /opt/zig-x86_64-linux-0.14.1/zig /usr/local/bin/zig",
         "zig version",
     )
     .env(
         {
-            "PATH": "/opt/zig-linux-x86_64-0.13.0:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "PATH": "/opt/zig-x86_64-linux-0.14.1:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HF_HOME": "/data/hf_home",
             "HF_DATASETS_CACHE": "/data/hf_datasets_cache",
             "HF_XET_HIGH_PERFORMANCE": "1",
@@ -137,6 +138,11 @@ def _extract_text_from_row(row: Any) -> str:
     return ""
 
 
+DATASET_NAME = "HuggingFaceFW/finephrase"
+DATASET_CONFIG = "faq"
+DATASET_MAX_SAMPLES = 100_000
+
+
 def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     from datasets import load_dataset
 
@@ -158,7 +164,7 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     if tmp_file.exists():
         tmp_file.unlink()
 
-    ds = load_dataset("HuggingFaceFW/finephrase", split="train")
+    ds = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train", streaming=True)
 
     line_count = 0
     with open(tmp_file, "w", encoding="utf-8") as f_out:
@@ -167,6 +173,8 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
             if text and len(text) > 20:
                 f_out.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
                 line_count += 1
+                if line_count >= DATASET_MAX_SAMPLES:
+                    break
 
     if line_count <= 0:
         if tmp_file.exists():
@@ -180,18 +188,67 @@ def download_finephrase_to_jsonl(volume: modal.Volume) -> Tuple[str, int, int]:
     return str(DATASET_FILE), size, line_count
 
 
-def _build_zig(project_dir: str) -> None:
-    if BINARY_PATH.is_file():
+def _build_zig_gpu(project_dir: str, force: bool = False) -> None:
+    if BINARY_PATH.is_file() and not force:
         return
     rc, out, err = _run_checked(
-        ["zig", "build-exe", "src/main.zig", "-O", "ReleaseFast", f"-femit-bin={BINARY_PATH}"],
+        ["zig", "build", "distributed-futhark", "-Dgpu=true", "-Doptimize=ReleaseFast"],
         cwd=project_dir,
     )
     if rc != 0:
-        raise RuntimeError(f"Build failed with exit code {rc}: {(err or out)[-8000:]}")
+        raise RuntimeError(f"GPU build failed with exit code {rc}: {(err or out)[-8000:]}")
     if not BINARY_PATH.is_file():
-        raise FileNotFoundError(f"Built binary not found at {BINARY_PATH}")
+        raise FileNotFoundError(f"GPU binary not found at {BINARY_PATH}")
     BINARY_PATH.chmod(0o755)
+
+
+def _ensure_binary_in_cache(volume: modal.Volume) -> str:
+    """Build the GPU binary on a CPU container, then cache it in checkpoint volume.
+
+    Returns the build_version (git-like hash of source) of the cached binary.
+    """
+    import hashlib
+
+    def _source_hash() -> str:
+        h = hashlib.sha256()
+        for sub in ("src", "build.zig"):
+            base = PROJECT_MOUNT_PATH / sub
+            if base.is_file():
+                with open(base, "rb") as f:
+                    h.update(f.read())
+            else:
+                for p in sorted(base.rglob("*")):
+                    if not p.is_file():
+                        continue
+                    if any(part in {".zig-cache", "zig-out"} for part in p.parts):
+                        continue
+                    with open(p, "rb") as f:
+                        h.update(p.name.encode())
+                        h.update(f.read())
+        return h.hexdigest()
+
+    expected_version = _source_hash()
+    cached_version = ""
+    if BUILD_VERSION_FILE.is_file():
+        try:
+            cached_version = BUILD_VERSION_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            cached_version = ""
+
+    if BINARY_CACHE_PATH.is_file() and cached_version == expected_version:
+        print(f"Reusing cached GPU binary ({expected_version[:12]})")
+        return expected_version
+
+    print(f"Building GPU binary (version {expected_version[:12]})...")
+    os.chdir(str(PROJECT_MOUNT_PATH))
+    _build_zig_gpu(str(PROJECT_MOUNT_PATH), force=True)
+    _ensure_dir(CHECKPOINT_MOUNT_PATH)
+    shutil.copy2(str(BINARY_PATH), str(BINARY_CACHE_PATH))
+    BINARY_CACHE_PATH.chmod(0o755)
+    BUILD_VERSION_FILE.write_text(expected_version, encoding="utf-8")
+    volume.commit()
+    print(f"Cached GPU binary at {BINARY_CACHE_PATH}")
+    return expected_version
 
 
 def _detect_gpus() -> Tuple[int, str]:
@@ -240,54 +297,6 @@ def _read_tail(path: Path, max_chars: int = 8000) -> str:
     return data.decode("utf-8", errors="replace")[-max_chars:]
 
 
-def _run_training_command(cmd: List[str], env: Dict[str, str], timeout_seconds: int, epoch: int) -> Tuple[int, str, str, bool]:
-    logs_dir = Path("/tmp/jaide_training_logs")
-    _ensure_dir(logs_dir)
-    stdout_path = logs_dir / f"epoch_{epoch:03d}.stdout.log"
-    stderr_path = logs_dir / f"epoch_{epoch:03d}.stderr.log"
-
-    timed_out = False
-    with open(stdout_path, "w", encoding="utf-8", errors="replace") as stdout_file, open(stderr_path, "w", encoding="utf-8", errors="replace") as stderr_file:
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                text=True,
-                env=env,
-                cwd=str(PROJECT_MOUNT_PATH),
-                preexec_fn=os.setsid,
-            )
-            try:
-                return_code = proc.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    os.killpg(proc.pid, 15)
-                    proc.wait(timeout=30)
-                except (ProcessLookupError, subprocess.TimeoutExpired):
-                    try:
-                        os.killpg(proc.pid, 9)
-                    except ProcessLookupError:
-                        pass
-                    proc.wait()
-                return_code = -9
-        except FileNotFoundError as e:
-            stderr_file.write(str(e))
-            return_code = 127
-
-    stdout_tail = _read_tail(stdout_path)
-    stderr_tail = _read_tail(stderr_path)
-    return int(return_code), stdout_tail, stderr_tail, timed_out
-
-
-def _validate_positive_int(value: int, name: str) -> int:
-    converted = int(value)
-    if converted < 1:
-        raise ValueError(f"{name} must be a positive integer")
-    return converted
-
-
 @app.function(
     image=jaide_image,
     gpu=GPU_SPEC,
@@ -300,177 +309,232 @@ def _validate_positive_int(value: int, name: str) -> int:
         str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
     },
 )
-def train_jaide(
+def train_all_ranks(
     epochs: int = 20,
-    batch_size: int = 256,
-    per_epoch_timeout_seconds: int = 3600,
+    model_dim: int = 512,
+    num_layers: int = 16,
+    local_batch_size: int = 4,
+    world_size: int = 8,
 ) -> Dict[str, Any]:
-    num_epochs = _validate_positive_int(epochs, "epochs")
-    bs = _validate_positive_int(batch_size, "batch_size")
-    epoch_timeout = _validate_positive_int(per_epoch_timeout_seconds, "per_epoch_timeout_seconds")
+    """Run all `world_size` ranks inside one B200+:8 container.
 
+    All processes share /tmp for NCCL ID rendezvous and use intra-node
+    NCCL P2P over NVLink for collective ops.
+    """
+    import threading
+
+    def _log(msg: str) -> None:
+        print(f"[orch] {msg}", flush=True)
+
+    _log("container started")
     data_volume.reload()
     checkpoint_volume.reload()
 
     gpu_count, gpu_list = _detect_gpus()
     expected_gpus = _expected_gpu_count()
-    if gpu_count < 1:
-        raise RuntimeError(f"No NVIDIA GPUs detected: {gpu_list}")
-    if gpu_count != expected_gpus:
-        raise RuntimeError(f"Expected {expected_gpus} GPUs from {GPU_SPEC}, detected {gpu_count}: {gpu_list}")
+    if gpu_count < world_size:
+        raise RuntimeError(
+            f"Need {world_size} GPUs, detected {gpu_count} from {GPU_SPEC}: {gpu_list}"
+        )
+    _log(f"detected {gpu_count} GPUs (expected {expected_gpus})")
 
-    dataset_path, dataset_size, sample_count = download_finephrase_to_jsonl(data_volume)
+    dataset_path_s, dataset_size, sample_count = download_finephrase_to_jsonl(data_volume)
     if sample_count <= 0:
         raise RuntimeError("Dataset contains zero samples")
+    dataset_path = str(dataset_path_s)
+    _log(f"dataset {sample_count} samples, {dataset_size / 1e6:.2f} MB")
 
-    os.chdir(str(PROJECT_MOUNT_PATH))
-    _ensure_dir(MODELS_DIR)
+    build_version = _ensure_binary_in_cache(checkpoint_volume)
+    _log(f"GPU binary ready (build_version={build_version[:12]})")
+
+    if not BINARY_CACHE_PATH.is_file():
+        raise FileNotFoundError(
+            f"Pre-built GPU binary missing from {BINARY_CACHE_PATH}"
+        )
+    local_binary = Path("/tmp/jaide-distributed-futhark")
+    shutil.copy2(str(BINARY_CACHE_PATH), str(local_binary))
+    local_binary.chmod(0o755)
+    _log(f"binary ready at {local_binary}")
+
+    nccl_id_path = Path("/tmp/jaide_nccl_id")
+    if nccl_id_path.exists():
+        nccl_id_path.unlink()
+    ready_path = Path("/tmp/jaide_nccl_id.ready")
+    if ready_path.exists():
+        ready_path.unlink()
+
+    logs_dir = Path("/tmp/jaide_training_logs")
+    _ensure_dir(logs_dir)
     _ensure_dir(CHECKPOINT_MOUNT_PATH)
 
-    _build_zig(str(PROJECT_MOUNT_PATH))
+    def _tee(src, dst_file, prefix: str) -> None:
+        try:
+            for raw in iter(src.readline, b""):
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").rstrip("\n")
+                print(f"[{prefix}] {line}", flush=True)
+                dst_file.write(line + "\n")
+                dst_file.flush()
+        except Exception as exc:  # pragma: no cover
+            print(f"[{prefix}] tee error: {exc}", flush=True)
 
-    total_start = time.time()
-    training_results: List[Dict[str, Any]] = []
-    aborted = False
+    procs: List[subprocess.Popen] = []
+    rank_files: List[Tuple[Path, Path, Any, Any, threading.Thread, threading.Thread]] = []
 
-    for epoch in range(1, num_epochs + 1):
-        epoch_start = time.time()
+    base_env = os.environ.copy()
+    base_env["WORLD_SIZE"] = str(world_size)
+    base_env["MASTER_ADDR"] = "127.0.0.1"
+    base_env["MASTER_PORT"] = "29500"
+    base_env["JAIDE_EPOCHS"] = str(epochs)
+    base_env["JAIDE_DATASET"] = dataset_path
+    base_env["JAIDE_MODEL_DIM"] = str(model_dim)
+    base_env["JAIDE_LAYERS"] = str(num_layers)
+    base_env["JAIDE_BATCH_SIZE"] = str(local_batch_size)
+    base_env["JAIDE_NCCL_ID_PATH"] = str(nccl_id_path)
+    base_env["JAIDE_TOTAL_SAMPLES"] = str(sample_count)
+    base_env["JAIDE_MAX_SAMPLES"] = "2000"
+    base_env["NCCL_DEBUG"] = "WARN"
+    base_env["NCCL_IB_DISABLE"] = "1"
+    base_env["NCCL_SOCKET_IFNAME"] = "lo"
+    base_env["NCCL_P2P_DISABLE"] = "0"
+    base_env["NCCL_SHM_DISABLE"] = "0"
+    base_env["NCCL_NVLS_ENABLE"] = "0"
+    base_env["NCCL_LAUNCH_MODE"] = "GROUP"
+    base_env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpu_count))
+    start_time = time.time()
+    _log(f"spawning {world_size} ranks in this container")
+    for rank in range(world_size):
+        env = base_env.copy()
+        env["RANK"] = str(rank)
+        env["LOCAL_RANK"] = str(rank)
+        env["JAIDE_LOCAL_RANK"] = str(rank)
 
-        cmd = [
-            str(BINARY_PATH),
-            "--mode", "train",
-            "--epochs", "1",
-            "--batch-size", str(bs),
-            "--dataset-path", str(dataset_path),
-            "--samples", str(sample_count),
-            "--output-dir", str(MODELS_DIR),
-        ]
+        stdout_path = logs_dir / f"rank_{rank:03d}.stdout.log"
+        stderr_path = logs_dir / f"rank_{rank:03d}.stderr.log"
+        stdout_file = open(stdout_path, "w", encoding="utf-8", errors="replace")
+        stderr_file = open(stderr_path, "w", encoding="utf-8", errors="replace")
 
-        return_code, stdout_tail, stderr_tail, timed_out = _run_training_command(cmd, env, epoch_timeout, epoch)
+        proc = subprocess.Popen(
+            [str(local_binary)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=str(PROJECT_MOUNT_PATH),
+        )
+        t_out = threading.Thread(
+            target=_tee, args=(proc.stdout, stdout_file, f"r{rank} out"), daemon=True
+        )
+        t_err = threading.Thread(
+            target=_tee, args=(proc.stderr, stderr_file, f"r{rank} err"), daemon=True
+        )
+        t_out.start()
+        t_err.start()
+        procs.append(proc)
+        rank_files.append((stdout_path, stderr_path, stdout_file, stderr_file, t_out, t_err))
+        _log(f"rank {rank} pid={proc.pid} LOCAL_RANK={env['LOCAL_RANK']}")
 
-        epoch_time = float(time.time() - epoch_start)
-        loss = _extract_loss(stdout_tail)
-        if loss is None:
-            loss = 0.0
+    results = []
+    timed_out_any = False
+    for rank, proc in enumerate(procs):
+        try:
+            rc = proc.wait(timeout=TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out_any = True
+            try:
+                proc.terminate()
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            rc = -9
+        results.append((rank, int(rc)))
+        _log(f"rank {rank} exit rc={rc}")
 
-        checkpoint_dir = CHECKPOINT_MOUNT_PATH / f"epoch_{epoch:03d}"
-        if checkpoint_dir.exists():
-            shutil.rmtree(checkpoint_dir)
-        _ensure_dir(checkpoint_dir)
+    for _, _, sout, serr, t_out, t_err in rank_files:
+        try:
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
+        finally:
+            sout.close()
+            serr.close()
 
-        model_files = sorted(MODELS_DIR.glob("*.bin"))
-        for model_file in model_files:
-            shutil.copy2(model_file, checkpoint_dir / model_file.name)
-
-        ckpt_files = list(checkpoint_dir.glob("*.bin"))
-        ckpt_size = int(sum(f.stat().st_size for f in ckpt_files)) if ckpt_files else 0
-
-        _write_json_file(
-            checkpoint_dir / "metadata.json",
+    elapsed = float(time.time() - start_time)
+    rank_results: List[Dict[str, Any]] = []
+    for rank, rc in results:
+        stdout_path, stderr_path, _, _, _, _ = rank_files[rank]
+        stdout_tail = _read_tail(stdout_path)
+        stderr_tail = _read_tail(stderr_path)
+        loss = _extract_loss(stdout_tail) if rank == 0 else None
+        rank_results.append(
             {
-                "epoch": epoch,
+                "rank": rank,
+                "return_code": rc,
+                "timed_out": timed_out_any and rc == -9,
                 "loss": loss,
-                "duration_seconds": epoch_time,
-                "batch_size": bs,
-                "dataset_samples": sample_count,
-                "dataset_size_mb": float(dataset_size) / 1e6,
-                "gpu_config": f"{gpu_count}x NVIDIA B200",
-                "return_code": int(return_code),
-                "timed_out": bool(timed_out),
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
-                "checkpoint_bytes": ckpt_size,
-                "checkpoint_files": len(ckpt_files),
-            },
-        )
-
-        checkpoint_volume.commit()
-
-        training_results.append(
-            {
-                "epoch": epoch,
-                "loss": loss,
-                "time_seconds": epoch_time,
-                "checkpoint_mb": float(ckpt_size) / 1e6,
-                "files": len(ckpt_files),
-                "return_code": int(return_code),
-                "timed_out": bool(timed_out),
             }
         )
 
-        if return_code != 0 or timed_out:
-            aborted = True
-            break
+    successful_ranks = [r for r in rank_results if int(r.get("return_code", -1)) == 0 and not r.get("timed_out", False)]
+    rank_0_result = next((r for r in rank_results if r.get("rank") == 0), None)
 
-    total_time = float(time.time() - total_start)
-
-    successful_results = [r for r in training_results if int(r["return_code"]) == 0 and not r.get("timed_out", False)]
-
-    latest_dir = CHECKPOINT_MOUNT_PATH / "latest"
-    if latest_dir.is_symlink():
-        latest_dir.unlink()
-    elif latest_dir.exists():
-        try:
-            shutil.rmtree(latest_dir)
-        except OSError:
-            pass
-
-    if successful_results:
-        last_ok_epoch = int(successful_results[-1]["epoch"])
-        src = CHECKPOINT_MOUNT_PATH / f"epoch_{last_ok_epoch:03d}"
-        if src.is_dir():
-            shutil.copytree(src, latest_dir)
-
-    final_loss = float(successful_results[-1]["loss"]) if successful_results else 0.0
-    completed_epochs = len(successful_results)
-    status = "completed" if (not aborted and completed_epochs == num_epochs) else "failed"
+    final_loss = rank_0_result.get("loss") if rank_0_result else 0.0
+    completed_epochs = epochs if len(successful_ranks) == world_size else 0
+    status = "completed" if len(successful_ranks) == world_size else "failed"
 
     _write_json_file(
         CHECKPOINT_MOUNT_PATH / "training_complete.json",
         {
             "status": status,
-            "total_epochs": num_epochs,
+            "total_epochs": epochs,
             "completed_epochs": completed_epochs,
-            "attempted_epochs": len(training_results),
-            "total_time_seconds": total_time,
-            "total_time_minutes": total_time / 60.0,
             "final_loss": final_loss,
-            "dataset_path": str(dataset_path),
+            "dataset_path": dataset_path,
             "dataset_size_mb": float(dataset_size) / 1e6,
             "sample_count": sample_count,
-            "gpu_config": f"{gpu_count}x NVIDIA B200",
-            "gpu_list": gpu_list,
-            "epochs": training_results,
+            "gpu_config": f"{world_size}x NVIDIA B200",
+            "model_dim": model_dim,
+            "num_layers": num_layers,
+            "local_batch_size": local_batch_size,
+            "world_size": world_size,
+            "rank_results": rank_results,
         },
     )
-
     checkpoint_volume.commit()
 
     return {
         "status": status,
-        "epochs": num_epochs,
+        "epochs": epochs,
         "completed_epochs": completed_epochs,
         "final_loss": final_loss,
-        "total_time_minutes": total_time / 60.0,
         "dataset_size_mb": float(dataset_size) / 1e6,
         "sample_count": sample_count,
-        "gpu_config": f"{gpu_count}x NVIDIA B200",
-        "checkpoints": completed_epochs,
+        "gpu_config": f"{world_size}x NVIDIA B200",
+        "model_dim": model_dim,
+        "num_layers": num_layers,
+        "successful_ranks": len(successful_ranks),
+        "elapsed_seconds": elapsed,
+        "rank_results": rank_results,
     }
+
 
 
 @app.local_entrypoint()
 def main(
     epochs: int = 20,
-    batch_size: int = 256,
-    per_epoch_timeout_seconds: int = 3600,
+    model_dim: int = 512,
+    num_layers: int = 16,
+    local_batch_size: int = 4,
+    world_size: int = 8,
 ) -> None:
-    result = train_jaide.remote(
+    result = train_all_ranks.remote(
         epochs=epochs,
-        batch_size=batch_size,
-        per_epoch_timeout_seconds=per_epoch_timeout_seconds,
+        model_dim=model_dim,
+        num_layers=num_layers,
+        local_batch_size=local_batch_size,
+        world_size=world_size,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
