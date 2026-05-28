@@ -26,6 +26,7 @@ pub const AccelError = error{
 
 pub const FutharkContext = struct {
     ctx: ?*futhark.struct_futhark_context,
+    cfg: ?*futhark.struct_futhark_context_config,
 
     const Self = @This();
 
@@ -39,22 +40,28 @@ pub const FutharkContext = struct {
         futhark.futhark_context_config_set_default_tile_size(cfg, 32);
 
         const ctx = futhark.futhark_context_new(cfg);
-        futhark.futhark_context_config_free(cfg);
-
-        if (ctx == null) return AccelError.FutharkContextFailed;
+        if (ctx == null) {
+            futhark.futhark_context_config_free(cfg);
+            return AccelError.FutharkContextFailed;
+        }
 
         if (futhark.futhark_context_sync(ctx) != 0) {
             futhark.futhark_context_free(ctx);
+            futhark.futhark_context_config_free(cfg);
             return AccelError.FutharkSyncFailed;
         }
 
-        return Self{ .ctx = ctx };
+        return Self{ .ctx = ctx, .cfg = cfg };
     }
 
     pub fn deinit(self: *Self) void {
         if (self.ctx) |ctx| {
             futhark.futhark_context_free(ctx);
             self.ctx = null;
+        }
+        if (self.cfg) |cfg| {
+            futhark.futhark_context_config_free(cfg);
+            self.cfg = null;
         }
     }
 
