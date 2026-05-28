@@ -90,10 +90,14 @@ entry batch_forward [batch_size][seq_len][half] (inputs: [batch_size][seq_len][h
   map (\sample -> rsf_forward sample weights_s weights_t s_bias t_bias clip_min clip_max) inputs
 
 entry batch_compute_loss [batch_size][seq_len][d] (outputs: [batch_size][seq_len][d]f16) (targets: [batch_size][seq_len][d]f16) : f16 =
-  let squared_diff = map2 (map2 (map2 (\o t -> (o f16.- t) f16.* (o f16.- t)))) outputs targets
-  let total = f16.sum (flatten (flatten squared_diff))
-  let count = f16.i64 (batch_size * seq_len * d)
-  in total f16./ count
+  let squared_diff_f32 = map2 (map2 (map2 (\o t ->
+    let diff = (f32.f16 o) - (f32.f16 t)
+    in diff * diff
+  ))) outputs targets
+  let total_f32 = f32.sum (flatten (flatten squared_diff_f32))
+  let count_f32 = f32.i64 (batch_size * seq_len * d)
+  let mean_f32 = total_f32 / count_f32
+  in f16.f32 mean_f32
 
 entry batch_gradients [batch_size][seq_len][half] (inputs: [batch_size][seq_len][half*2]f16)
   (grad_outputs: [batch_size][seq_len][half*2]f16)

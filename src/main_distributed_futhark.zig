@@ -1,6 +1,8 @@
 const std = @import("std");
 const GPUCoordinator = @import("distributed/gpu_coordinator.zig").GPUCoordinator;
-const DistributedTrainerFuthark = @import("distributed/distributed_trainer_futhark.zig").DistributedTrainerFuthark;
+const dtf = @import("distributed/distributed_trainer_futhark.zig");
+const DistributedTrainerFuthark = dtf.DistributedTrainerFuthark;
+const TrainerConfig = dtf.TrainerConfig;
 const nccl = @import("distributed/nccl_bindings.zig");
 
 pub fn main() !void {
@@ -131,13 +133,27 @@ pub fn main() !void {
 
     const num_epochs = std.fmt.parseInt(usize, epochs_env, 10) catch 20;
 
-    var trainer = try DistributedTrainerFuthark.init(
+    var lr_env_owned: ?[]u8 = null;
+    const lr_str: []const u8 = blk: {
+        lr_env_owned = std.process.getEnvVarOwned(allocator, "JAIDE_LEARNING_RATE") catch null;
+        break :blk lr_env_owned orelse "0.0001";
+    };
+    defer if (lr_env_owned) |owned| allocator.free(owned);
+    const learning_rate: f32 = std.fmt.parseFloat(f32, lr_str) catch 0.0001;
+
+    var trainer_cfg: TrainerConfig = .{};
+    trainer_cfg.learning_rate = learning_rate;
+
+    var trainer = try DistributedTrainerFuthark.initWithConfig(
         allocator,
         &coordinator,
         model_dim,
         local_batch_size,
+        trainer_cfg,
     );
     defer trainer.deinit();
+
+    std.debug.print("[Rank {d}] learning_rate={d}\n", .{ rank, learning_rate });
 
     std.debug.print("[Rank {d}] Futhark-accelerated trainer initialized (f16, model_dim={d}, layers={d})\n", .{ rank, model_dim, num_layers });
 

@@ -474,32 +474,34 @@ pub const RSFAccelerator = struct {
 
     pub fn init(model_dim: usize) AccelError!Self {
         if (model_dim == 0) return AccelError.InvalidDimensions;
+        if (model_dim % 2 != 0) return AccelError.InvalidDimensions;
+        const half: usize = model_dim / 2;
 
         var ctx = try FutharkContext.init();
         errdefer ctx.deinit();
 
-        var weights_s = try FutharkArray2DF16.newZeros(&ctx, model_dim, model_dim);
+        var weights_s = try FutharkArray2DF16.newZeros(&ctx, half, half);
         errdefer weights_s.free(&ctx);
 
-        var weights_t = try FutharkArray2DF16.newZeros(&ctx, model_dim, model_dim);
+        var weights_t = try FutharkArray2DF16.newZeros(&ctx, half, half);
         errdefer weights_t.free(&ctx);
 
-        var s_bias = try FutharkArray1DF16.newZeros(&ctx, model_dim);
+        var s_bias = try FutharkArray1DF16.newZeros(&ctx, half);
         errdefer s_bias.free(&ctx);
 
-        var t_bias = try FutharkArray1DF16.newZeros(&ctx, model_dim);
+        var t_bias = try FutharkArray1DF16.newZeros(&ctx, half);
         errdefer t_bias.free(&ctx);
 
-        var velocity_s = try FutharkArray2DF16.newZeros(&ctx, model_dim, model_dim);
+        var velocity_s = try FutharkArray2DF16.newZeros(&ctx, half, half);
         errdefer velocity_s.free(&ctx);
 
-        var velocity_t = try FutharkArray2DF16.newZeros(&ctx, model_dim, model_dim);
+        var velocity_t = try FutharkArray2DF16.newZeros(&ctx, half, half);
         errdefer velocity_t.free(&ctx);
 
-        var velocity_sb = try FutharkArray1DF16.newZeros(&ctx, model_dim);
+        var velocity_sb = try FutharkArray1DF16.newZeros(&ctx, half);
         errdefer velocity_sb.free(&ctx);
 
-        var velocity_tb = try FutharkArray1DF16.newZeros(&ctx, model_dim);
+        var velocity_tb = try FutharkArray1DF16.newZeros(&ctx, half);
         errdefer velocity_tb.free(&ctx);
 
         return Self{
@@ -513,8 +515,8 @@ pub const RSFAccelerator = struct {
             .velocity_sb = velocity_sb,
             .velocity_tb = velocity_tb,
             .model_dim = model_dim,
-            .clip_min = @as(f16, -5.0),
-            .clip_max = @as(f16, 5.0),
+            .clip_min = @as(f16, -2.0),
+            .clip_max = @as(f16, 2.0),
             .initialized = true,
         };
     }
