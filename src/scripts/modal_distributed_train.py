@@ -392,7 +392,9 @@ def train_all_ranks(
     base_env["JAIDE_LAYERS"] = str(num_layers)
     base_env["JAIDE_BATCH_SIZE"] = str(local_batch_size)
     base_env["JAIDE_NCCL_ID_PATH"] = str(nccl_id_path)
-    base_env["NCCL_DEBUG"] = "INFO"
+    base_env["JAIDE_TOTAL_SAMPLES"] = str(sample_count)
+    base_env["JAIDE_MAX_SAMPLES"] = "2000"
+    base_env["NCCL_DEBUG"] = "WARN"
     base_env["NCCL_IB_DISABLE"] = "1"
     base_env["NCCL_SOCKET_IFNAME"] = "lo"
     base_env["NCCL_P2P_DISABLE"] = "0"

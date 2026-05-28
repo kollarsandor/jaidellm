@@ -186,7 +186,7 @@ pub const DistributedTrainerFuthark = struct {
 
         const end_valid_index = try std.math.add(usize, start_valid_index, count);
         var appended: usize = 0;
-        var valid_index: usize = 0;
+        var line_index: usize = 0;
 
         const load_file = openReadFile(dataset_path) catch |err| {
             std.debug.print("[Rank {d}] ERROR: Cannot open dataset: {}\n", .{ self.coordinator.rank, err });
@@ -200,29 +200,27 @@ pub const DistributedTrainerFuthark = struct {
         while (try load_stream.readUntilDelimiterOrEofAlloc(self.allocator, '\n', self.config.max_line_size)) |line| {
             defer self.allocator.free(line);
 
-            const maybe_text = try self.extractDatasetText(line);
-            if (maybe_text) |text_copy| {
-                var keep = false;
-                defer if (!keep) self.allocator.free(text_copy);
+            if (line_index >= end_valid_index) {
+                return;
+            }
 
-                if (!try self.isTokenizableText(text_copy)) {
-                    continue;
-                }
-
-                if (valid_index >= start_valid_index and valid_index < end_valid_index) {
+            if (line_index >= start_valid_index) {
+                const maybe_text = try self.extractDatasetText(line);
+                if (maybe_text) |text_copy| {
                     try samples.append(text_copy);
-                    keep = true;
                     appended += 1;
                 }
-                valid_index += 1;
+            }
+            line_index += 1;
 
-                if (appended == count) {
-                    return;
-                }
+            if (appended == count) {
+                return;
             }
         }
 
-        return error.UnexpectedEndOfFile;
+        if (appended < count) {
+            std.debug.print("[Rank {d}] WARN: read {d}/{d} samples before EOF (line_index={d})\n", .{ self.coordinator.rank, appended, count, line_index });
+        }
     }
 
     fn readWeightsFlat(self: *DistributedTrainerFuthark, matrix: anytype) ![]f16 {
@@ -339,30 +337,34 @@ pub const DistributedTrainerFuthark = struct {
         if (self.coordinator.world_size == 0) return error.InvalidWorldSize;
         if (self.coordinator.rank >= self.coordinator.world_size) return error.InvalidRank;
 
-        var total_line_count: usize = 0;
+        const env_total_owned: ?[]u8 = std.process.getEnvVarOwned(self.allocator, "JAIDE_TOTAL_SAMPLES") catch null;
+        defer if (env_total_owned) |o| self.allocator.free(o);
+        const env_max_owned: ?[]u8 = std.process.getEnvVarOwned(self.allocator, "JAIDE_MAX_SAMPLES") catch null;
+        defer if (env_max_owned) |o| self.allocator.free(o);
+
         var valid_sample_count: usize = 0;
+        if (env_total_owned) |s| {
+            valid_sample_count = std.fmt.parseInt(usize, s, 10) catch 0;
+        }
+        if (env_max_owned) |s| {
+            const cap = std.fmt.parseInt(usize, s, 10) catch 0;
+            if (cap > 0 and cap < valid_sample_count) valid_sample_count = cap;
+        }
 
-        {
-            const count_file = openReadFile(dataset_path) catch |err| {
-                std.debug.print("[Rank {d}] ERROR: Cannot open dataset: {}\n", .{ self.coordinator.rank, err });
-                return err;
-            };
+        if (valid_sample_count == 0) {
+            std.debug.print("[Rank {d}] WARN: JAIDE_TOTAL_SAMPLES not provided, falling back to scan\n", .{self.coordinator.rank});
+            const count_file = openReadFile(dataset_path) catch |err| return err;
             defer count_file.close();
-
             var count_buf_reader = std.io.bufferedReader(count_file.reader());
             var count_stream = count_buf_reader.reader();
-
             while (try count_stream.readUntilDelimiterOrEofAlloc(self.allocator, '\n', self.config.max_line_size)) |line| {
                 defer self.allocator.free(line);
-                total_line_count = try std.math.add(usize, total_line_count, 1);
-                if (try self.isUsableDatasetLine(line)) {
-                    valid_sample_count = try std.math.add(usize, valid_sample_count, 1);
-                }
+                valid_sample_count = try std.math.add(usize, valid_sample_count, 1);
             }
         }
 
         if (valid_sample_count == 0) {
-            std.debug.print("[Rank {d}] ERROR: Dataset does not contain any usable samples\n", .{self.coordinator.rank});
+            std.debug.print("[Rank {d}] ERROR: Dataset is empty\n", .{self.coordinator.rank});
             return error.EmptyDataset;
         }
 
@@ -387,15 +389,15 @@ pub const DistributedTrainerFuthark = struct {
         }
 
         if (samples.items.len != samples_per_rank) {
+            std.debug.print("[Rank {d}] ERROR: partition got {d} samples, expected {d}\n", .{ self.coordinator.rank, samples.items.len, samples_per_rank });
             return error.InvalidDatasetPartition;
         }
 
         if (self.coordinator.isRoot()) {
-            std.debug.print("[Rank {d}] Loaded {d} samples on this rank from {d} usable samples across {d} lines\n", .{
+            std.debug.print("[Rank {d}] Loaded {d} samples from total {d} (rank slice)\n", .{
                 self.coordinator.rank,
                 samples.items.len,
                 valid_sample_count,
-                total_line_count,
             });
         }
 
