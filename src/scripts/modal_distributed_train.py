@@ -309,38 +309,35 @@ def _read_tail(path: Path, max_chars: int = 8000) -> str:
         str(CHECKPOINT_MOUNT_PATH): checkpoint_volume,
     },
 )
-def train_rank(
-    rank: int,
+def train_all_ranks(
     world_size: int,
-    master_addr: str,
-    master_port: str,
     epochs: int,
     model_dim: int,
     num_layers: int,
     local_batch_size: int,
     dataset_path: str,
 ) -> Dict[str, Any]:
-    import sys
+    """Run all `world_size` ranks inside one B200+:8 container.
+
+    All processes share /tmp for NCCL ID rendezvous and use intra-node
+    NCCL P2P over NVLink for collective ops.
+    """
     import threading
 
     def _log(msg: str) -> None:
-        print(f"[rank {rank}] {msg}", flush=True)
+        print(f"[orch] {msg}", flush=True)
 
     _log("container started")
     data_volume.reload()
     checkpoint_volume.reload()
-    _log("volumes reloaded")
 
     gpu_count, gpu_list = _detect_gpus()
     expected_gpus = _expected_gpu_count()
-    if gpu_count < 1:
-        raise RuntimeError(f"No NVIDIA GPUs detected: {gpu_list}")
-    if gpu_count != expected_gpus:
-        raise RuntimeError(f"Expected {expected_gpus} GPUs from {GPU_SPEC}, detected {gpu_count}: {gpu_list}")
-    _log(f"detected {gpu_count} GPUs")
-
-    os.chdir(str(PROJECT_MOUNT_PATH))
-    _ensure_dir(CHECKPOINT_MOUNT_PATH)
+    if gpu_count < world_size:
+        raise RuntimeError(
+            f"Need {world_size} GPUs, detected {gpu_count} from {GPU_SPEC}: {gpu_list}"
+        )
+    _log(f"detected {gpu_count} GPUs (expected {expected_gpus})")
 
     if not BINARY_CACHE_PATH.is_file():
         raise FileNotFoundError(
@@ -351,28 +348,16 @@ def train_rank(
     local_binary.chmod(0o755)
     _log(f"binary ready at {local_binary}")
 
-    env = os.environ.copy()
-    env["WORLD_SIZE"] = str(world_size)
-    env["RANK"] = str(rank)
-    env["MASTER_ADDR"] = master_addr
-    env["MASTER_PORT"] = str(master_port)
-    env["JAIDE_EPOCHS"] = str(epochs)
-    env["JAIDE_DATASET"] = dataset_path
-    env["JAIDE_MODEL_DIM"] = str(model_dim)
-    env["JAIDE_LAYERS"] = str(num_layers)
-    env["JAIDE_BATCH_SIZE"] = str(local_batch_size)
-    env["CUDA_VISIBLE_DEVICES"] = str(rank % gpu_count)
+    nccl_id_path = Path("/tmp/jaide_nccl_id")
+    if nccl_id_path.exists():
+        nccl_id_path.unlink()
+    ready_path = Path("/tmp/jaide_nccl_id.ready")
+    if ready_path.exists():
+        ready_path.unlink()
 
     logs_dir = Path("/tmp/jaide_training_logs")
     _ensure_dir(logs_dir)
-    stdout_path = logs_dir / f"rank_{rank:03d}.stdout.log"
-    stderr_path = logs_dir / f"rank_{rank:03d}.stderr.log"
-
-    start_time = time.time()
-    return_code = -1
-    stdout_tail = ""
-    stderr_tail = ""
-    timed_out = False
+    _ensure_dir(CHECKPOINT_MOUNT_PATH)
 
     def _tee(src, dst_file, prefix: str) -> None:
         try:
@@ -380,64 +365,110 @@ def train_rank(
                 if not raw:
                     break
                 line = raw.decode("utf-8", errors="replace").rstrip("\n")
-                print(f"[rank {rank} {prefix}] {line}", flush=True)
+                print(f"[{prefix}] {line}", flush=True)
                 dst_file.write(line + "\n")
                 dst_file.flush()
         except Exception as exc:  # pragma: no cover
-            print(f"[rank {rank} {prefix}] tee error: {exc}", flush=True)
+            print(f"[{prefix}] tee error: {exc}", flush=True)
 
-    _log("spawning binary")
-    with open(stdout_path, "w", encoding="utf-8", errors="replace") as stdout_file, open(stderr_path, "w", encoding="utf-8", errors="replace") as stderr_file:
+    procs: List[subprocess.Popen] = []
+    rank_files: List[Tuple[Path, Path, Any, Any, threading.Thread, threading.Thread]] = []
+
+    base_env = os.environ.copy()
+    base_env["WORLD_SIZE"] = str(world_size)
+    base_env["MASTER_ADDR"] = "127.0.0.1"
+    base_env["MASTER_PORT"] = "29500"
+    base_env["JAIDE_EPOCHS"] = str(epochs)
+    base_env["JAIDE_DATASET"] = dataset_path
+    base_env["JAIDE_MODEL_DIM"] = str(model_dim)
+    base_env["JAIDE_LAYERS"] = str(num_layers)
+    base_env["JAIDE_BATCH_SIZE"] = str(local_batch_size)
+    base_env["JAIDE_NCCL_ID_PATH"] = str(nccl_id_path)
+    base_env["NCCL_DEBUG"] = "WARN"
+    base_env["NCCL_P2P_LEVEL"] = "NVL"
+    base_env["NCCL_IB_DISABLE"] = "1"
+    base_env["NCCL_SOCKET_IFNAME"] = "lo"
+
+    start_time = time.time()
+    _log(f"spawning {world_size} ranks in this container")
+    for rank in range(world_size):
+        env = base_env.copy()
+        env["RANK"] = str(rank)
+        env["CUDA_VISIBLE_DEVICES"] = str(rank)
+        env["LOCAL_RANK"] = str(rank)
+
+        stdout_path = logs_dir / f"rank_{rank:03d}.stdout.log"
+        stderr_path = logs_dir / f"rank_{rank:03d}.stderr.log"
+        stdout_file = open(stdout_path, "w", encoding="utf-8", errors="replace")
+        stderr_file = open(stderr_path, "w", encoding="utf-8", errors="replace")
+
+        proc = subprocess.Popen(
+            [str(local_binary)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=str(PROJECT_MOUNT_PATH),
+        )
+        t_out = threading.Thread(
+            target=_tee, args=(proc.stdout, stdout_file, f"r{rank} out"), daemon=True
+        )
+        t_err = threading.Thread(
+            target=_tee, args=(proc.stderr, stderr_file, f"r{rank} err"), daemon=True
+        )
+        t_out.start()
+        t_err.start()
+        procs.append(proc)
+        rank_files.append((stdout_path, stderr_path, stdout_file, stderr_file, t_out, t_err))
+        _log(f"rank {rank} pid={proc.pid} CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
+
+    results = []
+    timed_out_any = False
+    for rank, proc in enumerate(procs):
         try:
-            proc = subprocess.Popen(
-                [str(local_binary)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                cwd=str(PROJECT_MOUNT_PATH),
-                preexec_fn=os.setsid,
-            )
-            t_out = threading.Thread(target=_tee, args=(proc.stdout, stdout_file, "out"), daemon=True)
-            t_err = threading.Thread(target=_tee, args=(proc.stderr, stderr_file, "err"), daemon=True)
-            t_out.start()
-            t_err.start()
+            rc = proc.wait(timeout=TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out_any = True
             try:
-                return_code = proc.wait(timeout=TIMEOUT_SECONDS)
+                proc.terminate()
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                timed_out = True
-                _log("timeout, killing")
-                try:
-                    os.killpg(proc.pid, 15)
-                    proc.wait(timeout=30)
-                except (ProcessLookupError, subprocess.TimeoutExpired):
-                    try:
-                        os.killpg(proc.pid, 9)
-                    except ProcessLookupError:
-                        pass
-                    proc.wait()
-                return_code = -9
+                proc.kill()
+                proc.wait()
+            rc = -9
+        results.append((rank, int(rc)))
+        _log(f"rank {rank} exit rc={rc}")
+
+    for _, _, sout, serr, t_out, t_err in rank_files:
+        try:
             t_out.join(timeout=5)
             t_err.join(timeout=5)
-        except FileNotFoundError as e:
-            stderr_file.write(str(e))
-            return_code = 127
+        finally:
+            sout.close()
+            serr.close()
 
-    elapsed_time = float(time.time() - start_time)
-    stdout_tail = _read_tail(stdout_path)
-    stderr_tail = _read_tail(stderr_path)
-
-    loss = _extract_loss(stdout_tail) if rank == 0 else None
-    _log(f"finished rc={return_code} elapsed={elapsed_time:.1f}s loss={loss}")
+    elapsed = float(time.time() - start_time)
+    rank_results: List[Dict[str, Any]] = []
+    for rank, rc in results:
+        stdout_path, stderr_path, _, _, _, _ = rank_files[rank]
+        stdout_tail = _read_tail(stdout_path)
+        stderr_tail = _read_tail(stderr_path)
+        loss = _extract_loss(stdout_tail) if rank == 0 else None
+        rank_results.append(
+            {
+                "rank": rank,
+                "return_code": rc,
+                "timed_out": timed_out_any and rc == -9,
+                "loss": loss,
+                "stdout_tail": stdout_tail,
+                "stderr_tail": stderr_tail,
+            }
+        )
 
     return {
-        "rank": rank,
-        "return_code": int(return_code),
-        "timed_out": bool(timed_out),
-        "elapsed_seconds": elapsed_time,
-        "loss": loss,
-        "stdout_tail": stdout_tail,
-        "stderr_tail": stderr_tail,
+        "results": rank_results,
+        "elapsed_seconds": elapsed,
     }
+
 
 
 @app.function(
@@ -468,40 +499,20 @@ def orchestrate_training(
     build_version = _ensure_binary_in_cache(checkpoint_volume)
     print(f"GPU binary ready (build_version={build_version[:12]})")
 
-    master_addr = "localhost"
-    master_port = "29500"
-
-    print(f"Starting distributed training with {world_size} ranks")
+    print(f"Starting distributed training with {world_size} ranks (single container, intra-node NCCL P2P)")
     print(f"Model: dim={model_dim}, layers={num_layers}, batch={local_batch_size}")
     print(f"Dataset: {sample_count} samples, {dataset_size / 1e6:.2f} MB")
     print(f"Epochs: {epochs}")
 
-    rank_futures = []
-    for rank in range(world_size):
-        future = train_rank.spawn(
-            rank=rank,
-            world_size=world_size,
-            master_addr=master_addr,
-            master_port=master_port,
-            epochs=epochs,
-            model_dim=model_dim,
-            num_layers=num_layers,
-            local_batch_size=local_batch_size,
-            dataset_path=dataset_path,
-        )
-        rank_futures.append(future)
-
-    results = []
-    for future in rank_futures:
-        try:
-            result = future.get(timeout=TIMEOUT_SECONDS + 300)
-            results.append(result)
-        except Exception as e:
-            results.append({
-                "rank": len(results),
-                "return_code": -1,
-                "error": str(e),
-            })
+    training_result = train_all_ranks.remote(
+        world_size=world_size,
+        epochs=epochs,
+        model_dim=model_dim,
+        num_layers=num_layers,
+        local_batch_size=local_batch_size,
+        dataset_path=dataset_path,
+    )
+    results = training_result.get("results", [])
 
     successful_ranks = [r for r in results if int(r.get("return_code", -1)) == 0 and not r.get("timed_out", False)]
     rank_0_result = next((r for r in results if r.get("rank") == 0), None)

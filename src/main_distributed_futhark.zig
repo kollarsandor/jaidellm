@@ -32,11 +32,15 @@ pub fn main() !void {
     std.debug.print("NVLink: Enabled (NCCL P2P)\n", .{});
     std.debug.print("============================================================\n\n", .{});
 
-    const pid = std.os.linux.getpid();
-    var nccl_id_path_buf: [256]u8 = undefined;
+    var nccl_id_path_owned: ?[]u8 = null;
+    const nccl_id_path: []const u8 = blk: {
+        nccl_id_path_owned = std.process.getEnvVarOwned(allocator, "JAIDE_NCCL_ID_PATH") catch null;
+        break :blk nccl_id_path_owned orelse "/tmp/jaide_nccl_id";
+    };
+    defer if (nccl_id_path_owned) |owned| allocator.free(owned);
+
     var nccl_ready_path_buf: [256]u8 = undefined;
-    const nccl_id_path = try std.fmt.bufPrint(&nccl_id_path_buf, "/tmp/nccl_id_{d}", .{pid});
-    const nccl_ready_path = try std.fmt.bufPrint(&nccl_ready_path_buf, "/tmp/nccl_ready_{d}", .{pid});
+    const nccl_ready_path = try std.fmt.bufPrint(&nccl_ready_path_buf, "{s}.ready", .{nccl_id_path});
 
     var nccl_id: nccl.ncclUniqueId = undefined;
 
