@@ -384,18 +384,22 @@ def train_all_ranks(
     base_env["JAIDE_LAYERS"] = str(num_layers)
     base_env["JAIDE_BATCH_SIZE"] = str(local_batch_size)
     base_env["JAIDE_NCCL_ID_PATH"] = str(nccl_id_path)
-    base_env["NCCL_DEBUG"] = "WARN"
-    base_env["NCCL_P2P_LEVEL"] = "NVL"
+    base_env["NCCL_DEBUG"] = "INFO"
     base_env["NCCL_IB_DISABLE"] = "1"
     base_env["NCCL_SOCKET_IFNAME"] = "lo"
+    base_env["NCCL_P2P_DISABLE"] = "0"
+    base_env["NCCL_SHM_DISABLE"] = "0"
+    base_env["NCCL_NVLS_ENABLE"] = "0"
+    base_env["NCCL_LAUNCH_MODE"] = "GROUP"
+    base_env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
     start_time = time.time()
     _log(f"spawning {world_size} ranks in this container")
     for rank in range(world_size):
         env = base_env.copy()
         env["RANK"] = str(rank)
-        env["CUDA_VISIBLE_DEVICES"] = str(rank)
         env["LOCAL_RANK"] = str(rank)
+        env["JAIDE_LOCAL_RANK"] = str(rank)
 
         stdout_path = logs_dir / f"rank_{rank:03d}.stdout.log"
         stderr_path = logs_dir / f"rank_{rank:03d}.stderr.log"
@@ -419,7 +423,7 @@ def train_all_ranks(
         t_err.start()
         procs.append(proc)
         rank_files.append((stdout_path, stderr_path, stdout_file, stderr_file, t_out, t_err))
-        _log(f"rank {rank} pid={proc.pid} CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
+        _log(f"rank {rank} pid={proc.pid} LOCAL_RANK={env['LOCAL_RANK']}")
 
     results = []
     timed_out_any = False
