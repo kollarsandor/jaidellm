@@ -11,7 +11,7 @@ pub const struct_futhark_i64_1d = opaque {};
 
 pub extern "c" fn futhark_context_config_new() ?*struct_futhark_context_config;
 pub extern "c" fn futhark_context_config_free(cfg: ?*struct_futhark_context_config) void;
-pub extern "c" fn futhark_context_config_set_device(cfg: ?*struct_futhark_context_config, device: c_int) void;
+pub extern "c" fn futhark_context_config_set_device(cfg: ?*struct_futhark_context_config, device: [*:0]const u8) void;
 pub extern "c" fn futhark_context_config_set_platform(cfg: ?*struct_futhark_context_config, platform: c_int) void;
 pub extern "c" fn futhark_context_config_set_default_group_size(cfg: ?*struct_futhark_context_config, size: c_int) void;
 pub extern "c" fn futhark_context_config_set_default_num_groups(cfg: ?*struct_futhark_context_config, num: c_int) void;
