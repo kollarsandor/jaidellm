@@ -5,6 +5,7 @@ const accel = @import("../hw/accel/accel_interface.zig");
 const RSFAccelerator = accel.RSFAccelerator;
 const FutharkArray2DF16 = accel.FutharkArray2DF16;
 const FutharkArray1DF16 = accel.FutharkArray1DF16;
+const FutharkArray3DF16 = accel.FutharkArray3DF16;
 const PinnedMemory = accel.PinnedMemory;
 
 pub const TrainerConfig = struct {
@@ -76,7 +77,14 @@ pub const DistributedTrainerFuthark = struct {
         var tokenizer = try MGT.init(allocator, vocab, empty_anchors);
         errdefer tokenizer.deinit();
 
-        var accelerator = try RSFAccelerator.init(model_dim);
+        std.debug.print("tokenizer.next_token_id = {d}\n", .{tokenizer.next_token_id});
+        var actual_model_dim = model_dim;
+        if (actual_model_dim < tokenizer.next_token_id) {
+            actual_model_dim = tokenizer.next_token_id;
+            if (actual_model_dim % 2 != 0) actual_model_dim += 1;
+        }
+
+        var accelerator = try RSFAccelerator.init(actual_model_dim);
         errdefer accelerator.deinit();
 
         return DistributedTrainerFuthark{
@@ -84,8 +92,8 @@ pub const DistributedTrainerFuthark = struct {
             .coordinator = coordinator,
             .tokenizer = tokenizer,
             .accelerator = accelerator,
-            .model_dim = model_dim,
-            .vocab_size = vocab.len,
+            .model_dim = actual_model_dim,
+            .vocab_size = tokenizer.next_token_id,
             .local_batch_size = local_batch_size,
             .global_step = 0,
             .learning_rate = config.learning_rate,
@@ -542,7 +550,7 @@ pub const DistributedTrainerFuthark = struct {
             var seq_idx: usize = 0;
             while (seq_idx < list.len) : (seq_idx += 1) {
                 const token_index_raw: usize = @intCast(list[seq_idx]);
-                const token_index: usize = token_index_raw % self.model_dim;
+                const token_index: usize = token_index_raw;
 
                 const row_offset = try std.math.mul(usize, b_idx, max_seq_len);
                 const row_index = try std.math.add(usize, row_offset, seq_idx);
@@ -553,7 +561,7 @@ pub const DistributedTrainerFuthark = struct {
 
                 if (seq_idx + 1 < list.len) {
                     const next_token_raw: usize = @intCast(list[seq_idx + 1]);
-                    const next_token: usize = next_token_raw % self.model_dim;
+                    const next_token: usize = next_token_raw;
                     const tgt_final = try std.math.add(usize, base_idx, next_token);
                     if (tgt_final >= target_f16_data.len) return error.IndexOutOfBounds;
                     target_f16_data[tgt_final] = @as(f16, 1.0);
@@ -561,10 +569,10 @@ pub const DistributedTrainerFuthark = struct {
             }
         }
 
-        var inputs = try FutharkArray2DF16.newFromFlat(&self.accelerator.ctx, input_f16_data, batch_rows, self.model_dim);
+        var inputs = try FutharkArray3DF16.newFromFlat(&self.accelerator.ctx, input_f16_data, effective_batch_size, max_seq_len, self.model_dim);
         defer inputs.free(&self.accelerator.ctx);
 
-        var targets = try FutharkArray2DF16.newFromFlat(&self.accelerator.ctx, target_f16_data, batch_rows, self.model_dim);
+        var targets = try FutharkArray3DF16.newFromFlat(&self.accelerator.ctx, target_f16_data, effective_batch_size, max_seq_len, self.model_dim);
         defer targets.free(&self.accelerator.ctx);
 
         const lr_f16: f16 = @floatCast(self.learning_rate);
