@@ -282,6 +282,17 @@ pub const GPUCoordinator = struct {
         try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat16, .ncclSum, "ncclAllReduceFloat16Sum");
     }
 
+    /// In-place average across ranks (NCCL ncclAvg op, available since 2.10).
+    /// The result on every rank equals (sum of inputs) / world_size, computed
+    /// without leaving the GPU.
+    pub fn allReduceFloat16Avg(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
+        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat16, .ncclAvg, "ncclAllReduceFloat16Avg");
+    }
+
+    pub fn allReduceFloat32Avg(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
+        try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclAvg, "ncclAllReduceFloat32Avg");
+    }
+
     pub fn allReduceFloat32Max(self: *GPUCoordinator, send_buf: *const anyopaque, recv_buf: *anyopaque, count: usize) !void {
         try self.doAllReduce(send_buf, recv_buf, count, .ncclFloat32, .ncclMax, "ncclAllReduceFloat32Max");
     }

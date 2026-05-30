@@ -41,7 +41,9 @@ pub extern "c" fn futhark_values_f16_3d(ctx: ?*struct_futhark_context, arr: ?*st
 pub extern "c" fn futhark_values_f16_2d_to_f32(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f16_2d, data: ?[*]f32) c_int;
 pub extern "c" fn futhark_values_f16_3d_to_f32(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f16_3d, data: ?[*]f32) c_int;
 
+pub extern "c" fn futhark_values_raw_f16_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f16_1d) ?*anyopaque;
 pub extern "c" fn futhark_values_raw_f16_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f16_2d) ?*anyopaque;
+pub extern "c" fn futhark_shape_f16_1d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f16_1d, dims: ?[*]i64) c_int;
 pub extern "c" fn futhark_shape_f16_2d(ctx: ?*struct_futhark_context, arr: ?*struct_futhark_f16_2d, dims: ?[*]i64) c_int;
 
 pub extern "c" fn futhark_new_f32_1d(ctx: ?*struct_futhark_context, data: ?[*]const f32, dim0: i64) ?*struct_futhark_f32_1d;

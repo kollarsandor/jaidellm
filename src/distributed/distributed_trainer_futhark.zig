@@ -285,6 +285,39 @@ pub const DistributedTrainerFuthark = struct {
         }
     }
 
+    /// All-reduce-average every per-layer tensor across ranks directly on the
+    /// GPU. We average weights and biases (the model state) AND the SFD
+    /// velocity buffers, so every rank starts the next step with identical
+    /// state and the training trajectory does not diverge across ranks.
+    ///
+    /// This is the GPU-resident replacement for the older snapshot/delta/merge
+    /// loop that used to copy each per-layer matrix to host RAM for the
+    /// allReduce. With ~24 layers x 8 tensors x 2 MB each, eliminating the
+    /// host roundtrip removes the dominant per-step overhead.
+    fn gpuAllReduceLayers(self: *DistributedTrainerFuthark) !void {
+        if (self.coordinator.world_size <= 1) return;
+
+        const kinds = [_]accel.WeightKind{
+            .weights_s,
+            .weights_t,
+            .s_bias,
+            .t_bias,
+            .velocity_s,
+            .velocity_t,
+            .velocity_sb,
+            .velocity_tb,
+        };
+
+        var li: usize = 0;
+        while (li < self.num_layers) : (li += 1) {
+            for (kinds) |k| {
+                const info = try self.accelerator.getLayerDevicePtr(li, k);
+                if (info.count == 0) continue;
+                try self.coordinator.allReduceFloat16Avg(info.ptr, info.ptr, info.count);
+            }
+        }
+    }
+
     fn applyDeltaToLayer(self: *DistributedTrainerFuthark, layer_idx: usize, base: []const f16, delta: []const f16, which: enum { s, t }) !void {
         if (base.len != delta.len) {
             return error.InvalidWeightsShape;
@@ -624,56 +657,20 @@ pub const DistributedTrainerFuthark = struct {
             return loss_f32;
         }
 
-        // Distributed path: snapshot all N layers' W_s and W_t, do the local step,
-        // re-snapshot, compute and average deltas, then apply them back per layer.
-        const ws_before = try self.allocator.alloc([]f16, self.num_layers);
-        defer {
-            for (ws_before) |p| if (p.len > 0) self.allocator.free(p);
-            self.allocator.free(ws_before);
-        }
-        const wt_before = try self.allocator.alloc([]f16, self.num_layers);
-        defer {
-            for (wt_before) |p| if (p.len > 0) self.allocator.free(p);
-            self.allocator.free(wt_before);
-        }
-        for (ws_before) |*p| p.* = &.{};
-        for (wt_before) |*p| p.* = &.{};
-
-        var li_before: usize = 0;
-        while (li_before < self.num_layers) : (li_before += 1) {
-            ws_before[li_before] = try self.readLayerMatrix(li_before, .weights_s);
-            wt_before[li_before] = try self.readLayerMatrix(li_before, .weights_t);
-        }
-
+        // Distributed path: run the local SFD step on every rank, then average
+        // the post-step weights+biases (and optionally velocities) across ranks
+        // directly on the GPU via NCCL ncclAvg — no host roundtrip per layer.
+        //
+        // Math: each rank starts step with identical W. After local step every
+        // rank has W_i = W + delta_i. Averaging W_i across ranks yields
+        //   W + avg(delta_i) == correct distributed update.
+        // So we don't need to snapshot anything — just allReduceAvg the live
+        // GPU buffers in place.
         const loss_f16 = try self.accelerator.trainingStep(&inputs, &targets, lr_f16, mom_f16);
         try self.accelerator.sync();
 
-        var li_after: usize = 0;
-        while (li_after < self.num_layers) : (li_after += 1) {
-            const ws_after = try self.readLayerMatrix(li_after, .weights_s);
-            defer self.allocator.free(ws_after);
-            const wt_after = try self.readLayerMatrix(li_after, .weights_t);
-            defer self.allocator.free(wt_after);
-
-            if (ws_after.len != ws_before[li_after].len or wt_after.len != wt_before[li_after].len) {
-                return error.InvalidWeightsShape;
-            }
-
-            for (ws_after, ws_before[li_after]) |*after_value, before_value| {
-                const d = @as(f32, @floatCast(after_value.*)) - @as(f32, @floatCast(before_value));
-                after_value.* = @floatCast(d);
-            }
-            for (wt_after, wt_before[li_after]) |*after_value, before_value| {
-                const d = @as(f32, @floatCast(after_value.*)) - @as(f32, @floatCast(before_value));
-                after_value.* = @floatCast(d);
-            }
-
-            try self.averageDeltaInPlace(ws_after);
-            try self.averageDeltaInPlace(wt_after);
-
-            try self.applyDeltaToLayer(li_after, ws_before[li_after], ws_after, .s);
-            try self.applyDeltaToLayer(li_after, wt_before[li_after], wt_after, .t);
-        }
+        try self.gpuAllReduceLayers();
+        try self.coordinator.synchronize();
         try self.accelerator.sync();
 
         var loss_arr = [1]f32{@as(f32, @floatCast(loss_f16))};

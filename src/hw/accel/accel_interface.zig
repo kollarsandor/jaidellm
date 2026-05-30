@@ -106,7 +106,23 @@ pub const FutharkContext = struct {
 
         return raw_ptr.?;
     }
+
+    pub fn getDataPointer1D(self: *Self, array: *FutharkArray1DF16) AccelError!*anyopaque {
+        if (self.ctx == null) return AccelError.NullPointer;
+        if (array.arr == null) return AccelError.NullPointer;
+
+        const raw_ptr = futhark.futhark_values_raw_f16_1d(self.ctx, array.arr);
+        if (raw_ptr == null) {
+            return AccelError.NullPointer;
+        }
+
+        return raw_ptr.?;
+    }
 };
+
+fn get1DDevicePtr(ctx: *FutharkContext, array: *FutharkArray1DF16) AccelError!*anyopaque {
+    return ctx.getDataPointer1D(array);
+}
 
 pub const PinnedMemory = struct {
     ptr: ?*anyopaque,
@@ -1056,6 +1072,31 @@ pub const RSFAccelerator = struct {
             .t_bias => readBiasFlat(self, &layer.t_bias, allocator),
             .velocity_sb => readBiasFlat(self, &layer.velocity_sb, allocator),
             .velocity_tb => readBiasFlat(self, &layer.velocity_tb, allocator),
+        };
+    }
+
+    /// Returns the raw GPU device pointer for the requested per-layer tensor.
+    /// Used by the distributed trainer to feed NCCL allReduce directly
+    /// without round-tripping through host memory.
+    /// Element count is the second return value (half*half for matrices,
+    /// half for biases).
+    pub fn getLayerDevicePtr(
+        self: *Self,
+        layer_idx: usize,
+        kind: WeightKind,
+    ) AccelError!struct { ptr: *anyopaque, count: usize } {
+        if (!self.initialized) return AccelError.NullPointer;
+        const layer = try self.layerPtr(layer_idx);
+        const half = self.model_dim / 2;
+        return switch (kind) {
+            .weights_s => .{ .ptr = try self.ctx.getDataPointer(&layer.weights_s), .count = half * half },
+            .weights_t => .{ .ptr = try self.ctx.getDataPointer(&layer.weights_t), .count = half * half },
+            .velocity_s => .{ .ptr = try self.ctx.getDataPointer(&layer.velocity_s), .count = half * half },
+            .velocity_t => .{ .ptr = try self.ctx.getDataPointer(&layer.velocity_t), .count = half * half },
+            .s_bias => .{ .ptr = try get1DDevicePtr(&self.ctx, &layer.s_bias), .count = half },
+            .t_bias => .{ .ptr = try get1DDevicePtr(&self.ctx, &layer.t_bias), .count = half },
+            .velocity_sb => .{ .ptr = try get1DDevicePtr(&self.ctx, &layer.velocity_sb), .count = half },
+            .velocity_tb => .{ .ptr = try get1DDevicePtr(&self.ctx, &layer.velocity_tb), .count = half },
         };
     }
 
