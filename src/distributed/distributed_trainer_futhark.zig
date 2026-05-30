@@ -510,10 +510,26 @@ pub const DistributedTrainerFuthark = struct {
             try token_lists.append(token_list);
         }
 
+        // Hard cap on sequence length to prevent rogue long samples from
+        // ballooning the padded batch (saw a 31k-token sample inflate
+        // max_seq_len to 31159 -> 99%% pad rows, diluted loss, f16 overflow).
+        // Default 256 tokens, configurable via JAIDE_MAX_SEQ_LEN.
+        const cap: usize = blk: {
+            const env_val = std.process.getEnvVarOwned(self.allocator, "JAIDE_MAX_SEQ_LEN") catch break :blk 256;
+            defer self.allocator.free(env_val);
+            const parsed = std.fmt.parseInt(usize, env_val, 10) catch break :blk 256;
+            if (parsed == 0) break :blk 256;
+            break :blk parsed;
+        };
+
         var max_seq_len: usize = 0;
-        for (token_lists.items) |list| {
+        for (token_lists.items) |*list| {
+            if (list.items.len > cap) {
+                list.shrinkRetainingCapacity(cap);
+            }
             max_seq_len = @max(max_seq_len, list.items.len);
         }
+        if (max_seq_len > cap) max_seq_len = cap;
 
         if (self.coordinator.world_size > 1) {
             var msl_arr = [1]f32{@floatFromInt(max_seq_len)};
@@ -524,8 +540,9 @@ pub const DistributedTrainerFuthark = struct {
             try self.coordinator.allReduceFloat32Max(dev, dev, msl_arr.len);
             try self.coordinator.copyDeviceToHost(std.mem.sliceAsBytes(msl_arr[0..]), dev, byte_count);
             try self.coordinator.synchronize();
-            const global_msl: usize = @intFromFloat(msl_arr[0]);
+            var global_msl: usize = @intFromFloat(msl_arr[0]);
             if (global_msl == 0) return 0.0;
+            if (global_msl > cap) global_msl = cap;
             max_seq_len = global_msl;
         } else {
             if (max_seq_len == 0) return 0.0;
@@ -573,6 +590,58 @@ pub const DistributedTrainerFuthark = struct {
                     target_f16_data[tgt_final] = @as(f16, 1.0);
                 }
             }
+        }
+
+        if (self.global_step == 0 and self.coordinator.isRoot() and token_lists.items.len > 0) {
+            const first_list = token_lists.items[0].items;
+            const dump_n: usize = @min(@as(usize, 12), first_list.len);
+            std.debug.print("[Rank 0 step0] first sample tokens (len={d}): ", .{first_list.len});
+            {
+                var i: usize = 0;
+                while (i < dump_n) : (i += 1) {
+                    std.debug.print("{d} ", .{first_list[i]});
+                }
+                std.debug.print("\n", .{});
+            }
+
+            // Scan first dump_n rows of batch 0 in input_f16_data / target_f16_data
+            // and report which token index is set to 1.0. Confirms 1-token shift.
+            std.debug.print("[Rank 0 step0] input row->token: ", .{});
+            {
+                var row: usize = 0;
+                while (row < dump_n) : (row += 1) {
+                    const base = row * self.model_dim;
+                    var found: isize = -1;
+                    var c: usize = 0;
+                    while (c < self.model_dim) : (c += 1) {
+                        if (input_f16_data[base + c] != @as(f16, 0.0)) {
+                            found = @intCast(c);
+                            break;
+                        }
+                    }
+                    std.debug.print("[{d}]={d} ", .{ row, found });
+                }
+                std.debug.print("\n", .{});
+            }
+            std.debug.print("[Rank 0 step0] target row->token: ", .{});
+            {
+                var row: usize = 0;
+                while (row < dump_n) : (row += 1) {
+                    const base = row * self.model_dim;
+                    var found: isize = -1;
+                    var c: usize = 0;
+                    while (c < self.model_dim) : (c += 1) {
+                        if (target_f16_data[base + c] != @as(f16, 0.0)) {
+                            found = @intCast(c);
+                            break;
+                        }
+                    }
+                    std.debug.print("[{d}]={d} ", .{ row, found });
+                }
+                std.debug.print("\n", .{});
+            }
+            std.debug.print("[Rank 0 step0] (target[i] must equal input[i+1] => 1-token shift)\n", .{});
+            std.debug.print("[Rank 0 step0] effective_batch_size={d} max_seq_len={d} model_dim={d}\n", .{ effective_batch_size, max_seq_len, self.model_dim });
         }
 
         var inputs = try FutharkArray3DF16.newFromFlat(&self.accelerator.ctx, input_f16_data, effective_batch_size, max_seq_len, self.model_dim);

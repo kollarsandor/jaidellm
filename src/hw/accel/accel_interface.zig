@@ -480,10 +480,33 @@ pub const RSFAccelerator = struct {
         var ctx = try FutharkContext.init();
         errdefer ctx.deinit();
 
-        var weights_s = try FutharkArray2DF16.newZeros(&ctx, half, half);
+        // Initialize weights with small Gaussian noise (stddev = 0.02) so RSF
+        // is not stuck in the identity passthrough regime. All ranks use the
+        // SAME fixed seed so that the model is consistent across the cluster
+        // before any all-reduce happens.
+        const total: usize = half * half;
+        const init_seed: u64 = 0x4A41494445204E4F; // "JAIDE NO"
+        const init_stddev: f32 = 0.02;
+        var rng = std.Random.DefaultPrng.init(init_seed);
+        const rnd = rng.random();
+
+        const ws_buf = std.heap.page_allocator.alloc(f16, total) catch return AccelError.AllocationFailed;
+        defer std.heap.page_allocator.free(ws_buf);
+        const wt_buf = std.heap.page_allocator.alloc(f16, total) catch return AccelError.AllocationFailed;
+        defer std.heap.page_allocator.free(wt_buf);
+        for (ws_buf) |*v| {
+            const r = rnd.floatNorm(f32) * init_stddev;
+            v.* = @floatCast(r);
+        }
+        for (wt_buf) |*v| {
+            const r = rnd.floatNorm(f32) * init_stddev;
+            v.* = @floatCast(r);
+        }
+
+        var weights_s = try FutharkArray2DF16.newFromFlat(&ctx, ws_buf, half, half);
         errdefer weights_s.free(&ctx);
 
-        var weights_t = try FutharkArray2DF16.newZeros(&ctx, half, half);
+        var weights_t = try FutharkArray2DF16.newFromFlat(&ctx, wt_buf, half, half);
         errdefer weights_t.free(&ctx);
 
         var s_bias = try FutharkArray1DF16.newZeros(&ctx, half);
