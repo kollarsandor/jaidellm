@@ -343,6 +343,30 @@ pub const DistributedTrainerFuthark = struct {
         }
     }
 
+    fn applyBiasDeltaToLayer(self: *DistributedTrainerFuthark, layer_idx: usize, base: []const f16, delta: []const f16, which: enum { s, t }) !void {
+        if (base.len != delta.len) {
+            return error.InvalidWeightsShape;
+        }
+        const half: usize = self.model_dim / 2;
+        if (base.len != half) {
+            std.debug.print("[Rank {d}] applyBiasDeltaToLayer: base.len={d}, expected half={d}, model_dim={d}\n", .{ self.coordinator.rank, base.len, half, self.model_dim });
+            return error.InvalidWeightsShape;
+        }
+
+        var merged = try self.allocator.alloc(f16, base.len);
+        defer self.allocator.free(merged);
+
+        for (base, delta, 0..) |base_value, delta_value, idx| {
+            const merged_value = @as(f32, @floatCast(base_value)) + @as(f32, @floatCast(delta_value));
+            merged[idx] = @floatCast(merged_value);
+        }
+
+        switch (which) {
+            .s => try self.accelerator.setLayerSBias(layer_idx, merged, half),
+            .t => try self.accelerator.setLayerTBias(layer_idx, merged, half),
+        }
+    }
+
     pub fn loadDataset(self: *DistributedTrainerFuthark, dataset_path: []const u8) ![][]const u8 {
         if (self.coordinator.world_size == 0) return error.InvalidWorldSize;
         if (self.coordinator.rank >= self.coordinator.world_size) return error.InvalidRank;
@@ -657,9 +681,11 @@ pub const DistributedTrainerFuthark = struct {
             return loss_f32;
         }
 
-        // Distributed path: snapshot all N layers' W_s and W_t, do the local
-        // step, re-snapshot, compute and average deltas, then apply them back
-        // per layer.
+        // Distributed path: snapshot every per-layer tensor (W_s, W_t, s_bias,
+        // t_bias) BEFORE the local SFD step, then re-snapshot AFTER, compute
+        // per-rank deltas, all-reduce-average the deltas across ranks, and
+        // overwrite the layer state with (before + avg_delta). This keeps all
+        // ranks in lockstep so the model state never diverges.
         //
         // We keep the host-resident snapshot+delta+merge path here because the
         // alternative — handing Futhark device pointers directly to NCCL via
@@ -667,23 +693,40 @@ pub const DistributedTrainerFuthark = struct {
         // round-trip cleanly through external NCCL collectives). The
         // GPU-resident fast path lives behind `gpuAllReduceLayers` and can be
         // re-enabled once that interop is sorted out.
-        const ws_before = try self.allocator.alloc([]f16, self.num_layers);
+        const Snapshots = struct {
+            ws: [][]f16,
+            wt: [][]f16,
+            sb: [][]f16,
+            tb: [][]f16,
+        };
+
+        var snap = Snapshots{
+            .ws = try self.allocator.alloc([]f16, self.num_layers),
+            .wt = try self.allocator.alloc([]f16, self.num_layers),
+            .sb = try self.allocator.alloc([]f16, self.num_layers),
+            .tb = try self.allocator.alloc([]f16, self.num_layers),
+        };
         defer {
-            for (ws_before) |p| if (p.len > 0) self.allocator.free(p);
-            self.allocator.free(ws_before);
+            for (snap.ws) |p| if (p.len > 0) self.allocator.free(p);
+            for (snap.wt) |p| if (p.len > 0) self.allocator.free(p);
+            for (snap.sb) |p| if (p.len > 0) self.allocator.free(p);
+            for (snap.tb) |p| if (p.len > 0) self.allocator.free(p);
+            self.allocator.free(snap.ws);
+            self.allocator.free(snap.wt);
+            self.allocator.free(snap.sb);
+            self.allocator.free(snap.tb);
         }
-        const wt_before = try self.allocator.alloc([]f16, self.num_layers);
-        defer {
-            for (wt_before) |p| if (p.len > 0) self.allocator.free(p);
-            self.allocator.free(wt_before);
-        }
-        for (ws_before) |*p| p.* = &.{};
-        for (wt_before) |*p| p.* = &.{};
+        for (snap.ws) |*p| p.* = &.{};
+        for (snap.wt) |*p| p.* = &.{};
+        for (snap.sb) |*p| p.* = &.{};
+        for (snap.tb) |*p| p.* = &.{};
 
         var li_before: usize = 0;
         while (li_before < self.num_layers) : (li_before += 1) {
-            ws_before[li_before] = try self.readLayerMatrix(li_before, .weights_s);
-            wt_before[li_before] = try self.readLayerMatrix(li_before, .weights_t);
+            snap.ws[li_before] = try self.readLayerMatrix(li_before, .weights_s);
+            snap.wt[li_before] = try self.readLayerMatrix(li_before, .weights_t);
+            snap.sb[li_before] = try self.readLayerMatrix(li_before, .s_bias);
+            snap.tb[li_before] = try self.readLayerMatrix(li_before, .t_bias);
         }
 
         const loss_f16 = try self.accelerator.trainingStep(&inputs, &targets, lr_f16, mom_f16);
@@ -695,25 +738,44 @@ pub const DistributedTrainerFuthark = struct {
             defer self.allocator.free(ws_after);
             const wt_after = try self.readLayerMatrix(li_after, .weights_t);
             defer self.allocator.free(wt_after);
+            const sb_after = try self.readLayerMatrix(li_after, .s_bias);
+            defer self.allocator.free(sb_after);
+            const tb_after = try self.readLayerMatrix(li_after, .t_bias);
+            defer self.allocator.free(tb_after);
 
-            if (ws_after.len != ws_before[li_after].len or wt_after.len != wt_before[li_after].len) {
+            if (ws_after.len != snap.ws[li_after].len or
+                wt_after.len != snap.wt[li_after].len or
+                sb_after.len != snap.sb[li_after].len or
+                tb_after.len != snap.tb[li_after].len)
+            {
                 return error.InvalidWeightsShape;
             }
 
-            for (ws_after, ws_before[li_after]) |*after_value, before_value| {
-                const d = @as(f32, @floatCast(after_value.*)) - @as(f32, @floatCast(before_value));
-                after_value.* = @floatCast(d);
+            // Convert (after) buffers into deltas in-place: after := after - before
+            for (ws_after, snap.ws[li_after]) |*v, b| {
+                v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
             }
-            for (wt_after, wt_before[li_after]) |*after_value, before_value| {
-                const d = @as(f32, @floatCast(after_value.*)) - @as(f32, @floatCast(before_value));
-                after_value.* = @floatCast(d);
+            for (wt_after, snap.wt[li_after]) |*v, b| {
+                v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
+            }
+            for (sb_after, snap.sb[li_after]) |*v, b| {
+                v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
+            }
+            for (tb_after, snap.tb[li_after]) |*v, b| {
+                v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
             }
 
+            // All-reduce-average the deltas so every rank applies the same update.
             try self.averageDeltaInPlace(ws_after);
             try self.averageDeltaInPlace(wt_after);
+            try self.averageDeltaInPlace(sb_after);
+            try self.averageDeltaInPlace(tb_after);
 
-            try self.applyDeltaToLayer(li_after, ws_before[li_after], ws_after, .s);
-            try self.applyDeltaToLayer(li_after, wt_before[li_after], wt_after, .t);
+            // Overwrite layer state: state := before + averaged_delta.
+            try self.applyDeltaToLayer(li_after, snap.ws[li_after], ws_after, .s);
+            try self.applyDeltaToLayer(li_after, snap.wt[li_after], wt_after, .t);
+            try self.applyBiasDeltaToLayer(li_after, snap.sb[li_after], sb_after, .s);
+            try self.applyBiasDeltaToLayer(li_after, snap.tb[li_after], tb_after, .t);
         }
         try self.accelerator.sync();
 
