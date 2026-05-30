@@ -510,10 +510,26 @@ pub const DistributedTrainerFuthark = struct {
             try token_lists.append(token_list);
         }
 
+        // Hard cap on sequence length to prevent rogue long samples from
+        // ballooning the padded batch (saw a 31k-token sample inflate
+        // max_seq_len to 31159 -> 99%% pad rows, diluted loss, f16 overflow).
+        // Default 256 tokens, configurable via JAIDE_MAX_SEQ_LEN.
+        const cap: usize = blk: {
+            const env_val = std.process.getEnvVarOwned(self.allocator, "JAIDE_MAX_SEQ_LEN") catch break :blk 256;
+            defer self.allocator.free(env_val);
+            const parsed = std.fmt.parseInt(usize, env_val, 10) catch break :blk 256;
+            if (parsed == 0) break :blk 256;
+            break :blk parsed;
+        };
+
         var max_seq_len: usize = 0;
-        for (token_lists.items) |list| {
+        for (token_lists.items) |*list| {
+            if (list.items.len > cap) {
+                list.shrinkRetainingCapacity(cap);
+            }
             max_seq_len = @max(max_seq_len, list.items.len);
         }
+        if (max_seq_len > cap) max_seq_len = cap;
 
         if (self.coordinator.world_size > 1) {
             var msl_arr = [1]f32{@floatFromInt(max_seq_len)};
@@ -524,8 +540,9 @@ pub const DistributedTrainerFuthark = struct {
             try self.coordinator.allReduceFloat32Max(dev, dev, msl_arr.len);
             try self.coordinator.copyDeviceToHost(std.mem.sliceAsBytes(msl_arr[0..]), dev, byte_count);
             try self.coordinator.synchronize();
-            const global_msl: usize = @intFromFloat(msl_arr[0]);
+            var global_msl: usize = @intFromFloat(msl_arr[0]);
             if (global_msl == 0) return 0.0;
+            if (global_msl > cap) global_msl = cap;
             max_seq_len = global_msl;
         } else {
             if (max_seq_len == 0) return 0.0;
