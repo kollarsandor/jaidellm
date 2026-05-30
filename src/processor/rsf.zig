@@ -994,19 +994,19 @@ fn uploadLayerToAccel(core: *RSFCore, layer: *const LayerCore, ga: *accel.RSFAcc
 
     var i: usize = 0;
     while (i < dim_sq) : (i += 1) f16_buf[i] = @floatCast(layer.s_weight.data[i]);
-    try ga.setWeightsS(f16_buf[0..dim_sq], core.dim, core.dim);
+    try ga.setLayerWeightsS(0, f16_buf[0..dim_sq], core.dim, core.dim);
 
     i = 0;
     while (i < dim_sq) : (i += 1) f16_buf[i] = @floatCast(layer.t_weight.data[i]);
-    try ga.setWeightsT(f16_buf[0..dim_sq], core.dim, core.dim);
+    try ga.setLayerWeightsT(0, f16_buf[0..dim_sq], core.dim, core.dim);
 
     i = 0;
     while (i < core.dim) : (i += 1) bias_f16[i] = @floatCast(layer.s_bias.data[i]);
-    try ga.setSBias(bias_f16[0..core.dim], core.dim);
+    try ga.setLayerSBias(0, bias_f16[0..core.dim], core.dim);
 
     i = 0;
     while (i < core.dim) : (i += 1) bias_f16[i] = @floatCast(layer.t_bias.data[i]);
-    try ga.setTBias(bias_f16[0..core.dim], core.dim);
+    try ga.setLayerTBias(0, bias_f16[0..core.dim], core.dim);
 }
 
 fn syncAllLayersGPU(core: *RSFCore) !void {
@@ -1034,7 +1034,7 @@ fn syncAllLayersGPU(core: *RSFCore) !void {
     var local_f16_owned = true;
     errdefer if (local_f16_owned) core.allocator.free(local_f16);
 
-    var staged_accel = accel.RSFAccelerator.init(core.dim) catch return error.NoGPUAvailable;
+    var staged_accel = accel.RSFAccelerator.initMultiLayer(core.dim, 1, core.allocator) catch return error.NoGPUAvailable;
     var staged_owned = true;
     errdefer if (staged_owned) staged_accel.deinit();
 

@@ -115,6 +115,88 @@ entry batch_gradients [batch_size][seq_len][half] (inputs: [batch_size][seq_len]
   let gtb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) gtb_list
   in (copy gs_total, copy gt_total, copy gsb_total, copy gtb_total)
 
+-- Single-sample RSF backward that ALSO computes grad_input (for chaining multi-layer backprop).
+-- Returns: (grad_ws, grad_wt, grad_sb, grad_tb, grad_input)
+-- grad_ws, grad_wt: [half][half] -- summed over the `n` (=seq_len) dimension
+-- grad_sb, grad_tb: [half] -- summed over the `n` dimension
+-- grad_input: [n][half*2] -- per-timestep input gradient for next-layer-up backward
+entry rsf_backward_full [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2]f16)
+  (weights_s: [half][half]f16) (weights_t: [half][half]f16)
+  (s_bias: [half]f16) (t_bias: [half]f16)
+  (clip_min: f16) (clip_max: f16)
+  : ([half][half]f16, [half][half]f16, [half]f16, [half]f16, [n][half*2]f16) =
+  let d = half * 2
+  -- Per-token computation: per-token weight/bias gradient + per-token input gradient
+  let per_token = map2 (\row g_row ->
+    let x1 = row[0:half] :> [half]f16
+    let x2 = row[half:d] :> [half]f16
+    let pre_scale = map2 (\j bias ->
+      bias f16.+ f16.sum (map2 (\w x -> w f16.* x) weights_s[j] x2)
+    ) (iota half) s_bias
+    let scale = map (\ps ->
+      let clipped = f16.max clip_min (f16.min clip_max ps)
+      in f16.exp clipped
+    ) pre_scale
+    let y1 = map2 (\a b -> a f16.* b) x1 scale
+    let dy1 = g_row[0:half] :> [half]f16
+    let dy2 = g_row[half:d] :> [half]f16
+    let grad_wt_tok = map (\j -> map (\k -> dy2[j] f16.* y1[k]) (iota half)) (iota half)
+    let grad_tb_tok = dy2
+    -- dy1_total[j] = dy1[j] + sum_k(W_t[k][j] * dy2[k])
+    let dy1_total = map2 (\dy1_j j ->
+      dy1_j f16.+ f16.sum (map (\k -> weights_t[k][j] f16.* dy2[k]) (iota half))
+    ) dy1 (iota half)
+    -- ds = d_pre_scale = dy1_total * y1   (in-range gated)
+    let ds = map2 (\j ps ->
+      let in_range = ps f16.>= clip_min && ps f16.<= clip_max
+      in if in_range then dy1_total[j] f16.* y1[j] else (f16.i32 0)
+    ) (iota half) pre_scale
+    let grad_ws_tok = map (\j -> map (\k -> ds[j] f16.* x2[k]) (iota half)) (iota half)
+    let grad_sb_tok = ds
+    -- Input gradients flowing to previous layer:
+    -- dx1[k] = dy1_total[k] * scale[k]   (from y1 = x1 * scale; dy1_total is accumulated grad at y1)
+    -- dx2[k] = dy2[k] + sum_j(ds[j] * W_s[j][k])
+    let dx1 = map2 (\g s -> g f16.* s) dy1_total scale
+    let dx2_from_ds = map (\k ->
+      f16.sum (map (\j -> ds[j] f16.* weights_s[j][k]) (iota half))
+    ) (iota half)
+    let dx2 = map2 (\a b -> a f16.+ b) dy2 dx2_from_ds
+    let grad_in_row = dx1 ++ dx2 :> [half*2]f16
+    in (grad_ws_tok, grad_wt_tok, grad_sb_tok, grad_tb_tok, grad_in_row)
+  ) input grad_output
+  let (gw_s_list, gw_t_list, g_sb_list, g_tb_list, g_in_rows) = unzip5 per_token
+  let gs_total = reduce (map2 (map2 (f16.+))) (replicate half (replicate half (f16.i32 0))) gw_s_list
+  let gt_total = reduce (map2 (map2 (f16.+))) (replicate half (replicate half (f16.i32 0))) gw_t_list
+  let gsb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) g_sb_list
+  let gtb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) g_tb_list
+  in (gs_total, gt_total, gsb_total, gtb_total, g_in_rows)
+
+-- Batched version of rsf_backward_full.
+-- Sums weight/bias gradients across all batch_size*seq_len tokens, but preserves
+-- per-token grad_input (shape [batch_size][seq_len][half*2]) for further backprop.
+entry batch_gradients_full [batch_size][seq_len][half]
+  (inputs: [batch_size][seq_len][half*2]f16)
+  (grad_outputs: [batch_size][seq_len][half*2]f16)
+  (weights_s: [half][half]f16) (weights_t: [half][half]f16)
+  (s_bias: [half]f16) (t_bias: [half]f16)
+  (clip_min: f16) (clip_max: f16)
+  : ([half][half]f16, [half][half]f16, [half]f16, [half]f16, *[batch_size][seq_len][half*2]f16) =
+  let results = map2 (\inp g_out ->
+    rsf_backward_full inp g_out weights_s weights_t s_bias t_bias clip_min clip_max
+  ) inputs grad_outputs
+  let (gs_list, gt_list, gsb_list, gtb_list, gin_list) = unzip5 results
+  let gs_total = reduce (map2 (map2 (f16.+))) (replicate half (replicate half (f16.i32 0))) gs_list
+  let gt_total = reduce (map2 (map2 (f16.+))) (replicate half (replicate half (f16.i32 0))) gt_list
+  let gsb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) gsb_list
+  let gtb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) gtb_list
+  in (copy gs_total, copy gt_total, copy gsb_total, copy gtb_total, copy gin_list)
+
+-- 2 * (output - target) per element. Used as the initial dL/dY at the top of the stack.
+entry compute_initial_grad_l2 [batch_size][seq_len][d]
+  (outputs: [batch_size][seq_len][d]f16) (targets: [batch_size][seq_len][d]f16)
+  : *[batch_size][seq_len][d]f16 =
+  map2 (map2 (map2 (\o t -> (f16.f32 2.0) f16.* (o f16.- t)))) outputs targets
+
 entry xavier_fill_inplace [d] (weights: *[d][d]f16) (seed: i32) : *[d][d]f16 =
   let scale = f16.sqrt (f16.f32 2.0 f16./ f16.i64 d)
   in map (\i ->

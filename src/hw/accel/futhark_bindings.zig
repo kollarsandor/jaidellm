@@ -9,6 +9,7 @@ pub const struct_futhark_f32_3d = opaque {};
 pub const struct_futhark_u64_1d = opaque {};
 pub const struct_futhark_i64_1d = opaque {};
 pub const struct_futhark_opaque_tup9 = opaque {};
+pub const struct_futhark_opaque_tup5_grad_full = opaque {};
 
 pub extern "c" fn futhark_context_config_new() ?*struct_futhark_context_config;
 pub extern "c" fn futhark_context_config_free(cfg: ?*struct_futhark_context_config) void;
@@ -174,4 +175,144 @@ pub extern "c" fn futhark_entry_training_step(
     in11_momentum: u16,
     in12_clip_min: u16,
     in13_clip_max: u16,
+) c_int;
+
+// === Multi-layer backprop primitives ===
+// `batch_forward` returns the full-sample output tensor [batch][seq][half*2] so it can be cached
+// as activations between layers.
+pub extern "c" fn futhark_entry_batch_forward(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_3d,
+    in0_inputs: ?*const struct_futhark_f16_3d,
+    in1_weights_s: ?*const struct_futhark_f16_2d,
+    in2_weights_t: ?*const struct_futhark_f16_2d,
+    in3_s_bias: ?*const struct_futhark_f16_1d,
+    in4_t_bias: ?*const struct_futhark_f16_1d,
+    in5_clip_min: u16,
+    in6_clip_max: u16,
+) c_int;
+
+// `batch_compute_loss` returns the scalar mean-squared-error loss in f16 (accumulated in f32).
+pub extern "c" fn futhark_entry_batch_compute_loss(
+    ctx: ?*struct_futhark_context,
+    out: ?*u16,
+    in0_outputs: ?*const struct_futhark_f16_3d,
+    in1_targets: ?*const struct_futhark_f16_3d,
+) c_int;
+
+// `compute_initial_grad_l2` returns 2*(output-target) per element, used as the dL/dY seed at the
+// top of the multi-layer stack.
+pub extern "c" fn futhark_entry_compute_initial_grad_l2(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_3d,
+    in0_outputs: ?*const struct_futhark_f16_3d,
+    in1_targets: ?*const struct_futhark_f16_3d,
+) c_int;
+
+// `batch_gradients_full` returns (grad_ws, grad_wt, grad_sb, grad_tb, grad_input) as an opaque tup5.
+// grad_input is [batch][seq][half*2] -- the dL/dX of the current layer, fed as dL/dY of the previous one.
+pub extern "c" fn futhark_entry_batch_gradients_full(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_opaque_tup5_grad_full,
+    in0_inputs: ?*const struct_futhark_f16_3d,
+    in1_grad_outputs: ?*const struct_futhark_f16_3d,
+    in2_weights_s: ?*const struct_futhark_f16_2d,
+    in3_weights_t: ?*const struct_futhark_f16_2d,
+    in4_s_bias: ?*const struct_futhark_f16_1d,
+    in5_t_bias: ?*const struct_futhark_f16_1d,
+    in6_clip_min: u16,
+    in7_clip_max: u16,
+) c_int;
+
+pub extern "c" fn futhark_free_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16(
+    ctx: ?*struct_futhark_context,
+    obj: ?*struct_futhark_opaque_tup5_grad_full,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_0(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_2d,
+    obj: ?*const struct_futhark_opaque_tup5_grad_full,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_1(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_2d,
+    obj: ?*const struct_futhark_opaque_tup5_grad_full,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_2(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_1d,
+    obj: ?*const struct_futhark_opaque_tup5_grad_full,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_3(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_1d,
+    obj: ?*const struct_futhark_opaque_tup5_grad_full,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_4(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_3d,
+    obj: ?*const struct_futhark_opaque_tup5_grad_full,
+) c_int;
+
+// SFD updates per-layer (already exist as entry points in main.fut, declared here for completeness).
+pub extern "c" fn futhark_entry_sfd_update_half(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_opaque_tup2_2d,
+    in0_weights: ?*const struct_futhark_f16_2d,
+    in1_gradients: ?*const struct_futhark_f16_2d,
+    in2_lr: u16,
+    in3_momentum: u16,
+    in4_velocity: ?*const struct_futhark_f16_2d,
+) c_int;
+
+pub extern "c" fn futhark_entry_sfd_update_bias(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_opaque_tup2_1d,
+    in0_bias: ?*const struct_futhark_f16_1d,
+    in1_gradients: ?*const struct_futhark_f16_1d,
+    in2_lr: u16,
+    in3_momentum: u16,
+    in4_velocity: ?*const struct_futhark_f16_1d,
+) c_int;
+
+pub const struct_futhark_opaque_tup2_2d = opaque {};
+pub const struct_futhark_opaque_tup2_1d = opaque {};
+
+pub extern "c" fn futhark_free_opaque_tup2_arr2d_f16_arr2d_f16(
+    ctx: ?*struct_futhark_context,
+    obj: ?*struct_futhark_opaque_tup2_2d,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup2_arr2d_f16_arr2d_f16_0(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_2d,
+    obj: ?*const struct_futhark_opaque_tup2_2d,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup2_arr2d_f16_arr2d_f16_1(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_2d,
+    obj: ?*const struct_futhark_opaque_tup2_2d,
+) c_int;
+
+pub extern "c" fn futhark_free_opaque_tup2_arr1d_f16_arr1d_f16(
+    ctx: ?*struct_futhark_context,
+    obj: ?*struct_futhark_opaque_tup2_1d,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup2_arr1d_f16_arr1d_f16_0(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_1d,
+    obj: ?*const struct_futhark_opaque_tup2_1d,
+) c_int;
+
+pub extern "c" fn futhark_project_opaque_tup2_arr1d_f16_arr1d_f16_1(
+    ctx: ?*struct_futhark_context,
+    out: ?*?*struct_futhark_f16_1d,
+    obj: ?*const struct_futhark_opaque_tup2_1d,
 ) c_int;
