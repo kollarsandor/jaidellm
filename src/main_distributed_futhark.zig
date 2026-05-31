@@ -111,10 +111,13 @@ pub fn main() !void {
     var num_layers_str_owned: ?[]u8 = null;
     const num_layers_str: []const u8 = blk: {
         num_layers_str_owned = std.process.getEnvVarOwned(allocator, "JAIDE_LAYERS") catch null;
-        break :blk num_layers_str_owned orelse "48";
+        // 24 matches the baseline Modal config (model_dim=2048,layers=24 ≈ 50M params).
+        // The Modal orchestrator always sets JAIDE_LAYERS explicitly so this
+        // default only matters for local invocations.
+        break :blk num_layers_str_owned orelse "24";
     };
     defer if (num_layers_str_owned) |owned| allocator.free(owned);
-    const num_layers = std.fmt.parseInt(usize, num_layers_str, 10) catch 48;
+    const num_layers = std.fmt.parseInt(usize, num_layers_str, 10) catch 24;
 
     var local_batch_size_str_owned: ?[]u8 = null;
     const local_batch_size_str: []const u8 = blk: {
@@ -204,7 +207,19 @@ pub fn main() !void {
             {
                 var dir_buf: [256]u8 = undefined;
                 const dir_path = std.fmt.bufPrint(&dir_buf, "/checkpoints/epoch_{d:0>3}", .{epoch + 1}) catch "/checkpoints";
-                std.fs.makeDirAbsolute(dir_path) catch {};
+                // Ensure both /checkpoints (parent volume mount) and the
+                // per-epoch subdirectory exist. makeDirAbsolute only creates
+                // the leaf and silently fails (ENOENT) if the parent isn't
+                // there. By making both we tolerate either fresh boots or
+                // Modal mounts where the parent is pre-created.
+                std.fs.makeDirAbsolute("/checkpoints") catch |e| switch (e) {
+                    error.PathAlreadyExists => {},
+                    else => std.debug.print("[Rank 0] makeDirAbsolute(/checkpoints) failed: {} (continuing)\n", .{e}),
+                };
+                std.fs.makeDirAbsolute(dir_path) catch |e| switch (e) {
+                    error.PathAlreadyExists => {},
+                    else => std.debug.print("[Rank 0] makeDirAbsolute({s}) failed: {} (continuing)\n", .{ dir_path, e }),
+                };
 
                 var checkpoint_path_buf: [256]u8 = undefined;
                 const checkpoint_path = try std.fmt.bufPrint(

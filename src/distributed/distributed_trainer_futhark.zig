@@ -594,6 +594,17 @@ pub const DistributedTrainerFuthark = struct {
             while (seq_idx < list.len) : (seq_idx += 1) {
                 const token_index_raw: usize = @intCast(list[seq_idx]);
                 const token_index: usize = token_index_raw;
+                // One-hot encoding requires token_index < model_dim — otherwise
+                // the write spills into the next row's slot and silently corrupts
+                // both input and target. trainer.init() expands model_dim to
+                // >= vocab_size so this should never fire in practice, but if a
+                // future tokenizer change breaks that invariant we want to fail
+                // loudly here instead of silently producing garbage training
+                // data.
+                if (token_index >= self.model_dim) {
+                    std.debug.print("[Rank {d}] token id {d} >= model_dim {d} (vocab_size={d}); aborting step\n", .{ self.coordinator.rank, token_index, self.model_dim, self.vocab_size });
+                    return error.TokenIndexOutOfRange;
+                }
 
                 const row_offset = try std.math.mul(usize, b_idx, max_seq_len);
                 const row_index = try std.math.add(usize, row_offset, seq_idx);
@@ -605,6 +616,10 @@ pub const DistributedTrainerFuthark = struct {
                 if (seq_idx + 1 < list.len) {
                     const next_token_raw: usize = @intCast(list[seq_idx + 1]);
                     const next_token: usize = next_token_raw;
+                    if (next_token >= self.model_dim) {
+                        std.debug.print("[Rank {d}] next-token id {d} >= model_dim {d}; aborting step\n", .{ self.coordinator.rank, next_token, self.model_dim });
+                        return error.TokenIndexOutOfRange;
+                    }
                     const tgt_final = try std.math.add(usize, base_idx, next_token);
                     if (tgt_final >= target_f16_data.len) return error.IndexOutOfBounds;
                     target_f16_data[tgt_final] = @as(f16, 1.0);
