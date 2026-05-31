@@ -12,7 +12,8 @@ pub const TrainerConfig = struct {
     learning_rate: f32 = 0.001,
     momentum: f32 = 0.0,
     max_line_size: usize = 10 * 1024 * 1024,
-    checkpoint_version: u32 = 4,
+    // checkpoint v5: per-layer serialization (one block of {W_s, W_t, sb, tb, vs, vt, vsb, vtb} per layer).
+    checkpoint_version: u32 = 5,
 };
 
 pub const DistributedTrainerFuthark = struct {
@@ -21,6 +22,7 @@ pub const DistributedTrainerFuthark = struct {
     tokenizer: MGT,
     accelerator: RSFAccelerator,
     model_dim: usize,
+    num_layers: usize,
     vocab_size: usize,
     local_batch_size: usize,
     global_step: u64,
@@ -34,18 +36,20 @@ pub const DistributedTrainerFuthark = struct {
         model_dim: usize,
         local_batch_size: usize,
     ) !DistributedTrainerFuthark {
-        return initWithConfig(allocator, coordinator, model_dim, local_batch_size, .{});
+        return initWithConfig(allocator, coordinator, model_dim, 1, local_batch_size, .{});
     }
 
     pub fn initWithConfig(
         allocator: std.mem.Allocator,
         coordinator: *GPUCoordinator,
         model_dim: usize,
+        num_layers: usize,
         local_batch_size: usize,
         config: TrainerConfig,
     ) !DistributedTrainerFuthark {
         if (model_dim == 0) return error.InvalidModelDim;
         if (model_dim % 2 != 0) return error.InvalidModelDim;
+        if (num_layers == 0) return error.InvalidNumLayers;
         if (local_batch_size == 0) return error.InvalidBatchSize;
         if (coordinator.world_size == 0) return error.InvalidWorldSize;
         if (coordinator.rank >= coordinator.world_size) return error.InvalidRank;
@@ -84,7 +88,7 @@ pub const DistributedTrainerFuthark = struct {
             if (actual_model_dim % 2 != 0) actual_model_dim += 1;
         }
 
-        var accelerator = try RSFAccelerator.init(actual_model_dim);
+        var accelerator = try RSFAccelerator.initMultiLayer(actual_model_dim, num_layers, allocator);
         errdefer accelerator.deinit();
 
         return DistributedTrainerFuthark{
@@ -93,6 +97,7 @@ pub const DistributedTrainerFuthark = struct {
             .tokenizer = tokenizer,
             .accelerator = accelerator,
             .model_dim = actual_model_dim,
+            .num_layers = num_layers,
             .vocab_size = tokenizer.next_token_id,
             .local_batch_size = local_batch_size,
             .global_step = 0,
@@ -231,53 +236,11 @@ pub const DistributedTrainerFuthark = struct {
         }
     }
 
-    fn readWeightsFlat(self: *DistributedTrainerFuthark, matrix: anytype) ![]f16 {
-        const rows = try matrix.values(&self.accelerator.ctx, self.allocator);
-        defer {
-            for (rows) |row| {
-                self.allocator.free(row);
-            }
-            self.allocator.free(rows);
-        }
-
-        const half: usize = self.model_dim / 2;
-        if (rows.len != half) {
-            std.debug.print("[Rank {d}] readWeightsFlat: rows.len={d}, expected half={d}, model_dim={d}\n", .{ self.coordinator.rank, rows.len, half, self.model_dim });
-            return error.InvalidWeightsShape;
-        }
-
-        const weight_count = try std.math.mul(usize, half, half);
-        var flat = try self.allocator.alloc(f16, weight_count);
-        errdefer self.allocator.free(flat);
-
-        var idx: usize = 0;
-        for (rows) |row| {
-            if (row.len != half) {
-                std.debug.print("[Rank {d}] readWeightsFlat: row.len={d}, expected half={d}\n", .{ self.coordinator.rank, row.len, half });
-                return error.InvalidWeightsShape;
-            }
-            for (row) |value| {
-                flat[idx] = value;
-                idx += 1;
-            }
-        }
-
-        if (idx != weight_count) {
-            return error.InvalidWeightsShape;
-        }
-
-        return flat;
-    }
-
-    fn readBiasFlat(self: *DistributedTrainerFuthark, bias: anytype) ![]f16 {
-        const values = try bias.values1D(&self.accelerator.ctx, self.allocator);
-        errdefer self.allocator.free(values);
-        const half: usize = self.model_dim / 2;
-        if (values.len != half) {
-            self.allocator.free(values);
-            return error.InvalidBiasShape;
-        }
-        return values;
+    fn readLayerMatrix(self: *DistributedTrainerFuthark, layer_idx: usize, kind: accel.WeightKind) ![]f16 {
+        return self.accelerator.readLayerWeightsFlat(layer_idx, kind, self.allocator) catch |err| {
+            std.debug.print("[Rank {d}] readLayerMatrix layer={d} err={}\n", .{ self.coordinator.rank, layer_idx, err });
+            return err;
+        };
     }
 
     fn allReduceFloat32Values(self: *DistributedTrainerFuthark, values: []f32) !void {
@@ -322,14 +285,47 @@ pub const DistributedTrainerFuthark = struct {
         }
     }
 
-    fn applyDelta(self: *DistributedTrainerFuthark, base: []const f16, delta: []const f16, which: enum { s, t }) !void {
+    /// All-reduce-average every per-layer tensor across ranks directly on the
+    /// GPU. We average weights and biases (the model state) AND the SFD
+    /// velocity buffers, so every rank starts the next step with identical
+    /// state and the training trajectory does not diverge across ranks.
+    ///
+    /// This is the GPU-resident replacement for the older snapshot/delta/merge
+    /// loop that used to copy each per-layer matrix to host RAM for the
+    /// allReduce. With ~24 layers x 8 tensors x 2 MB each, eliminating the
+    /// host roundtrip removes the dominant per-step overhead.
+    fn gpuAllReduceLayers(self: *DistributedTrainerFuthark) !void {
+        if (self.coordinator.world_size <= 1) return;
+
+        const kinds = [_]accel.WeightKind{
+            .weights_s,
+            .weights_t,
+            .s_bias,
+            .t_bias,
+            .velocity_s,
+            .velocity_t,
+            .velocity_sb,
+            .velocity_tb,
+        };
+
+        var li: usize = 0;
+        while (li < self.num_layers) : (li += 1) {
+            for (kinds) |k| {
+                const info = try self.accelerator.getLayerDevicePtr(li, k);
+                if (info.count == 0) continue;
+                try self.coordinator.allReduceFloat16Avg(info.ptr, info.ptr, info.count);
+            }
+        }
+    }
+
+    fn applyDeltaToLayer(self: *DistributedTrainerFuthark, layer_idx: usize, base: []const f16, delta: []const f16, which: enum { s, t }) !void {
         if (base.len != delta.len) {
             return error.InvalidWeightsShape;
         }
         const half: usize = self.model_dim / 2;
         const expected_len = try std.math.mul(usize, half, half);
         if (base.len != expected_len) {
-            std.debug.print("[Rank {d}] applyDelta: base.len={d}, expected half*half={d}, model_dim={d}\n", .{ self.coordinator.rank, base.len, expected_len, self.model_dim });
+            std.debug.print("[Rank {d}] applyDeltaToLayer: base.len={d}, expected half*half={d}, model_dim={d}\n", .{ self.coordinator.rank, base.len, expected_len, self.model_dim });
             return error.InvalidWeightsShape;
         }
 
@@ -342,8 +338,32 @@ pub const DistributedTrainerFuthark = struct {
         }
 
         switch (which) {
-            .s => try self.accelerator.setWeightsS(merged, half, half),
-            .t => try self.accelerator.setWeightsT(merged, half, half),
+            .s => try self.accelerator.setLayerWeightsS(layer_idx, merged, half, half),
+            .t => try self.accelerator.setLayerWeightsT(layer_idx, merged, half, half),
+        }
+    }
+
+    fn applyBiasDeltaToLayer(self: *DistributedTrainerFuthark, layer_idx: usize, base: []const f16, delta: []const f16, which: enum { s, t }) !void {
+        if (base.len != delta.len) {
+            return error.InvalidWeightsShape;
+        }
+        const half: usize = self.model_dim / 2;
+        if (base.len != half) {
+            std.debug.print("[Rank {d}] applyBiasDeltaToLayer: base.len={d}, expected half={d}, model_dim={d}\n", .{ self.coordinator.rank, base.len, half, self.model_dim });
+            return error.InvalidWeightsShape;
+        }
+
+        var merged = try self.allocator.alloc(f16, base.len);
+        defer self.allocator.free(merged);
+
+        for (base, delta, 0..) |base_value, delta_value, idx| {
+            const merged_value = @as(f32, @floatCast(base_value)) + @as(f32, @floatCast(delta_value));
+            merged[idx] = @floatCast(merged_value);
+        }
+
+        switch (which) {
+            .s => try self.accelerator.setLayerSBias(layer_idx, merged, half),
+            .t => try self.accelerator.setLayerTBias(layer_idx, merged, half),
         }
     }
 
@@ -661,37 +681,102 @@ pub const DistributedTrainerFuthark = struct {
             return loss_f32;
         }
 
-        const weights_s_before = try self.readWeightsFlat(self.accelerator.weights_s);
-        defer self.allocator.free(weights_s_before);
-        const weights_t_before = try self.readWeightsFlat(self.accelerator.weights_t);
-        defer self.allocator.free(weights_t_before);
+        // Distributed path: snapshot every per-layer tensor (W_s, W_t, s_bias,
+        // t_bias) BEFORE the local SFD step, then re-snapshot AFTER, compute
+        // per-rank deltas, all-reduce-average the deltas across ranks, and
+        // overwrite the layer state with (before + avg_delta). This keeps all
+        // ranks in lockstep so the model state never diverges.
+        //
+        // We keep the host-resident snapshot+delta+merge path here because the
+        // alternative — handing Futhark device pointers directly to NCCL via
+        // ncclAvg — hangs in practice (Futhark's `_values_raw_*` arrays do not
+        // round-trip cleanly through external NCCL collectives). The
+        // GPU-resident fast path lives behind `gpuAllReduceLayers` and can be
+        // re-enabled once that interop is sorted out.
+        const Snapshots = struct {
+            ws: [][]f16,
+            wt: [][]f16,
+            sb: [][]f16,
+            tb: [][]f16,
+        };
+
+        var snap = Snapshots{
+            .ws = try self.allocator.alloc([]f16, self.num_layers),
+            .wt = try self.allocator.alloc([]f16, self.num_layers),
+            .sb = try self.allocator.alloc([]f16, self.num_layers),
+            .tb = try self.allocator.alloc([]f16, self.num_layers),
+        };
+        defer {
+            for (snap.ws) |p| if (p.len > 0) self.allocator.free(p);
+            for (snap.wt) |p| if (p.len > 0) self.allocator.free(p);
+            for (snap.sb) |p| if (p.len > 0) self.allocator.free(p);
+            for (snap.tb) |p| if (p.len > 0) self.allocator.free(p);
+            self.allocator.free(snap.ws);
+            self.allocator.free(snap.wt);
+            self.allocator.free(snap.sb);
+            self.allocator.free(snap.tb);
+        }
+        for (snap.ws) |*p| p.* = &.{};
+        for (snap.wt) |*p| p.* = &.{};
+        for (snap.sb) |*p| p.* = &.{};
+        for (snap.tb) |*p| p.* = &.{};
+
+        var li_before: usize = 0;
+        while (li_before < self.num_layers) : (li_before += 1) {
+            snap.ws[li_before] = try self.readLayerMatrix(li_before, .weights_s);
+            snap.wt[li_before] = try self.readLayerMatrix(li_before, .weights_t);
+            snap.sb[li_before] = try self.readLayerMatrix(li_before, .s_bias);
+            snap.tb[li_before] = try self.readLayerMatrix(li_before, .t_bias);
+        }
 
         const loss_f16 = try self.accelerator.trainingStep(&inputs, &targets, lr_f16, mom_f16);
         try self.accelerator.sync();
 
-        const weights_s_after = try self.readWeightsFlat(self.accelerator.weights_s);
-        defer self.allocator.free(weights_s_after);
-        const weights_t_after = try self.readWeightsFlat(self.accelerator.weights_t);
-        defer self.allocator.free(weights_t_after);
+        var li_after: usize = 0;
+        while (li_after < self.num_layers) : (li_after += 1) {
+            const ws_after = try self.readLayerMatrix(li_after, .weights_s);
+            defer self.allocator.free(ws_after);
+            const wt_after = try self.readLayerMatrix(li_after, .weights_t);
+            defer self.allocator.free(wt_after);
+            const sb_after = try self.readLayerMatrix(li_after, .s_bias);
+            defer self.allocator.free(sb_after);
+            const tb_after = try self.readLayerMatrix(li_after, .t_bias);
+            defer self.allocator.free(tb_after);
 
-        if (weights_s_before.len != weights_s_after.len or weights_t_before.len != weights_t_after.len) {
-            return error.InvalidWeightsShape;
+            if (ws_after.len != snap.ws[li_after].len or
+                wt_after.len != snap.wt[li_after].len or
+                sb_after.len != snap.sb[li_after].len or
+                tb_after.len != snap.tb[li_after].len)
+            {
+                return error.InvalidWeightsShape;
+            }
+
+            // Convert (after) buffers into deltas in-place: after := after - before
+            for (ws_after, snap.ws[li_after]) |*v, b| {
+                v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
+            }
+            for (wt_after, snap.wt[li_after]) |*v, b| {
+                v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
+            }
+            for (sb_after, snap.sb[li_after]) |*v, b| {
+                v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
+            }
+            for (tb_after, snap.tb[li_after]) |*v, b| {
+                v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
+            }
+
+            // All-reduce-average the deltas so every rank applies the same update.
+            try self.averageDeltaInPlace(ws_after);
+            try self.averageDeltaInPlace(wt_after);
+            try self.averageDeltaInPlace(sb_after);
+            try self.averageDeltaInPlace(tb_after);
+
+            // Overwrite layer state: state := before + averaged_delta.
+            try self.applyDeltaToLayer(li_after, snap.ws[li_after], ws_after, .s);
+            try self.applyDeltaToLayer(li_after, snap.wt[li_after], wt_after, .t);
+            try self.applyBiasDeltaToLayer(li_after, snap.sb[li_after], sb_after, .s);
+            try self.applyBiasDeltaToLayer(li_after, snap.tb[li_after], tb_after, .t);
         }
-
-        for (weights_s_after, weights_s_before) |*after_value, before_value| {
-            const delta = @as(f32, @floatCast(after_value.*)) - @as(f32, @floatCast(before_value));
-            after_value.* = @floatCast(delta);
-        }
-        for (weights_t_after, weights_t_before) |*after_value, before_value| {
-            const delta = @as(f32, @floatCast(after_value.*)) - @as(f32, @floatCast(before_value));
-            after_value.* = @floatCast(delta);
-        }
-
-        try self.averageDeltaInPlace(weights_s_after);
-        try self.averageDeltaInPlace(weights_t_after);
-
-        try self.applyDelta(weights_s_before, weights_s_after, .s);
-        try self.applyDelta(weights_t_before, weights_t_after, .t);
         try self.accelerator.sync();
 
         var loss_arr = [1]f32{@as(f32, @floatCast(loss_f16))};
@@ -727,42 +812,46 @@ pub const DistributedTrainerFuthark = struct {
         try writer.writeInt(u32, self.config.checkpoint_version, .little);
         try writer.writeInt(u64, self.global_step, .little);
         try writer.writeInt(u64, @as(u64, @intCast(self.model_dim)), .little);
+        try writer.writeInt(u64, @as(u64, @intCast(self.num_layers)), .little);
         try writer.writeInt(u64, @as(u64, @intCast(self.vocab_size)), .little);
         try writer.writeInt(u64, @as(u64, @intCast(self.local_batch_size)), .little);
         try writeF32(writer, self.learning_rate);
         try writeF32(writer, self.momentum);
 
-        const weights_s_vals = try self.readWeightsFlat(self.accelerator.weights_s);
-        defer self.allocator.free(weights_s_vals);
-        for (weights_s_vals) |w| try writeF32(writer, @floatCast(w));
+        var li_save: usize = 0;
+        while (li_save < self.num_layers) : (li_save += 1) {
+            const weights_s_vals = try self.readLayerMatrix(li_save, .weights_s);
+            defer self.allocator.free(weights_s_vals);
+            for (weights_s_vals) |w| try writeF32(writer, @floatCast(w));
 
-        const weights_t_vals = try self.readWeightsFlat(self.accelerator.weights_t);
-        defer self.allocator.free(weights_t_vals);
-        for (weights_t_vals) |w| try writeF32(writer, @floatCast(w));
+            const weights_t_vals = try self.readLayerMatrix(li_save, .weights_t);
+            defer self.allocator.free(weights_t_vals);
+            for (weights_t_vals) |w| try writeF32(writer, @floatCast(w));
 
-        const s_bias_vals = try self.readBiasFlat(self.accelerator.s_bias);
-        defer self.allocator.free(s_bias_vals);
-        for (s_bias_vals) |b| try writeF32(writer, @floatCast(b));
+            const s_bias_vals = try self.readLayerMatrix(li_save, .s_bias);
+            defer self.allocator.free(s_bias_vals);
+            for (s_bias_vals) |b| try writeF32(writer, @floatCast(b));
 
-        const t_bias_vals = try self.readBiasFlat(self.accelerator.t_bias);
-        defer self.allocator.free(t_bias_vals);
-        for (t_bias_vals) |b| try writeF32(writer, @floatCast(b));
+            const t_bias_vals = try self.readLayerMatrix(li_save, .t_bias);
+            defer self.allocator.free(t_bias_vals);
+            for (t_bias_vals) |b| try writeF32(writer, @floatCast(b));
 
-        const vel_s_vals = try self.readWeightsFlat(self.accelerator.velocity_s);
-        defer self.allocator.free(vel_s_vals);
-        for (vel_s_vals) |v| try writeF32(writer, @floatCast(v));
+            const vel_s_vals = try self.readLayerMatrix(li_save, .velocity_s);
+            defer self.allocator.free(vel_s_vals);
+            for (vel_s_vals) |v| try writeF32(writer, @floatCast(v));
 
-        const vel_t_vals = try self.readWeightsFlat(self.accelerator.velocity_t);
-        defer self.allocator.free(vel_t_vals);
-        for (vel_t_vals) |v| try writeF32(writer, @floatCast(v));
+            const vel_t_vals = try self.readLayerMatrix(li_save, .velocity_t);
+            defer self.allocator.free(vel_t_vals);
+            for (vel_t_vals) |v| try writeF32(writer, @floatCast(v));
 
-        const vel_sb_vals = try self.readBiasFlat(self.accelerator.velocity_sb);
-        defer self.allocator.free(vel_sb_vals);
-        for (vel_sb_vals) |v| try writeF32(writer, @floatCast(v));
+            const vel_sb_vals = try self.readLayerMatrix(li_save, .velocity_sb);
+            defer self.allocator.free(vel_sb_vals);
+            for (vel_sb_vals) |v| try writeF32(writer, @floatCast(v));
 
-        const vel_tb_vals = try self.readBiasFlat(self.accelerator.velocity_tb);
-        defer self.allocator.free(vel_tb_vals);
-        for (vel_tb_vals) |v| try writeF32(writer, @floatCast(v));
+            const vel_tb_vals = try self.readLayerMatrix(li_save, .velocity_tb);
+            defer self.allocator.free(vel_tb_vals);
+            for (vel_tb_vals) |v| try writeF32(writer, @floatCast(v));
+        }
 
         try writeF32(writer, @as(f32, @floatCast(self.accelerator.clip_min)));
         try writeF32(writer, @as(f32, @floatCast(self.accelerator.clip_max)));
@@ -798,16 +887,19 @@ pub const DistributedTrainerFuthark = struct {
 
         const saved_global_step = try reader.readInt(u64, .little);
         const saved_model_dim_u64 = try reader.readInt(u64, .little);
+        const saved_num_layers_u64 = try reader.readInt(u64, .little);
         const saved_vocab_size_u64 = try reader.readInt(u64, .little);
         const saved_local_batch_size_u64 = try reader.readInt(u64, .little);
         const saved_learning_rate = try readF32(reader);
         const saved_momentum = try readF32(reader);
 
         const saved_model_dim: usize = std.math.cast(usize, saved_model_dim_u64) orelse return error.ModelDimMismatch;
+        const saved_num_layers: usize = std.math.cast(usize, saved_num_layers_u64) orelse return error.NumLayersMismatch;
         const saved_vocab_size: usize = std.math.cast(usize, saved_vocab_size_u64) orelse return error.VocabSizeMismatch;
         const saved_local_batch_size: usize = std.math.cast(usize, saved_local_batch_size_u64) orelse return error.InvalidBatchSize;
 
         if (saved_model_dim != self.model_dim) return error.ModelDimMismatch;
+        if (saved_num_layers != self.num_layers) return error.NumLayersMismatch;
         if (saved_vocab_size != self.vocab_size) return error.VocabSizeMismatch;
         _ = saved_local_batch_size;
 
@@ -822,80 +914,83 @@ pub const DistributedTrainerFuthark = struct {
         const half: usize = self.model_dim / 2;
         const weight_count = try std.math.mul(usize, half, half);
 
-        const s_weights = try self.allocator.alloc(f16, weight_count);
-        defer self.allocator.free(s_weights);
-        for (s_weights) |*w| {
-            const v = try readF32(reader);
-            if (!std.math.isFinite(v)) return error.InvalidWeightValue;
-            w.* = @floatCast(v);
+        var li_load: usize = 0;
+        while (li_load < self.num_layers) : (li_load += 1) {
+            const s_weights = try self.allocator.alloc(f16, weight_count);
+            defer self.allocator.free(s_weights);
+            for (s_weights) |*w| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return error.InvalidWeightValue;
+                w.* = @floatCast(v);
+            }
+
+            const t_weights = try self.allocator.alloc(f16, weight_count);
+            defer self.allocator.free(t_weights);
+            for (t_weights) |*w| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return error.InvalidWeightValue;
+                w.* = @floatCast(v);
+            }
+
+            try self.accelerator.setLayerWeightsS(li_load, s_weights, half, half);
+            try self.accelerator.setLayerWeightsT(li_load, t_weights, half, half);
+
+            const s_bias_data = try self.allocator.alloc(f16, half);
+            defer self.allocator.free(s_bias_data);
+            for (s_bias_data) |*b| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return error.InvalidWeightValue;
+                b.* = @floatCast(v);
+            }
+
+            const t_bias_data = try self.allocator.alloc(f16, half);
+            defer self.allocator.free(t_bias_data);
+            for (t_bias_data) |*b| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return error.InvalidWeightValue;
+                b.* = @floatCast(v);
+            }
+
+            try self.accelerator.setLayerSBias(li_load, s_bias_data, half);
+            try self.accelerator.setLayerTBias(li_load, t_bias_data, half);
+
+            const vel_s = try self.allocator.alloc(f16, weight_count);
+            defer self.allocator.free(vel_s);
+            for (vel_s) |*w| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return error.InvalidWeightValue;
+                w.* = @floatCast(v);
+            }
+
+            const vel_t = try self.allocator.alloc(f16, weight_count);
+            defer self.allocator.free(vel_t);
+            for (vel_t) |*w| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return error.InvalidWeightValue;
+                w.* = @floatCast(v);
+            }
+
+            const vel_sb = try self.allocator.alloc(f16, half);
+            defer self.allocator.free(vel_sb);
+            for (vel_sb) |*w| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return error.InvalidWeightValue;
+                w.* = @floatCast(v);
+            }
+
+            const vel_tb = try self.allocator.alloc(f16, half);
+            defer self.allocator.free(vel_tb);
+            for (vel_tb) |*w| {
+                const v = try readF32(reader);
+                if (!std.math.isFinite(v)) return error.InvalidWeightValue;
+                w.* = @floatCast(v);
+            }
+
+            try self.accelerator.setLayerVelocityS(li_load, vel_s, half, half);
+            try self.accelerator.setLayerVelocityT(li_load, vel_t, half, half);
+            try self.accelerator.setLayerVelocitySB(li_load, vel_sb, half);
+            try self.accelerator.setLayerVelocityTB(li_load, vel_tb, half);
         }
-
-        const t_weights = try self.allocator.alloc(f16, weight_count);
-        defer self.allocator.free(t_weights);
-        for (t_weights) |*w| {
-            const v = try readF32(reader);
-            if (!std.math.isFinite(v)) return error.InvalidWeightValue;
-            w.* = @floatCast(v);
-        }
-
-        try self.accelerator.setWeightsS(s_weights, half, half);
-        try self.accelerator.setWeightsT(t_weights, half, half);
-
-        const s_bias_data = try self.allocator.alloc(f16, half);
-        defer self.allocator.free(s_bias_data);
-        for (s_bias_data) |*b| {
-            const v = try readF32(reader);
-            if (!std.math.isFinite(v)) return error.InvalidWeightValue;
-            b.* = @floatCast(v);
-        }
-
-        const t_bias_data = try self.allocator.alloc(f16, half);
-        defer self.allocator.free(t_bias_data);
-        for (t_bias_data) |*b| {
-            const v = try readF32(reader);
-            if (!std.math.isFinite(v)) return error.InvalidWeightValue;
-            b.* = @floatCast(v);
-        }
-
-        try self.accelerator.setSBias(s_bias_data, half);
-        try self.accelerator.setTBias(t_bias_data, half);
-
-        const vel_s = try self.allocator.alloc(f16, weight_count);
-        defer self.allocator.free(vel_s);
-        for (vel_s) |*w| {
-            const v = try readF32(reader);
-            if (!std.math.isFinite(v)) return error.InvalidWeightValue;
-            w.* = @floatCast(v);
-        }
-
-        const vel_t = try self.allocator.alloc(f16, weight_count);
-        defer self.allocator.free(vel_t);
-        for (vel_t) |*w| {
-            const v = try readF32(reader);
-            if (!std.math.isFinite(v)) return error.InvalidWeightValue;
-            w.* = @floatCast(v);
-        }
-
-        const vel_sb = try self.allocator.alloc(f16, half);
-        defer self.allocator.free(vel_sb);
-        for (vel_sb) |*w| {
-            const v = try readF32(reader);
-            if (!std.math.isFinite(v)) return error.InvalidWeightValue;
-            w.* = @floatCast(v);
-        }
-
-        const vel_tb = try self.allocator.alloc(f16, half);
-        defer self.allocator.free(vel_tb);
-        for (vel_tb) |*w| {
-            const v = try readF32(reader);
-            if (!std.math.isFinite(v)) return error.InvalidWeightValue;
-            w.* = @floatCast(v);
-        }
-
-        try self.accelerator.setVelocityS(vel_s, half, half);
-        try self.accelerator.setVelocityT(vel_t, half, half);
-        try self.accelerator.setVelocitySB(vel_sb, half);
-        try self.accelerator.setVelocityTB(vel_tb, half);
 
         const clip_min_f32 = try readF32(reader);
         const clip_max_f32 = try readF32(reader);

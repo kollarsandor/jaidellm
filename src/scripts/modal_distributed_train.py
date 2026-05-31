@@ -310,9 +310,9 @@ def _read_tail(path: Path, max_chars: int = 8000) -> str:
     },
 )
 def train_all_ranks(
-    epochs: int = 20,
-    model_dim: int = 512,
-    num_layers: int = 16,
+    epochs: int = 5,
+    model_dim: int = 2048,
+    num_layers: int = 24,
     local_batch_size: int = 4,
     world_size: int = 8,
 ) -> Dict[str, Any]:
@@ -393,7 +393,12 @@ def train_all_ranks(
     base_env["JAIDE_BATCH_SIZE"] = str(local_batch_size)
     base_env["JAIDE_NCCL_ID_PATH"] = str(nccl_id_path)
     base_env["JAIDE_TOTAL_SAMPLES"] = str(sample_count)
-    base_env["JAIDE_MAX_SAMPLES"] = "2000"
+    # Sample cap: large enough that with batch=4 across 8 ranks we still get
+    # ~250 SFD steps/epoch but the wall-time stays under ~10 minutes for the
+    # baseline test run. Bump for serious training.
+    base_env["JAIDE_MAX_SAMPLES"] = str(min(sample_count, 8000))
+    base_env["JAIDE_MAX_SEQ_LEN"] = "256"
+    base_env["JAIDE_LEARNING_RATE"] = "0.0001"
     base_env["NCCL_DEBUG"] = "WARN"
     base_env["NCCL_IB_DISABLE"] = "1"
     base_env["NCCL_SOCKET_IFNAME"] = "lo"
@@ -524,9 +529,9 @@ def train_all_ranks(
 
 @app.local_entrypoint()
 def main(
-    epochs: int = 20,
-    model_dim: int = 512,
-    num_layers: int = 16,
+    epochs: int = 5,
+    model_dim: int = 2048,
+    num_layers: int = 24,
     local_batch_size: int = 4,
     world_size: int = 8,
 ) -> None:

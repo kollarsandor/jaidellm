@@ -148,6 +148,7 @@ pub fn main() !void {
         allocator,
         &coordinator,
         model_dim,
+        num_layers,
         local_batch_size,
         trainer_cfg,
     );
