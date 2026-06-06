@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const memory = @import("../core/memory.zig");
 const accel = @import("../hw/accel/accel_interface.zig");
+const oftb_mod = @import("oftb.zig");
 const Thread = std.Thread;
 
 pub const RSFLayerConfig = struct {
@@ -808,6 +809,8 @@ fn forwardOnCore(core: *const RSFCore, x: *Tensor) !void {
     const trans = try allocator.alloc(f32, core.dim);
     defer allocator.free(trans);
 
+    const oftb = oftb_mod.OFTB.init(core.dim);
+
     var l: usize = 0;
     while (l < layer_count) : (l += 1) {
         const layer = &core.layers[l];
@@ -826,6 +829,8 @@ fn forwardOnCore(core: *const RSFCore, x: *Tensor) !void {
 
             i = 0;
             while (i < core.dim) : (i += 1) x2_row[i] += trans[i];
+
+            try oftb.forwardInPlaceSlice(row);
         }
     }
 }
@@ -847,12 +852,17 @@ fn inverseOnCore(core: *const RSFCore, y: *Tensor) !void {
     const scale = try allocator.alloc(f32, core.dim);
     defer allocator.free(scale);
 
+    const oftb = oftb_mod.OFTB.init(core.dim);
+
     var idx = layer_count;
     while (idx > 0) : (idx -= 1) {
         const layer = &core.layers[idx - 1];
         var b: usize = 0;
         while (b < batch_size) : (b += 1) {
             const row = y.data[b * dim2 .. b * dim2 + dim2];
+
+            try oftb.inverseInPlaceSlice(row);
+
             const y1_row = row[0..core.dim];
             const y2_row = row[core.dim..dim2];
 
