@@ -202,9 +202,28 @@ pub const VerifiedInferenceEngine = struct {
         self.allocator.destroy(self);
     }
 
+    fn matrixVector(self: *Self, weights: [][]f32, input: []const f32, output: []f32) void {
+        _ = self;
+        var row: usize = 0;
+        while (row < output.len) : (row += 1) {
+            var sum: f32 = 0.0;
+            if (row < weights.len) {
+                var col: usize = 0;
+                while (col < input.len and col < weights[row].len) : (col += 1) {
+                    sum += weights[row][col] * input[col];
+                }
+            }
+            output[row] = sum;
+        }
+    }
+
     pub fn performVerifiedInference(self: *Self, input: []const f32, output_buf: []f32) !void {
         if (input.len == 0 or output_buf.len == 0) {
             return error.InvalidInputOutput;
+        }
+
+        if (self.layer_weights_s == null or self.layer_weights_t == null) {
+            try self.initializeWeights();
         }
 
         const input_commitment = try self.commitInput(input);
@@ -212,13 +231,7 @@ pub const VerifiedInferenceEngine = struct {
         var intermediate_1 = try self.allocator.alloc(f32, output_buf.len);
         defer self.allocator.free(intermediate_1);
 
-        var i: usize = 0;
-        while (i < intermediate_1.len and i < input.len) : (i += 1) {
-            intermediate_1[i] = input[i] * 1.732;
-        }
-        while (i < intermediate_1.len) : (i += 1) {
-            intermediate_1[i] = 0.0;
-        }
+        self.matrixVector(self.layer_weights_s.?[0], input, intermediate_1);
 
         try self.proof_of_correctness.recordStep(
             1,
@@ -236,9 +249,12 @@ pub const VerifiedInferenceEngine = struct {
                 const scale = @exp(clipped);
                 intermediate_1[j] *= scale;
             }
+            var coupling_update = try self.allocator.alloc(f32, half);
+            defer self.allocator.free(coupling_update);
+            self.matrixVector(self.layer_weights_t.?[0][0..half], intermediate_1[0..half], coupling_update);
             j = 0;
             while (j < half) : (j += 1) {
-                intermediate_1[j + half] += intermediate_1[j] * 1.732;
+                intermediate_1[j + half] += coupling_update[j];
             }
         }
 
@@ -249,7 +265,7 @@ pub const VerifiedInferenceEngine = struct {
             obf.ProofOfCorrectness.OperationType.AffineCoupling,
         );
 
-        i = 0;
+        var i: usize = 0;
         while (i < output_buf.len) : (i += 1) {
             output_buf[i] = intermediate_1[i];
         }

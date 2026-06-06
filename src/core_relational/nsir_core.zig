@@ -411,11 +411,12 @@ pub const SelfSimilarRelationalGraph = struct {
     entanglements: EntMap,
     quantum_register: StringHashMap(Qubit),
     topology_hash: [65]u8,
+    topology_hash_dirty: bool,
+    topology_update_depth: usize,
     rng: std.Random.DefaultPrng,
+    rng_mutex: std.Thread.Mutex,
 
     pub fn init(allocator: Allocator) !SelfSimilarRelationalGraph {
-        const ts = std.time.nanoTimestamp();
-        const seed: u64 = std.hash.Wyhash.hash(0, std.mem.asBytes(&ts));
         var g = SelfSimilarRelationalGraph{
             .allocator = allocator,
             .nodes = StringHashMap(Node).init(allocator),
@@ -423,7 +424,10 @@ pub const SelfSimilarRelationalGraph = struct {
             .entanglements = EntMap.init(allocator),
             .quantum_register = StringHashMap(Qubit).init(allocator),
             .topology_hash = [_]u8{0} ** 65,
-            .rng = std.Random.DefaultPrng.init(seed),
+            .topology_hash_dirty = true,
+            .topology_update_depth = 0,
+            .rng = std.Random.DefaultPrng.init(0),
+            .rng_mutex = .{},
         };
         try g.updateTopologyHash();
         return g;
@@ -778,7 +782,9 @@ pub const SelfSimilarRelationalGraph = struct {
             var state = hit_val.?;
             state.normalizeInPlace();
 
+            self.rng_mutex.lock();
             const r = self.rng.random().float(f64);
+            self.rng_mutex.unlock();
             var cum: f64 = 0.0;
             var outcome: usize = state.amps.len - 1;
             var amp_idx: usize = 0;
@@ -843,7 +849,9 @@ pub const SelfSimilarRelationalGraph = struct {
 
         const n = self.nodes.getPtr(canonical).?;
         const p0 = n.qubit.prob0();
+        self.rng_mutex.lock();
         const r0 = self.rng.random().float(f64);
+        self.rng_mutex.unlock();
         const bit: u1 = if (r0 <= p0) 0 else 1;
 
         n.qubit = if (bit == 0) Qubit.initBasis0() else Qubit.initBasis1();
@@ -899,6 +907,11 @@ pub const SelfSimilarRelationalGraph = struct {
     }
 
     fn updateTopologyHash(self: *SelfSimilarRelationalGraph) !void {
+        if (self.topology_update_depth > 0) {
+            self.topology_hash_dirty = true;
+            return;
+        }
+        self.topology_hash_dirty = false;
         var node_digests = ArrayList([Sha256.digest_length]u8).init(self.allocator);
         defer node_digests.deinit();
 
@@ -1065,6 +1078,19 @@ pub const SelfSimilarRelationalGraph = struct {
         _ = try std.fmt.bufPrint(out[0..64], "{s}", .{std.fmt.fmtSliceHexLower(&digest)});
         out[64] = 0;
         self.topology_hash = out;
+    }
+
+    pub fn beginTopologyBatch(self: *SelfSimilarRelationalGraph) void {
+        self.topology_update_depth += 1;
+    }
+
+    pub fn endTopologyBatch(self: *SelfSimilarRelationalGraph) !void {
+        if (self.topology_update_depth > 0) {
+            self.topology_update_depth -= 1;
+        }
+        if (self.topology_update_depth == 0 and self.topology_hash_dirty) {
+            try self.updateTopologyHash();
+        }
     }
 
     pub fn getTopologyHashHex(self: *const SelfSimilarRelationalGraph) []const u8 {

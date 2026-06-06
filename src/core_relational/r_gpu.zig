@@ -148,8 +148,11 @@ pub const ProcessingCore = struct {
 
     pub fn getWorkload(self: *const ProcessingCore) f64 {
         const total = self.cycles_active + self.cycles_idle;
-        if (total == 0) return 0.0;
-        return @as(f64, @floatFromInt(self.cycles_active)) / @as(f64, @floatFromInt(total));
+        const queued = @as(f64, @floatFromInt(self.message_queue.items.len));
+        const queue_pressure = queued / @max(queued + 16.0, 1.0);
+        if (total == 0) return queue_pressure;
+        const utilization = @as(f64, @floatFromInt(self.cycles_active)) / @as(f64, @floatFromInt(total));
+        return @min(1.0, utilization + queue_pressure * (1.0 - utilization));
     }
 
     pub fn getUtilization(self: *const ProcessingCore) f64 {
@@ -268,7 +271,7 @@ pub const RouteKey = struct {
 
 pub const RouteKeyContext = struct {
     pub fn hash(_: @This(), key: RouteKey) u64 {
-        var hasher = std.hash.Wyhash.init(blk: { var seed_buf: [8]u8 = undefined; std.crypto.random.bytes(&seed_buf); break :blk std.mem.readInt(u64, &seed_buf, .little); });
+        var hasher = std.hash.Wyhash.init(0xB83F_6C2A_49E1_D057);
         hasher.update(std.mem.asBytes(&key.source));
         hasher.update(std.mem.asBytes(&key.destination));
         return hasher.final();
@@ -471,7 +474,7 @@ pub const AsynchronousNoC = struct {
 
 const StringContext = struct {
     pub fn hash(_: @This(), key: []const u8) u64 {
-        var hasher = std.hash.Wyhash.init(blk: { var seed_buf: [8]u8 = undefined; std.crypto.random.bytes(&seed_buf); break :blk std.mem.readInt(u64, &seed_buf, .little); });
+        var hasher = std.hash.Wyhash.init(0x0F12_63B5_C4A9_D8E7);
         hasher.update(key);
         return hasher.final();
     }
@@ -710,7 +713,7 @@ pub const EdgeKeyForWeighting = struct {
 
 const EdgeKeyForWeightingContext = struct {
     pub fn hash(_: @This(), key: EdgeKeyForWeighting) u64 {
-        var hasher = std.hash.Wyhash.init(blk: { var seed_buf: [8]u8 = undefined; std.crypto.random.bytes(&seed_buf); break :blk std.mem.readInt(u64, &seed_buf, .little); });
+        var hasher = std.hash.Wyhash.init(0x97D4_2A75_1C8E_B309);
         hasher.update(key.source);
         hasher.update(&[_]u8{0});
         hasher.update(key.target);

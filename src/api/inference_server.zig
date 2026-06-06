@@ -13,6 +13,13 @@ const ModelFormat = @import("../core/model_io.zig").ModelFormat;
 const importModel = @import("../core/model_io.zig").importModel;
 const core_memory = @import("../core/memory.zig");
 const nsir = @import("../core_relational/nsir_core.zig");
+const crev = @import("../core_relational/crev_pipeline.zig");
+const esso = @import("../core_relational/esso_optimizer.zig");
+const chaos = @import("../core_relational/chaos_core.zig");
+const reasoning = @import("../core_relational/reasoning_orchestrator.zig");
+const surprise = @import("../core_relational/surprise_memory.zig");
+const temporal = @import("../core_relational/temporal_graph.zig");
+const quantum_logic = @import("../core_relational/quantum_logic.zig");
 const sfd = @import("../optimizer/sfd.zig");
 const accel = @import("../hw/accel/accel_interface.zig");
 
@@ -96,13 +103,14 @@ const RateLimiter = struct {
         log.mutex.lock();
         defer log.mutex.unlock();
 
-        var i: usize = 0;
-        while (i < log.timestamps.items.len) {
-            if (log.timestamps.items[i] < cutoff) {
-                _ = log.timestamps.orderedRemove(i);
-            } else {
-                i += 1;
+        var first_valid: usize = 0;
+        while (first_valid < log.timestamps.items.len and log.timestamps.items[first_valid] < cutoff) : (first_valid += 1) {}
+        if (first_valid > 0) {
+            const remaining = log.timestamps.items.len - first_valid;
+            if (remaining > 0) {
+                std.mem.copyForwards(i64, log.timestamps.items[0..remaining], log.timestamps.items[first_valid..]);
             }
+            log.timestamps.shrinkRetainingCapacity(remaining);
         }
 
         if (log.timestamps.items.len >= self.max_requests) {
@@ -159,15 +167,42 @@ pub const InferenceRequest = struct {
 
 pub const InferenceResponse = struct {
     tokens: []u32,
+    text: []const u8,
     embeddings: ?[]f32 = null,
+    rank_score: ?f32 = null,
+    graph_energy: ?f64 = null,
     processing_time_ms: f64,
+
+    fn writeJsonString(writer: anytype, value: []const u8) !void {
+        try writer.writeByte('"');
+        for (value) |c| {
+            if (c == '"') {
+                try writer.writeAll("\\\"");
+            } else if (c == '\\') {
+                try writer.writeAll("\\\\");
+            } else if (c == '\n') {
+                try writer.writeAll("\\n");
+            } else if (c == '\r') {
+                try writer.writeAll("\\r");
+            } else if (c == '\t') {
+                try writer.writeAll("\\t");
+            } else if (c < 0x20) {
+                try writer.print("\\u{x:0>4}", .{c});
+            } else {
+                try writer.writeByte(c);
+            }
+        }
+        try writer.writeByte('"');
+    }
 
     pub fn toJson(self: *const InferenceResponse, allocator: Allocator) ![]u8 {
         var list = std.ArrayList(u8).init(allocator);
         errdefer list.deinit();
         var writer = list.writer();
 
-        try writer.writeAll("{\"tokens\":[");
+        try writer.writeAll("{\"text\":");
+        try writeJsonString(writer, self.text);
+        try writer.writeAll(",\"tokens\":[");
         var i: usize = 0;
         while (i < self.tokens.len) : (i += 1) {
             if (i > 0) try writer.writeAll(",");
@@ -185,6 +220,12 @@ pub const InferenceResponse = struct {
             try writer.writeAll("]");
         }
 
+        if (self.rank_score) |score| {
+            try writer.print(",\"rank_score\":{d:.6}", .{score});
+        }
+        if (self.graph_energy) |energy| {
+            try writer.print(",\"graph_energy\":{d:.6}", .{energy});
+        }
         try writer.print(",\"processing_time_ms\":{d:.2}", .{self.processing_time_ms});
         try writer.writeAll("}");
 
@@ -193,6 +234,7 @@ pub const InferenceResponse = struct {
 
     pub fn deinit(self: *InferenceResponse, allocator: Allocator) void {
         allocator.free(self.tokens);
+        allocator.free(self.text);
         if (self.embeddings) |emb| {
             allocator.free(emb);
         }
@@ -234,6 +276,82 @@ fn nsirModulateForInference(data: []f32) void {
             data[i] *= 1.05;
         }
     }
+}
+
+fn stableSeed(data: []const u8) u64 {
+    return std.hash.Wyhash.hash(0xA31D_1F6B_8E4F_5A13, data);
+}
+
+fn mixU64(value: u64, salt: u64) u64 {
+    var v = value +% salt +% 0x9E37_79B9_7F4A_7C15;
+    v ^= v >> 30;
+    v *%= 0xBF58_476D_1CE4_E5B9;
+    v ^= v >> 27;
+    v *%= 0x94D0_49BB_1331_11EB;
+    v ^= v >> 31;
+    return v;
+}
+
+fn latentFromToken(token: u32, position: usize, seed: u64) f32 {
+    const mixed = mixU64(@as(u64, token) ^ (@as(u64, @intCast(position)) *% 0x517C_C1B7_2722_0A95), seed);
+    const mantissa = @as(u32, @intCast(mixed & 0x00FF_FFFF));
+    return (@as(f32, @floatFromInt(mantissa)) / 8_388_608.0) - 1.0;
+}
+
+fn tokenFromLatent(value: f32, position: usize, seed: u64, vocab_size: usize, fallback: u32) u32 {
+    if (vocab_size == 0) return fallback;
+    const clean = if (std.math.isFinite(value)) value else 0.0;
+    const bits: u32 = @bitCast(clean);
+    const mixed = mixU64(@as(u64, bits) ^ (@as(u64, @intCast(position)) *% 0xD6E8_FEB8_6659_FD93), seed);
+    const space = @min(@as(u64, @intCast(vocab_size)), @as(u64, std.math.maxInt(u32)) + 1);
+    return @intCast(mixed % space);
+}
+
+fn existingTokenId(mgt: *MGT, raw: u32, fallback: u32) u32 {
+    if (mgt.id_to_token.contains(raw)) return raw;
+    const vocab_size = mgt.vocabSize();
+    if (vocab_size == 0) return fallback;
+    var offset: usize = 0;
+    const start = @as(usize, @intCast(raw)) % vocab_size;
+    while (offset < vocab_size) : (offset += 1) {
+        const candidate: u32 = @intCast((start + offset) % vocab_size);
+        if (mgt.id_to_token.contains(candidate)) return candidate;
+    }
+    return fallback;
+}
+
+fn rankedSegmentsDeinit(allocator: Allocator, segments: []@import("../core/types.zig").RankedSegment) void {
+    for (segments) |*segment| {
+        segment.deinit(allocator);
+    }
+    allocator.free(segments);
+}
+
+fn fillTensorFromTokens(tensor: *Tensor, tokens: []const u32, text: []const u8) void {
+    const seed = stableSeed(text);
+    var i: usize = 0;
+    while (i < tensor.data.len) : (i += 1) {
+        const token = if (tokens.len > 0) tokens[i % tokens.len] else @as(u32, @truncate(mixU64(@as(u64, @intCast(i)), seed)));
+        tensor.data[i] = latentFromToken(token, i, seed);
+    }
+}
+
+fn evolveLatentWithEnergy(data: []f32, energy: f64, seed: u64) void {
+    if (data.len == 0) return;
+    const finite_energy = if (std.math.isFinite(energy)) energy else 1.0;
+    const energy_bits: u64 = @bitCast(finite_energy);
+    var i: usize = 0;
+    while (i < data.len) : (i += 1) {
+        const token: u32 = @truncate(mixU64(energy_bits, seed +% @as(u64, @intCast(i))));
+        data[i] += latentFromToken(token, i, seed) * 0.03125;
+    }
+}
+
+fn decodeGeneratedTokens(allocator: Allocator, mgt: *MGT, tokens: []const u32) ![]u8 {
+    var out = std.ArrayList(u8).init(allocator);
+    errdefer out.deinit();
+    try mgt.decode(tokens, &out);
+    return try out.toOwnedSlice();
 }
 
 pub const InferenceServer = struct {
@@ -309,7 +427,7 @@ pub const InferenceServer = struct {
         std.debug.print("   - Rate limiting: {d} requests/min per IP\n", .{self.config.rate_limit_per_minute});
         std.debug.print("   - Max request size: {d} bytes\n", .{self.config.max_request_size_bytes});
         std.debug.print("\n", .{});
-        std.debug.print("Inference server listening on {s}:{d}\n", .{self.config.host, self.config.port});
+        std.debug.print("Inference server listening on {s}:{d}\n", .{ self.config.host, self.config.port });
 
         while (self.running.load(.seq_cst)) {
             const connection = server.accept() catch |err| {
@@ -450,6 +568,118 @@ pub const InferenceServer = struct {
         _ = stream.write(response_buf.items) catch {};
     }
 
+    fn addTokenGraph(self: *InferenceServer, graph: *nsir.SelfSimilarRelationalGraph, time_graph: *temporal.TemporalGraph, tokens: []const u32, latent: []const f32) !void {
+        _ = self;
+        const limit = @min(tokens.len, 128);
+        var previous_id: [64]u8 = undefined;
+        var previous_len: usize = 0;
+        var has_previous = false;
+        var i: usize = 0;
+        while (i < limit) : (i += 1) {
+            var id_buf: [64]u8 = undefined;
+            const id = try std.fmt.bufPrint(id_buf[0..], "tok_{d}_{d}", .{ i, tokens[i] });
+            var data_buf: [64]u8 = undefined;
+            const data = try std.fmt.bufPrint(data_buf[0..], "{d}", .{tokens[i]});
+            const phase = if (latent.len > 0) @as(f64, @floatCast(latent[i % latent.len])) else 0.0;
+            const q = if ((tokens[i] & 1) == 0) nsir.Qubit.initBasis0() else nsir.Qubit.initBasis1();
+            const node = try nsir.Node.init(graph.allocator, id, data, q, phase);
+            try graph.addNode(node);
+            const t_state = quantum_logic.QuantumState.init(q.a.re, q.a.im, q.b.re, q.b.im, phase, 0.0);
+            time_graph.addNode(id, t_state) catch {};
+            if (has_previous) {
+                const prev = previous_id[0..previous_len];
+                const edge = nsir.Edge.init(
+                    graph.allocator,
+                    prev,
+                    id,
+                    .coherent,
+                    1.0,
+                    std.math.Complex(f64).init(1.0, 0.0),
+                    1.0,
+                );
+                try graph.addEdge(prev, id, edge);
+                time_graph.addEdge(prev, id, 1.0, .coherent) catch {};
+            }
+            @memcpy(previous_id[0..id.len], id);
+            previous_len = id.len;
+            has_previous = true;
+        }
+    }
+
+    fn addTripletsToGraphs(self: *InferenceServer, graph: *nsir.SelfSimilarRelationalGraph, time_graph: *temporal.TemporalGraph, pipeline: *crev.CREVPipeline, triplets: []*crev.RelationalTriplet) !usize {
+        _ = self;
+        var integrated: usize = 0;
+        for (triplets) |triplet| {
+            var validation = try pipeline.validateTriplet(triplet);
+            defer validation.deinit();
+            if (!validation.is_valid) continue;
+            triplet.confidence = validation.confidence_adjusted;
+            var subject_id_buf: [64]u8 = undefined;
+            var object_id_buf: [64]u8 = undefined;
+            const subject_id = try std.fmt.bufPrint(subject_id_buf[0..], "ent_{x}", .{stableSeed(triplet.subject)});
+            const object_id = try std.fmt.bufPrint(object_id_buf[0..], "ent_{x}", .{stableSeed(triplet.object)});
+            const c = std.math.clamp(triplet.confidence, 0.0, 1.0);
+            const q = nsir.Qubit.init(std.math.Complex(f64).init(c, 0.0), std.math.Complex(f64).init(1.0 - c, 0.0));
+            const subject_node = try nsir.Node.init(graph.allocator, subject_id, triplet.subject, q, c);
+            try graph.addNode(subject_node);
+            const object_node = try nsir.Node.init(graph.allocator, object_id, triplet.object, q, c);
+            try graph.addNode(object_node);
+            var edge = nsir.Edge.init(graph.allocator, subject_id, object_id, .coherent, c, std.math.Complex(f64).init(c, 0.0), 1.0);
+            try edge.setMetadata("relation", triplet.relation);
+            try graph.addEdge(subject_id, object_id, edge);
+            const q_state = quantum_logic.QuantumState.init(q.a.re, q.a.im, q.b.re, q.b.im, c, 0.0);
+            time_graph.addNode(subject_id, q_state) catch {};
+            time_graph.addNode(object_id, q_state) catch {};
+            time_graph.addEdge(subject_id, object_id, c, .coherent) catch {};
+            integrated += 1;
+        }
+        return integrated;
+    }
+
+    fn runRelationalInference(self: *InferenceServer, text: []const u8, tokens: []const u32, latent: []const f32, allocator: Allocator) !f64 {
+        var kernel = chaos.ChaosCoreKernel.init(allocator);
+        defer kernel.deinit();
+
+        var pipeline = try crev.CREVPipeline.init(allocator, &kernel);
+        defer pipeline.deinit();
+
+        var graph = try nsir.SelfSimilarRelationalGraph.init(allocator);
+        defer graph.deinit();
+
+        var time_graph = temporal.TemporalGraph.init(allocator);
+        defer time_graph.deinit();
+
+        var triplets = try pipeline.extractTriplets(text);
+        defer {
+            for (triplets.items) |triplet| {
+                triplet.deinit();
+                allocator.destroy(triplet);
+            }
+            triplets.deinit();
+        }
+
+        graph.beginTopologyBatch();
+        const integrated = try self.addTripletsToGraphs(&graph, &time_graph, &pipeline, triplets.items);
+        if (integrated == 0) {
+            try self.addTokenGraph(&graph, &time_graph, tokens, latent);
+        }
+        try graph.endTopologyBatch();
+
+        var memory = surprise.SurpriseMemoryManager.init(allocator, &kernel.storage, &kernel.flow_analyzer);
+        defer memory.deinit();
+        _ = try memory.storeWithSurprise(text, null);
+        _ = try time_graph.createSnapshot();
+
+        var optimizer = esso.EntangledStochasticSymmetryOptimizer.initWithSeed(allocator, 5.0, 0.91, 64, stableSeed(text));
+        defer optimizer.deinit();
+
+        var orchestrator = reasoning.ReasoningOrchestrator.init(allocator, &graph, &optimizer, &kernel);
+        defer orchestrator.deinit();
+        orchestrator.setParameters(4, 2, 2);
+        orchestrator.setProcessingLimits(32, 32, 16);
+        return try orchestrator.runHierarchicalReasoning(1);
+    }
+
     fn handleInference(self: *InferenceServer, stream: net.Stream, body: []const u8, allocator: Allocator) !void {
         if (self.model == null or self.model.?.mgt == null) {
             try self.sendError(stream, "Model not loaded", 503);
@@ -472,41 +702,69 @@ pub const InferenceServer = struct {
             return;
         };
 
-        const max_tokens = request.max_tokens orelse tokens.items.len;
-        const final_tokens = if (tokens.items.len > max_tokens)
-            tokens.items[0..max_tokens]
-        else
-            tokens.items;
+        self.inference_mutex.lock();
+        defer self.inference_mutex.unlock();
+
+        const rsf_model = self.model.?.rsf orelse {
+            try self.sendError(stream, "RSF not initialized", 500);
+            return;
+        };
+        const ctrl = rsf_model.ctrl orelse {
+            try self.sendError(stream, "RSF controller not initialized", 500);
+            return;
+        };
+        const dim = ctrl.dim;
+        const output_len = request.max_tokens orelse @max(tokens.items.len + 16, 16);
+
+        var rank_seed: ?[]u32 = null;
+        var rank_score: ?f32 = null;
+
+        if (self.ssi) |*ssi_idx| {
+            const is_anchor = (self.request_count % 10 == 0);
+            ssi_idx.addSequence(tokens.items, self.request_count, is_anchor) catch {};
+
+            if (self.ranker) |*rnk| {
+                const candidates = ssi_idx.retrieveTopK(tokens.items, 3, allocator) catch null;
+                if (candidates) |cands| {
+                    defer rankedSegmentsDeinit(allocator, cands);
+                    rnk.rankCandidatesWithQuery(cands, tokens.items, ssi_idx, allocator) catch {};
+                    if (cands.len > 0 and cands[0].tokens.len > 0) {
+                        rank_seed = try allocator.dupe(u32, cands[0].tokens);
+                        rank_score = cands[0].score;
+                    }
+                }
+            }
+        }
+        defer if (rank_seed) |seed_tokens| allocator.free(seed_tokens);
+
+        const seed_tokens = if (rank_seed) |seed| seed else tokens.items;
+        var input_tensor = Tensor.init(allocator, &.{ 1, dim * 2 }) catch {
+            try self.sendError(stream, "Failed to create RSF tensor", 500);
+            return;
+        };
+        defer input_tensor.deinit();
+
+        fillTensorFromTokens(&input_tensor, seed_tokens, request.text);
+
+        rsf_model.forward(&input_tensor) catch {
+            try self.sendError(stream, "RSF forward failed", 500);
+            return;
+        };
+
+        const graph_energy = self.runRelationalInference(request.text, tokens.items, input_tensor.data, allocator) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => 1.0,
+        };
+        evolveLatentWithEnergy(input_tensor.data, graph_energy, stableSeed(request.text));
+
+        rsf_model.inverse(&input_tensor) catch {
+            try self.sendError(stream, "RSF inverse failed", 500);
+            return;
+        };
 
         var embeddings: ?[]f32 = null;
-        if (request.return_embeddings and self.model.?.rsf != null) {
-            const dim = (self.model.?.rsf.?.ctrl orelse {
-                try self.sendError(stream, "RSF not initialized", 500);
-                return;
-            }).dim;
-            const batch_size = 1;
-
-            var input_tensor = Tensor.init(allocator, &.{batch_size, dim * 2}) catch {
-                try self.sendError(stream, "Failed to create embeddings", 500);
-                return;
-            };
-            defer input_tensor.deinit();
-
-            var k: usize = 0;
-            while (k < input_tensor.data.len) : (k += 1) {
-                input_tensor.data[k] = if (k < final_tokens.len)
-                    @as(f32, @floatFromInt(final_tokens[k])) / 1000.0
-                else
-                    0.0;
-            }
-
-            self.model.?.rsf.?.forward(&input_tensor) catch {
-                try self.sendError(stream, "Embedding generation failed", 500);
-                return;
-            };
-
+        if (request.return_embeddings) {
             nsirModulateForInference(input_tensor.data);
-
             embeddings = try allocator.alloc(f32, @min(dim, 128));
             var m: usize = 0;
             while (m < embeddings.?.len) : (m += 1) {
@@ -514,37 +772,33 @@ pub const InferenceServer = struct {
             }
         }
 
-        self.inference_mutex.lock();
-        defer self.inference_mutex.unlock();
-
-        if (self.ssi) |*ssi_idx| {
-            const is_anchor = (self.request_count % 10 == 0);
-            ssi_idx.addSequence(final_tokens, self.request_count, is_anchor) catch {};
-
-            if (self.ranker) |*rnk| {
-                const candidates = ssi_idx.retrieveTopK(final_tokens, 3, allocator) catch null;
-                if (candidates) |cands| {
-                    defer allocator.free(cands);
-                    rnk.rankCandidatesWithQuery(cands, final_tokens, ssi_idx, allocator) catch {};
-                }
-            }
+        var generated_tokens = try allocator.alloc(u32, output_len);
+        errdefer allocator.free(generated_tokens);
+        const vocab_size = self.model.?.mgt.?.vocabSize();
+        var g: usize = 0;
+        while (g < generated_tokens.len) : (g += 1) {
+            const fallback = if (tokens.items.len > 0) tokens.items[g % tokens.items.len] else 0;
+            const latent = if (input_tensor.data.len > 0) input_tensor.data[g % input_tensor.data.len] else 0.0;
+            const raw_token = tokenFromLatent(latent, g, stableSeed(request.text), vocab_size, fallback);
+            generated_tokens[g] = existingTokenId(self.model.?.mgt.?, raw_token, fallback);
         }
+
+        const generated_text = try decodeGeneratedTokens(allocator, self.model.?.mgt.?, generated_tokens);
+        errdefer allocator.free(generated_text);
         self.request_count += 1;
 
         const end_time = std.time.milliTimestamp();
         const processing_time = @as(f64, @floatFromInt(end_time - start_time));
 
-        const tokens_copy = try allocator.dupe(u32, final_tokens);
-
         var response = InferenceResponse{
-            .tokens = tokens_copy,
+            .tokens = generated_tokens,
+            .text = generated_text,
             .embeddings = embeddings,
+            .rank_score = rank_score,
+            .graph_energy = graph_energy,
             .processing_time_ms = processing_time,
         };
-        defer {
-            allocator.free(response.tokens);
-            if (response.embeddings) |emb| allocator.free(emb);
-        }
+        defer response.deinit(allocator);
 
         const json = try response.toJson(allocator);
         defer allocator.free(json);
@@ -590,7 +844,7 @@ pub const InferenceServer = struct {
                 "Content-Length: {d}\r\n" ++
                 "\r\n" ++
                 "{s}",
-            .{status_code, status_text, json.len, json},
+            .{ status_code, status_text, json.len, json },
         ) catch return;
 
         _ = stream.write(response) catch {};

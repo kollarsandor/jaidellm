@@ -341,12 +341,7 @@ pub const ReasoningOrchestrator = struct {
             while (node_iter.next()) |entry| {
                 if (count >= self.transform_node_limit) break;
                 const node = entry.value_ptr;
-                const quantum_state = quantum.QuantumState{
-                    .amplitude_real = node.qubit.a.re,
-                    .amplitude_imag = node.qubit.a.im,
-                    .phase = node.phase,
-                    .entanglement_degree = 0.0,
-                };
+                const quantum_state = quantum.QuantumState.init(node.qubit.a.re, node.qubit.a.im, node.qubit.b.re, node.qubit.b.im, node.phase, 0.0);
                 const transformed = transform.applyToQuantumState(&quantum_state);
                 node.qubit.a.re = transformed.amplitude_real;
                 node.qubit.a.im = transformed.amplitude_imag;
