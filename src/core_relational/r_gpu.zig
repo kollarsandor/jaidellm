@@ -152,12 +152,6 @@ pub const ProcessingCore = struct {
         return @as(f64, @floatFromInt(self.cycles_active)) / @as(f64, @floatFromInt(total));
     }
 
-    pub fn getUtilization(self: *const ProcessingCore) f64 {
-        const total = self.cycles_active + self.cycles_idle;
-        if (total == 0) return 0.0;
-        return @as(f64, @floatFromInt(self.cycles_active)) / @as(f64, @floatFromInt(total));
-    }
-
     pub fn clone(self: *const ProcessingCore, allocator: Allocator) !ProcessingCore {
         var new_core = ProcessingCore{
             .core_id = self.core_id,
@@ -268,7 +262,7 @@ pub const RouteKey = struct {
 
 pub const RouteKeyContext = struct {
     pub fn hash(_: @This(), key: RouteKey) u64 {
-        var hasher = std.hash.Wyhash.init(blk: { var seed_buf: [8]u8 = undefined; std.crypto.random.bytes(&seed_buf); break :blk std.mem.readInt(u64, &seed_buf, .little); });
+        var hasher = std.hash.Wyhash.init(0);
         hasher.update(std.mem.asBytes(&key.source));
         hasher.update(std.mem.asBytes(&key.destination));
         return hasher.final();
@@ -471,7 +465,7 @@ pub const AsynchronousNoC = struct {
 
 const StringContext = struct {
     pub fn hash(_: @This(), key: []const u8) u64 {
-        var hasher = std.hash.Wyhash.init(blk: { var seed_buf: [8]u8 = undefined; std.crypto.random.bytes(&seed_buf); break :blk std.mem.readInt(u64, &seed_buf, .little); });
+        var hasher = std.hash.Wyhash.init(0);
         hasher.update(key);
         return hasher.final();
     }
@@ -520,74 +514,96 @@ pub const GraphIsomorphismProcessor = struct {
             }
         }.lessThan);
 
-        const DegreePair = struct { out_degree: usize, in_degree: usize };
-        var degree_sequence = ArrayList(DegreePair).init(graph.allocator);
-        defer degree_sequence.deinit();
+        const NodeSignature = struct {
+            out_degree: usize,
+            in_degree: usize,
+            weight_sum: f64,
+            edge_quality_sum: u64,
+        };
+
+        var node_signatures = ArrayList(NodeSignature).init(graph.allocator);
+        defer node_signatures.deinit();
 
         for (node_ids.items) |node_id| {
             var out_degree: usize = 0;
             var in_degree: usize = 0;
+            var weight_sum: f64 = 0.0;
+            var edge_quality_sum: u64 = 0;
 
             var edge_iter = graph.edges.iterator();
             while (edge_iter.next()) |edge_entry| {
                 const key = edge_entry.key_ptr.*;
                 if (std.mem.eql(u8, key.source, node_id)) {
                     out_degree += edge_entry.value_ptr.items.len;
+                    for (edge_entry.value_ptr.items) |edge| {
+                        weight_sum += edge.weight;
+                        edge_quality_sum += @intFromEnum(edge.quality);
+                    }
                 }
                 if (std.mem.eql(u8, key.target, node_id)) {
                     in_degree += edge_entry.value_ptr.items.len;
+                    for (edge_entry.value_ptr.items) |edge| {
+                        weight_sum += edge.weight;
+                        edge_quality_sum += @intFromEnum(edge.quality);
+                    }
                 }
             }
-            try degree_sequence.append(.{ .out_degree = out_degree, .in_degree = in_degree });
+            try node_signatures.append(.{ .out_degree = out_degree, .in_degree = in_degree, .weight_sum = weight_sum, .edge_quality_sum = edge_quality_sum });
         }
 
-        std.mem.sort(DegreePair, degree_sequence.items, {}, struct {
-            fn lessThan(_: void, a: DegreePair, b: DegreePair) bool {
-                if (a.out_degree != b.out_degree) {
-                    return a.out_degree < b.out_degree;
-                }
-                return a.in_degree < b.in_degree;
+        std.mem.sort(NodeSignature, node_signatures.items, {}, struct {
+            fn lessThan(_: void, a: NodeSignature, b: NodeSignature) bool {
+                if (a.out_degree != b.out_degree) return a.out_degree < b.out_degree;
+                if (a.in_degree != b.in_degree) return a.in_degree < b.in_degree;
+                if (a.edge_quality_sum != b.edge_quality_sum) return a.edge_quality_sum < b.edge_quality_sum;
+                return a.weight_sum < b.weight_sum;
             }
         }.lessThan);
 
-        var edge_qualities = ArrayList(u8).init(graph.allocator);
-        defer edge_qualities.deinit();
+        var adj_triples = ArrayList(struct { src: usize, dst: usize, quality: u8 }).init(graph.allocator);
+        defer adj_triples.deinit();
 
         var edge_iter = graph.edges.iterator();
         while (edge_iter.next()) |edge_entry| {
-            for (edge_entry.value_ptr.items) |edge| {
-                try edge_qualities.append(@intFromEnum(edge.quality));
+            const key = edge_entry.key_ptr.*;
+            var src_idx: usize = 0;
+            var found_src = false;
+            for (node_ids.items, 0..) |nid, idx| {
+                if (std.mem.eql(u8, nid, key.source)) { src_idx = idx; found_src = true; break; }
+            }
+            var dst_idx: usize = 0;
+            var found_dst = false;
+            for (node_ids.items, 0..) |nid, idx| {
+                if (std.mem.eql(u8, nid, key.target)) { dst_idx = idx; found_dst = true; break; }
+            }
+            if (found_src and found_dst) {
+                for (edge_entry.value_ptr.items) |edge| {
+                    try adj_triples.append(.{ .src = src_idx, .dst = dst_idx, .quality = @intFromEnum(edge.quality) });
+                }
             }
         }
 
-        std.mem.sort(u8, edge_qualities.items, {}, struct {
-            fn lessThan(_: void, a: u8, b: u8) bool {
-                return a < b;
+        std.mem.sort(@TypeOf(adj_triples.items[0]), adj_triples.items, {}, struct {
+            fn lessThan(_: void, a: @TypeOf(adj_triples.items[0]), b: @TypeOf(adj_triples.items[0])) bool {
+                if (a.src != b.src) return a.src < b.src;
+                if (a.dst != b.dst) return a.dst < b.dst;
+                return a.quality < b.quality;
             }
         }.lessThan);
 
         var buffer = ArrayList(u8).init(graph.allocator);
         errdefer buffer.deinit();
 
-        try std.fmt.format(buffer.writer(), "{d}_[", .{node_ids.items.len});
-        {
-            var i: usize = 0;
-            while (i < degree_sequence.items.len) : (i += 1) {
-                const deg = degree_sequence.items[i];
-                if (i > 0) try buffer.appendSlice(",");
-                try std.fmt.format(buffer.writer(), "({d},{d})", .{ deg.out_degree, deg.in_degree });
-            }
+        try std.fmt.format(buffer.writer(), "{d}_", .{node_ids.items.len});
+        for (node_signatures.items, 0..) |sig, i| {
+            if (i > 0) try buffer.appendSlice(";");
+            try std.fmt.format(buffer.writer(), "({d},{d},{d:.0},{d})", .{ sig.out_degree, sig.in_degree, sig.weight_sum, sig.edge_quality_sum });
         }
-        try buffer.appendSlice("]_[");
-        {
-            var i: usize = 0;
-            while (i < edge_qualities.items.len) : (i += 1) {
-                const q = edge_qualities.items[i];
-                if (i > 0) try buffer.appendSlice(",");
-                try std.fmt.format(buffer.writer(), "{d}", .{q});
-            }
+        try buffer.appendSlice("_E");
+        for (adj_triples.items, 0..) |triple, i| {
+            if (i > 0) try buffer.appendSlice(",");
+            try std.fmt.format(buffer.writer(), "{d}-{d}-{d}", .{ triple.src, triple.dst, triple.quality });
         }
-        try buffer.appendSlice("]");
 
         return try buffer.toOwnedSlice();
     }
@@ -710,7 +726,7 @@ pub const EdgeKeyForWeighting = struct {
 
 const EdgeKeyForWeightingContext = struct {
     pub fn hash(_: @This(), key: EdgeKeyForWeighting) u64 {
-        var hasher = std.hash.Wyhash.init(blk: { var seed_buf: [8]u8 = undefined; std.crypto.random.bytes(&seed_buf); break :blk std.mem.readInt(u64, &seed_buf, .little); });
+        var hasher = std.hash.Wyhash.init(0);
         hasher.update(key.source);
         hasher.update(&[_]u8{0});
         hasher.update(key.target);
@@ -748,6 +764,8 @@ pub const DynamicEdgeWeighting = struct {
             self.allocator.free(key);
         }
         self.key_storage.deinit();
+
+        self.learning_rate = 0.0;
     }
 
     pub fn updateWeight(self: *DynamicEdgeWeighting, source: []const u8, target: []const u8, current_weight: f64, feedback: f64) !f64 {
@@ -783,41 +801,71 @@ pub const DynamicEdgeWeighting = struct {
         spatial_factor: f64,
         semantic_factor: f64,
     ) f64 {
-        _ = self;
-        _ = source;
-        _ = target;
-        var adaptive_weight = base_weight * temporal_factor * spatial_factor * semantic_factor;
+        const key = EdgeKeyForWeighting{ .source = source, .target = target };
+        var history_adjustment: f64 = 1.0;
+        var temporal_adjustment: f64 = 1.0;
+        var spatial_adjustment: f64 = 1.0;
+        var semantic_adjustment: f64 = 1.0;
+        if (self.weight_history.get(key)) |history| {
+            if (history.items.len > 0) {
+                const recent = history.items[history.items.len - 1];
+                history_adjustment = 0.8 + 0.2 * recent;
+                const history_len = @as(f64, @floatFromInt(history.items.len));
+                temporal_adjustment = temporal_factor * (1.0 + 0.1 * @log(@max(1.0, history_len)));
+                if (history.items.len >= 2) {
+                    const prev = history.items[history.items.len - 2];
+                    const trend = recent - prev;
+                    spatial_adjustment = spatial_factor * (1.0 + 0.05 * trend);
+                } else {
+                    spatial_adjustment = spatial_factor;
+                }
+                var history_sum: f64 = 0.0;
+                for (history.items) |h| {
+                    history_sum += h;
+                }
+                const history_avg = history_sum / history_len;
+                semantic_adjustment = semantic_factor * (0.5 + 0.5 * history_avg);
+            } else {
+                temporal_adjustment = temporal_factor;
+                spatial_adjustment = spatial_factor;
+                semantic_adjustment = semantic_factor;
+            }
+        } else {
+            temporal_adjustment = temporal_factor;
+            spatial_adjustment = spatial_factor;
+            semantic_adjustment = semantic_factor;
+        }
+        var adaptive_weight = base_weight * history_adjustment * temporal_adjustment * spatial_adjustment * semantic_adjustment;
         adaptive_weight = @max(0.0, @min(1.0, adaptive_weight));
         return adaptive_weight;
     }
 
     pub fn propagateWeights(self: *DynamicEdgeWeighting, graph: *SelfSimilarRelationalGraph, source_node: []const u8, iterations: usize) !void {
-        _ = self;
-        var visited = std.HashMap([]const u8, void, StringContext, std.hash_map.default_max_load_percentage).init(graph.allocator);
+        var visited = std.HashMap([]const u8, void, StringContext, std.hash_map.default_max_load_percentage).init(self.allocator);
         defer {
             var iter = visited.iterator();
             while (iter.next()) |entry| {
-                graph.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.key_ptr.*);
             }
             visited.deinit();
         }
 
-        var current_layer = ArrayList([]const u8).init(graph.allocator);
+        var current_layer = ArrayList([]const u8).init(self.allocator);
         defer {
             for (current_layer.items) |item| {
-                graph.allocator.free(item);
+                self.allocator.free(item);
             }
             current_layer.deinit();
         }
 
-        try current_layer.append(try graph.allocator.dupe(u8, source_node));
+        try current_layer.append(try self.allocator.dupe(u8, source_node));
 
         var iteration: usize = 0;
         while (iteration < iterations) : (iteration += 1) {
-            var next_layer = ArrayList([]const u8).init(graph.allocator);
+            var next_layer = ArrayList([]const u8).init(self.allocator);
             defer {
                 for (next_layer.items) |item| {
-                    graph.allocator.free(item);
+                    self.allocator.free(item);
                 }
                 next_layer.deinit();
             }
@@ -827,7 +875,7 @@ pub const DynamicEdgeWeighting = struct {
                     continue;
                 }
 
-                const visited_copy = try graph.allocator.dupe(u8, node_id);
+                const visited_copy = try self.allocator.dupe(u8, node_id);
                 try visited.put(visited_copy, {});
 
                 const decay_factor = std.math.pow(f64, 0.9, @as(f64, @floatFromInt(iteration)));
@@ -847,7 +895,7 @@ pub const DynamicEdgeWeighting = struct {
                             }
                         }
                         if (!already_added) {
-                            try next_layer.append(try graph.allocator.dupe(u8, key.target));
+                            try next_layer.append(try self.allocator.dupe(u8, key.target));
                         }
                     } else if (std.mem.eql(u8, key.target, node_id)) {
                         for (edge_entry.value_ptr.items) |*edge| {
@@ -861,19 +909,19 @@ pub const DynamicEdgeWeighting = struct {
                             }
                         }
                         if (!already_added) {
-                            try next_layer.append(try graph.allocator.dupe(u8, key.source));
+                            try next_layer.append(try self.allocator.dupe(u8, key.source));
                         }
                     }
                 }
             }
 
             for (current_layer.items) |item| {
-                graph.allocator.free(item);
+                self.allocator.free(item);
             }
             current_layer.clearRetainingCapacity();
 
             for (next_layer.items) |item| {
-                try current_layer.append(try graph.allocator.dupe(u8, item));
+                try current_layer.append(try self.allocator.dupe(u8, item));
             }
 
             if (current_layer.items.len == 0) {
@@ -1682,3 +1730,5 @@ test "RelationalGraphProcessingUnit managePower" {
     const stats = rpgu.getStatistics();
     try testing.expectEqual(@as(usize, 4), stats.total_cores);
 }
+
+================

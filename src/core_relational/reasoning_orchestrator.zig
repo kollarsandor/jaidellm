@@ -147,6 +147,13 @@ pub const OrchestratorStatistics = struct {
     }
 };
 
+pub const ReasoningResult = struct {
+    best_energy: f64,
+    modulation_factor: f64,
+    phases_completed: usize,
+    patterns_found: usize,
+};
+
 pub const ReasoningOrchestrator = struct {
     graph: *SelfSimilarRelationalGraph,
     esso: *EntangledStochasticSymmetryOptimizer,
@@ -256,17 +263,25 @@ pub const ReasoningOrchestrator = struct {
         while (node_iter.next()) |entry| {
             if (count >= self.perturb_node_limit) break;
             var node = entry.value_ptr;
-            const perturbation = (self.esso.prng.random().float(f64) - 0.5) * 0.1;
-            node.phase += perturbation;
-            const magnitude = std.math.sqrt(node.qubit.a.re * node.qubit.a.re + node.qubit.a.im * node.qubit.a.im);
-            if (magnitude > 0.0) {
-                const new_real = node.qubit.a.re + perturbation * 0.01;
-                const new_imag = node.qubit.a.im + perturbation * 0.01;
-                const new_mag = @sqrt(new_real * new_real + new_imag * new_imag);
-                if (new_mag > 0.0) {
-                    node.qubit.a.re = new_real / new_mag * magnitude;
-                    node.qubit.a.im = new_imag / new_mag * magnitude;
-                }
+            const perturbation_a = (self.esso.prng.random().float(f64) - 0.5) * 0.1;
+            const perturbation_b = (self.esso.prng.random().float(f64) - 0.5) * 0.1;
+            node.phase += (perturbation_a + perturbation_b) * 0.5;
+            const perturb_scale = 0.01;
+            var new_a_re = node.qubit.a.re + perturbation_a * perturb_scale;
+            var new_a_im = node.qubit.a.im + perturbation_a * perturb_scale;
+            var new_b_re = node.qubit.b.re + perturbation_b * perturb_scale;
+            var new_b_im = node.qubit.b.im + perturbation_b * perturb_scale;
+            const mag = std.math.sqrt(new_a_re * new_a_re + new_a_im * new_a_im + new_b_re * new_b_re + new_b_im * new_b_im);
+            if (mag > 1e-12) {
+                node.qubit.a.re = new_a_re / mag;
+                node.qubit.a.im = new_a_im / mag;
+                node.qubit.b.re = new_b_re / mag;
+                node.qubit.b.im = new_b_im / mag;
+            } else {
+                node.qubit.a.re = 1.0;
+                node.qubit.a.im = 0.0;
+                node.qubit.b.re = 0.0;
+                node.qubit.b.im = 0.0;
             }
             count += 1;
         }
@@ -335,23 +350,67 @@ pub const ReasoningOrchestrator = struct {
         const transforms = try self.esso.detectSymmetries(self.graph);
         defer self.allocator.free(transforms);
 
+        const epsilon: f64 = 1e-10;
+
         for (transforms) |transform| {
             var node_iter = self.graph.nodes.iterator();
             var count: usize = 0;
             while (node_iter.next()) |entry| {
                 if (count >= self.transform_node_limit) break;
                 const node = entry.value_ptr;
-                const quantum_state = quantum.QuantumState{
+                const quantum_state_a = quantum.QuantumState{
                     .amplitude_real = node.qubit.a.re,
                     .amplitude_imag = node.qubit.a.im,
                     .phase = node.phase,
                     .entanglement_degree = 0.0,
                 };
-                const transformed = transform.applyToQuantumState(&quantum_state);
-                node.qubit.a.re = transformed.amplitude_real;
-                node.qubit.a.im = transformed.amplitude_imag;
-                node.phase = transformed.phase;
+                const transformed_a = transform.applyToQuantumState(&quantum_state_a);
+                const quantum_state_b = quantum.QuantumState{
+                    .amplitude_real = node.qubit.b.re,
+                    .amplitude_imag = node.qubit.b.im,
+                    .phase = node.phase,
+                    .entanglement_degree = 0.0,
+                };
+                const transformed_b = transform.applyToQuantumState(&quantum_state_b);
+                var new_a_re = if (@abs(transformed_a.amplitude_real) < epsilon) epsilon else transformed_a.amplitude_real;
+                var new_a_im = if (@abs(transformed_a.amplitude_imag) < epsilon) epsilon else transformed_a.amplitude_imag;
+                var new_b_re = if (@abs(transformed_b.amplitude_real) < epsilon) epsilon else transformed_b.amplitude_real;
+                var new_b_im = if (@abs(transformed_b.amplitude_imag) < epsilon) epsilon else transformed_b.amplitude_imag;
+                const mag = std.math.sqrt(new_a_re * new_a_re + new_a_im * new_a_im + new_b_re * new_b_re + new_b_im * new_b_im);
+                if (mag > 1e-12) {
+                    node.qubit.a.re = new_a_re / mag;
+                    node.qubit.a.im = new_a_im / mag;
+                    node.qubit.b.re = new_b_re / mag;
+                    node.qubit.b.im = new_b_im / mag;
+                } else {
+                    node.qubit.a.re = 1.0;
+                    node.qubit.a.im = 0.0;
+                    node.qubit.b.re = 0.0;
+                    node.qubit.b.im = 0.0;
+                }
+                node.phase = transformed_a.phase;
                 count += 1;
+            }
+        }
+
+        var norm_iter = self.graph.nodes.iterator();
+        while (norm_iter.next()) |entry| {
+            var node = entry.value_ptr;
+            const re_a = node.qubit.a.re;
+            const im_a = node.qubit.a.im;
+            const re_b = node.qubit.b.re;
+            const im_b = node.qubit.b.im;
+            const mag = std.math.sqrt(re_a * re_a + im_a * im_a + re_b * re_b + im_b * im_b);
+            if (mag > 1e-12) {
+                node.qubit.a.re = re_a / mag;
+                node.qubit.a.im = im_a / mag;
+                node.qubit.b.re = re_b / mag;
+                node.qubit.b.im = im_b / mag;
+            } else {
+                node.qubit.a.re = 1.0;
+                node.qubit.a.im = 0.0;
+                node.qubit.b.re = 0.0;
+                node.qubit.b.im = 0.0;
             }
         }
     }
@@ -389,15 +448,16 @@ pub const ReasoningOrchestrator = struct {
         phase.previous_energy = initial_energy;
         phase.current_energy = initial_energy;
 
-        var depth: usize = 0;
-        while (depth < self.hierarchical_depth) : (depth += 1) {
-            const local_energy = try self.executeLocalPhaseInternal(false);
-            const global_energy = try self.executeGlobalPhaseInternal(false);
+        var step: usize = 0;
+        while (step < 3) : (step += 1) {
+            const sub_energy = if (step % 2 == 0)
+                try self.executeLocalPhaseInternal(false)
+            else
+                try self.executeGlobalPhaseInternal(false);
 
-            const composite = (local_energy + global_energy) / 2.0;
-            phase.updateEnergy(composite);
+            phase.updateEnergy(sub_energy);
 
-            if (depth > 0 and phase.hasConverged()) {
+            if (step > 0 and phase.hasConverged()) {
                 break;
             }
         }
@@ -426,7 +486,8 @@ pub const ReasoningOrchestrator = struct {
         var node_iter = self.graph.nodes.iterator();
         while (node_iter.next()) |entry| {
             const node = entry.value_ptr;
-            total_energy += @cos(node.phase);
+            const cos_phase = @cos(node.phase);
+            total_energy += (1.0 - cos_phase * cos_phase) / 2.0;
             count += 1;
         }
 
@@ -437,9 +498,15 @@ pub const ReasoningOrchestrator = struct {
     }
 
     pub fn runHierarchicalReasoning(self: *Self, max_cycles: usize) !f64 {
+        const result = try self.runHierarchicalReasoningFull(max_cycles);
+        return result.best_energy;
+    }
+
+    pub fn runHierarchicalReasoningFull(self: *Self, max_cycles: usize) !ReasoningResult {
         var cycle: usize = 0;
         var best_energy: f64 = std.math.inf(f64);
         var prev_combined: f64 = std.math.inf(f64);
+        var total_patterns: usize = 0;
 
         while (cycle < max_cycles) : (cycle += 1) {
             const local_e = try self.executeLocalPhase();
@@ -450,6 +517,8 @@ pub const ReasoningOrchestrator = struct {
             if (combined < best_energy) {
                 best_energy = combined;
             }
+
+            total_patterns = self.statistics.patterns_discovered;
 
             if (cycle > 0) {
                 const delta = @abs(combined - prev_combined);
@@ -465,7 +534,28 @@ pub const ReasoningOrchestrator = struct {
             }
         }
 
-        return best_energy;
+        const modulation = 1.0 / (1.0 + best_energy);
+
+        return ReasoningResult{
+            .best_energy = best_energy,
+            .modulation_factor = modulation,
+            .phases_completed = self.statistics.total_phases,
+            .patterns_found = total_patterns,
+        };
+    }
+
+    pub fn modulateTensor(self: *const Self, data: []f32, modulation: f64) void {
+        if (data.len == 0) return;
+        const scale: f32 = @floatCast(modulation);
+        var i: usize = 0;
+        while (i < data.len) : (i += 1) {
+            data[i] *= scale;
+        }
+    }
+
+    pub fn applyModulationToGraph(self: *Self) !f64 {
+        const result = try self.runHierarchicalReasoningFull(1);
+        return result.modulation_factor;
     }
 
     pub fn getStatistics(self: *const Self) OrchestratorStatistics {

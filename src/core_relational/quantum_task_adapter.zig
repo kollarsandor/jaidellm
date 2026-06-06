@@ -22,6 +22,7 @@ pub const QuantumSubgraph = struct {
     total_entanglement: f64,
     avg_fractal_dimension: f64,
     subgraph_id: u64,
+    semantic_cluster_id: u64,
     allocator: Allocator,
 
     const Self = @This();
@@ -33,6 +34,7 @@ pub const QuantumSubgraph = struct {
             .total_entanglement = 0.0,
             .avg_fractal_dimension = 0.0,
             .subgraph_id = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))),
+            .semantic_cluster_id = 0,
             .allocator = allocator,
         };
     }
@@ -86,7 +88,7 @@ pub const QuantumTaskResult = struct {
     quantum_states: ArrayList(Complex(f64)),
     correlations: ArrayList(f64),
     execution_time_ms: i64,
-    backend_name: []const u8,
+    backend_name: ?[]const u8,
     allocator: Allocator,
 
     const Self = @This();
@@ -98,7 +100,7 @@ pub const QuantumTaskResult = struct {
             .quantum_states = ArrayList(Complex(f64)).init(allocator),
             .correlations = ArrayList(f64).init(allocator),
             .execution_time_ms = 0,
-            .backend_name = "unknown",
+            .backend_name = null,
             .allocator = allocator,
         };
     }
@@ -106,9 +108,16 @@ pub const QuantumTaskResult = struct {
     pub fn deinit(self: *Self) void {
         self.quantum_states.deinit();
         self.correlations.deinit();
+        if (self.backend_name) |bn| {
+            self.allocator.free(bn);
+            self.backend_name = null;
+        }
     }
 
     pub fn setBackendName(self: *Self, name: []const u8) !void {
+        if (self.backend_name) |bn| {
+            self.allocator.free(bn);
+        }
         self.backend_name = try self.allocator.dupe(u8, name);
     }
 };
@@ -166,6 +175,13 @@ pub const QuantumTaskAdapter = struct {
         self.fractal_threshold = fractal;
     }
 
+    fn semanticClusterKey(allocator: Allocator, edge: *const Edge) ![]const u8 {
+        const quality_val: usize = @intFromEnum(edge.quality);
+        const fractal_bucket: usize = if (edge.fractal_dimension >= 2.0) 2 else if (edge.fractal_dimension >= 1.5) 1 else 0;
+        const corr_bucket: usize = if (edge.quantum_correlation.magnitude() >= 0.8) 3 else if (edge.quantum_correlation.magnitude() >= 0.5) 2 else if (edge.quantum_correlation.magnitude() >= 0.2) 1 else 0;
+        return std.fmt.allocPrint(allocator, "q{d}_f{d}_c{d}", .{ quality_val, fractal_bucket, corr_bucket });
+    }
+
     pub fn identifyQuantumSubgraphs(self: *Self) !ArrayList(QuantumSubgraph) {
         var subgraphs = ArrayList(QuantumSubgraph).init(self.allocator);
 
@@ -187,7 +203,7 @@ pub const QuantumTaskAdapter = struct {
             for (entry.value_ptr.items) |edge| {
                 const correlation = edge.quantum_correlation.magnitude();
                 if (correlation > self.entanglement_threshold and edge.fractal_dimension > self.fractal_threshold) {
-                    const cluster_key = try std.fmt.allocPrint(self.allocator, "{d:.2}_{d:.2}", .{ correlation, edge.fractal_dimension });
+                    const cluster_key = try semanticClusterKey(self.allocator, edge);
                     errdefer self.allocator.free(cluster_key);
 
                     var result = try node_clusters.getOrPut(cluster_key);
@@ -245,18 +261,28 @@ pub const QuantumTaskAdapter = struct {
             const qasm = try self.generateQASM(subgraph);
             defer self.allocator.free(qasm);
 
-            const job_response = try self.quantum_client.?.submitJob(qasm);
+            const job_response = try self.quantum_client.?.submitJobWithBackend(qasm, self.quantum_client.?.backend_name, 1024);
             defer self.allocator.free(job_response);
 
             result.success = true;
-            try result.setBackendName("ibm_brisbane");
+            try result.setBackendName(self.quantum_client.?.backend_name);
         } else {
             try self.executeLocalSimulation(subgraph, &result);
             try result.setBackendName("local_simulator");
         }
 
         const end_time = std.time.nanoTimestamp();
-        result.execution_time_ms = end_time - start_time;
+        const elapsed_ns = end_time - start_time;
+        const max_i64: i128 = std.math.maxInt(i64);
+        const min_i64: i128 = std.math.minInt(i64);
+        if (elapsed_ns > max_i64) {
+            result.execution_time_ms = @as(i64, @truncate(@divTrunc(elapsed_ns, 1_000_000)));
+        } else if (elapsed_ns < min_i64) {
+            result.execution_time_ms = @as(i64, @truncate(@divTrunc(elapsed_ns, 1_000_000)));
+        } else {
+            const ms_i128 = @divTrunc(elapsed_ns, 1_000_000);
+            result.execution_time_ms = @as(i64, @intCast(ms_i128));
+        }
 
         if (result.success) {
             self.statistics.tasks_completed += 1;
@@ -266,8 +292,9 @@ pub const QuantumTaskAdapter = struct {
 
         const total_completed = self.statistics.tasks_completed;
         if (total_completed > 0) {
+            const elapsed_ms: f64 = @as(f64, @floatFromInt(result.execution_time_ms));
             const prev_avg = self.statistics.avg_execution_time_ms * @as(f64, @floatFromInt(total_completed - 1));
-            self.statistics.avg_execution_time_ms = (prev_avg + @as(f64, @floatFromInt(result.execution_time_ms))) / @as(f64, @floatFromInt(total_completed));
+            self.statistics.avg_execution_time_ms = (prev_avg + elapsed_ms) / @as(f64, @floatFromInt(total_completed));
         }
 
         return result;
@@ -294,7 +321,7 @@ pub const QuantumTaskAdapter = struct {
         var i: usize = 0;
         while (i < qubit_count) : (i += 1) {
             const state = self.local_simulator.getState(i) orelse continue;
-            const complex_val = Complex(f64).init(state.amplitude_real, state.amplitude_imag);
+            const complex_val = Complex(f64).init(state.amplitudes[0].re, state.amplitudes[0].im);
             try result.quantum_states.append(complex_val);
             try result.correlations.append(state.entanglement_degree);
         }
@@ -367,8 +394,15 @@ pub const QuantumTaskAdapter = struct {
                         break :blk sum / @as(f64, @floatFromInt(result.correlations.items.len));
                     } else 0.0;
 
+                    var avg_imag: f64 = 0.0;
+                    if (result.quantum_states.items.len > 0) {
+                        var sum_imag: f64 = 0.0;
+                        for (result.quantum_states.items) |qs| sum_imag += qs.im;
+                        avg_imag = sum_imag / @as(f64, @floatFromInt(result.quantum_states.items.len));
+                    }
+
                     edge.quantum_correlation.re = avg_corr;
-                    edge.quantum_correlation.im = avg_corr * 0.5;
+                    edge.quantum_correlation.im = avg_imag;
                 }
             }
         }

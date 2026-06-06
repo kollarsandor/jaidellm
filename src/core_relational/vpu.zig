@@ -157,7 +157,8 @@ pub fn SimdVector(comptime T: type, comptime N: usize) type {
             const other_arr = other.toArray();
             for (other_arr) |v| {
                 if (is_float) {
-                    if (v == 0.0) return VectorError.DivisionByZero;
+                    const epsilon: T = if (T == f32) 1e-7 else 1e-15;
+                    if (@abs(v) < epsilon) return VectorError.DivisionByZero;
                 } else {
                     if (v == 0) return VectorError.DivisionByZero;
                 }
@@ -493,6 +494,7 @@ pub const VectorBatch = struct {
     allocator: Allocator,
     processed_count: usize,
     total_unique_processed: usize,
+    skipped_count: usize,
 
     const Self = @This();
 
@@ -503,6 +505,7 @@ pub const VectorBatch = struct {
             .allocator = allocator,
             .processed_count = 0,
             .total_unique_processed = 0,
+            .skipped_count = 0,
         };
     }
 
@@ -568,17 +571,45 @@ pub const VectorBatch = struct {
 
     pub fn processBatch(self: *Self, operation: BatchOperation) !void {
         const process_count = @min(self.batch_size, self.vectors.items.len);
+        var success_count: usize = 0;
+        var skip_count: usize = 0;
         var i: usize = 0; while (i < process_count) : (i += 1) {
             const entry = &self.vectors.items[i];
             switch (operation) {
-                .normalize => try self.normalizeEntry(entry),
-                .scale => |s| try self.scaleEntry(entry, s),
-                .abs => try self.absEntry(entry),
-                .sqrt => try self.sqrtEntry(entry),
+                .normalize => self.normalizeEntry(entry) catch |err| switch (err) {
+                    VectorError.InvalidOperation => {
+                        skip_count += 1;
+                        continue;
+                    },
+                    else => return err,
+                },
+                .scale => |s| self.scaleEntry(entry, s) catch |err| switch (err) {
+                    VectorError.InvalidOperation => {
+                        skip_count += 1;
+                        continue;
+                    },
+                    else => return err,
+                },
+                .abs => self.absEntry(entry) catch |err| switch (err) {
+                    VectorError.InvalidOperation => {
+                        skip_count += 1;
+                        continue;
+                    },
+                    else => return err,
+                },
+                .sqrt => self.sqrtEntry(entry) catch |err| switch (err) {
+                    VectorError.InvalidOperation => {
+                        skip_count += 1;
+                        continue;
+                    },
+                    else => return err,
+                },
             }
+            success_count += 1;
         }
-        self.processed_count = process_count;
-        self.total_unique_processed += process_count;
+        self.processed_count = success_count;
+        self.skipped_count = skip_count;
+        self.total_unique_processed += success_count;
     }
 
     fn normalizeEntry(self: *Self, entry: *VectorBatchEntry) !void {
@@ -1988,5 +2019,4 @@ test "VectorCache put and get" {
     try std.testing.expect(entry != null);
 }
 
-
-
+================

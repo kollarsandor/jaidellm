@@ -129,40 +129,71 @@ pub const SecureRng = struct {
         };
     }
 
+    fn advanceState(self: *Self) void {
+        self.fallback_state = self.fallback_state *% 6364136223846793005 +% 1442695040888963407;
+    }
+
+    fn mixFallback(self: *Self, comptime T: type) T {
+        self.advanceState();
+        const Ut = std.meta.Int(.unsigned, @bitSizeOf(T));
+        return @as(T, @truncate(@as(Ut, @intCast(self.fallback_state))));
+    }
+
     pub fn bytes(self: *Self, buffer: []u8) void {
-        _ = self;
         std.crypto.random.bytes(buffer);
+        for (buffer, 0..) |*b, i| {
+            if (i % 8 == 0) self.advanceState();
+            b.* ^= @truncate(self.fallback_state >> @intCast((i % 8) * 8));
+        }
     }
 
     pub fn int(self: *Self, comptime T: type) T {
-        _ = self;
-        return std.crypto.random.int(T);
+        const crypto_val = std.crypto.random.int(T);
+        const fallback_val = self.mixFallback(T);
+        const Ut = std.meta.Int(.unsigned, @bitSizeOf(T));
+        return @as(T, @bitCast(@as(Ut, @bitCast(crypto_val)) ^ @as(Ut, @bitCast(fallback_val))));
     }
 
     pub fn intRange(self: *Self, comptime T: type, min: T, max: T) T {
-        _ = self;
         if (min >= max) {
             return min;
         }
         const range = max - min;
-        const random_val = std.crypto.random.int(T);
-        return min + @mod(random_val, range);
+        const UnsignedT = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const u_range = @as(UnsignedT, @bitCast(range));
+        if (u_range == 0) return min;
+        const limit = std.math.maxInt(UnsignedT) - (std.math.maxInt(UnsignedT) % u_range);
+        while (true) {
+            self.advanceState();
+            const crypto_raw = std.crypto.random.int(UnsignedT);
+            const fallback_raw = @as(UnsignedT, @intCast(self.fallback_state));
+            const raw = crypto_raw ^ fallback_raw;
+            if (raw < limit) {
+                return min + @as(T, @bitCast(@as(UnsignedT, raw % u_range)));
+            }
+        }
     }
 
     pub fn uintLessThan(self: *Self, comptime T: type, upper: T) T {
-        _ = self;
-        return std.crypto.random.uintLessThan(T, upper);
+        self.advanceState();
+        const crypto_val = std.crypto.random.uintLessThan(T, upper);
+        const fallback_val = @as(T, @truncate(self.fallback_state));
+        return (crypto_val +% fallback_val) % upper;
     }
 
     pub fn float(self: *Self, comptime T: type) T {
-        _ = self;
+        self.advanceState();
         if (T == f32) {
             const bits = std.crypto.random.int(u32);
-            const mantissa = bits & 0x7FFFFF;
+            const fb = @as(u32, @truncate(self.fallback_state));
+            const combined = bits ^ fb;
+            const mantissa = combined & 0x7FFFFF;
             return @as(f32, @floatFromInt(mantissa)) / @as(f32, @floatFromInt(0x800000));
         } else {
             const bits = std.crypto.random.int(u64);
-            const mantissa = bits & 0xFFFFFFFFFFFFF;
+            const fb = self.fallback_state;
+            const combined = bits ^ fb;
+            const mantissa = combined & 0xFFFFFFFFFFFFF;
             return @as(f64, @floatFromInt(mantissa)) / @as(f64, @floatFromInt(0x10000000000000));
         }
     }
@@ -212,13 +243,14 @@ pub fn secureZeroSlice(comptime T: type, buffer: []T) void {
 }
 
 pub fn secureCompare(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) {
-        return false;
-    }
     var result: u8 = 0;
+    result |= @intFromBool(a.len != b.len);
+    const max_len = @max(a.len, b.len);
     var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        result |= a[i] ^ b[i];
+    while (i < max_len) : (i += 1) {
+        const a_byte: u8 = if (i < a.len) a[i] else 0;
+        const b_byte: u8 = if (i < b.len) b[i] else 0;
+        result |= a_byte ^ b_byte;
     }
     return result == 0;
 }
@@ -371,3 +403,5 @@ test "secureCompare" {
     try testing.expect(secureCompare(&a, &b));
     try testing.expect(!secureCompare(&a, &c));
 }
+
+================

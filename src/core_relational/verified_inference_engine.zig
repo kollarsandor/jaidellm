@@ -7,6 +7,11 @@ const crypto = std.crypto;
 const Blake3 = crypto.hash.Blake3;
 const fs = std.fs;
 
+pub const StoredCommitment = struct {
+    input_commitment: [32]u8,
+    output_commitment: [32]u8,
+};
+
 pub const VerifiedInferenceEngine = struct {
     allocator: Allocator,
     commitment_scheme: *zk.CommitmentScheme,
@@ -24,6 +29,8 @@ pub const VerifiedInferenceEngine = struct {
     layer_weights_t: ?[][][]f32,
     num_layers: usize,
     embedding_dim: usize,
+    weight_seed: u64,
+    stored_commitments: ArrayList(StoredCommitment),
 
     const Self = @This();
 
@@ -34,7 +41,7 @@ pub const VerifiedInferenceEngine = struct {
             .allocator = allocator,
             .commitment_scheme = try zk.CommitmentScheme.init(allocator),
             .homomorphic_enc = try obf.HomomorphicEncryption.init(allocator),
-            .differential_privacy = try zk.DifferentialPrivacy.init(allocator, 1.0, 1e-5, 1.0),
+            .differential_privacy = try zk.DifferentialPrivacy.init(allocator, 1.0, 1e-5, 0.001),
             .dataset_fingerprint = try obf.DatasetFingerprint.init(allocator),
             .proof_of_correctness = try obf.ProofOfCorrectness.init(allocator),
             .inference_proofs = ArrayList(*zk.ZKInferenceProof).init(allocator),
@@ -47,12 +54,16 @@ pub const VerifiedInferenceEngine = struct {
             .layer_weights_t = null,
             .num_layers = 8,
             .embedding_dim = 32,
+            .weight_seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))),
+            .stored_commitments = ArrayList(StoredCommitment).init(allocator),
         };
 
         var model_hasher = Blake3.init(.{});
         const model_seed = "JAIDE_VERIFIED_MODEL_V40";
         model_hasher.update(model_seed);
         model_hasher.final(&self.model_hash);
+
+        try self.initializeWeights();
 
         return self;
     }
@@ -64,7 +75,7 @@ pub const VerifiedInferenceEngine = struct {
             .allocator = allocator,
             .commitment_scheme = try zk.CommitmentScheme.init(allocator),
             .homomorphic_enc = try obf.HomomorphicEncryption.init(allocator),
-            .differential_privacy = try zk.DifferentialPrivacy.init(allocator, 1.0, 1e-5, 1.0),
+            .differential_privacy = try zk.DifferentialPrivacy.init(allocator, 1.0, 1e-5, 0.001),
             .dataset_fingerprint = try obf.DatasetFingerprint.init(allocator),
             .proof_of_correctness = try obf.ProofOfCorrectness.init(allocator),
             .inference_proofs = ArrayList(*zk.ZKInferenceProof).init(allocator),
@@ -77,6 +88,42 @@ pub const VerifiedInferenceEngine = struct {
             .layer_weights_t = null,
             .num_layers = 8,
             .embedding_dim = 32,
+            .weight_seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))),
+            .stored_commitments = ArrayList(StoredCommitment).init(allocator),
+        };
+
+        var model_hasher = Blake3.init(.{});
+        const model_seed = "JAIDE_VERIFIED_MODEL_V40";
+        model_hasher.update(model_seed);
+        model_hasher.final(&self.model_hash);
+
+        try self.initializeWeights();
+
+        return self;
+    }
+
+    pub fn initWithSeed(allocator: Allocator, seed: u64) !*Self {
+        const self = try allocator.create(Self);
+
+        self.* = Self{
+            .allocator = allocator,
+            .commitment_scheme = try zk.CommitmentScheme.init(allocator),
+            .homomorphic_enc = try obf.HomomorphicEncryption.init(allocator),
+            .differential_privacy = try zk.DifferentialPrivacy.init(allocator, 1.0, 1e-5, 0.001),
+            .dataset_fingerprint = try obf.DatasetFingerprint.init(allocator),
+            .proof_of_correctness = try obf.ProofOfCorrectness.init(allocator),
+            .inference_proofs = ArrayList(*zk.ZKInferenceProof).init(allocator),
+            .model_hash = undefined,
+            .verification_count = 0,
+            .successful_verifications = 0,
+            .zk_prover = null,
+            .use_zk_proofs = false,
+            .layer_weights_s = null,
+            .layer_weights_t = null,
+            .num_layers = 8,
+            .embedding_dim = 32,
+            .weight_seed = seed,
+            .stored_commitments = ArrayList(StoredCommitment).init(allocator),
         };
 
         var model_hasher = Blake3.init(.{});
@@ -93,6 +140,9 @@ pub const VerifiedInferenceEngine = struct {
         self.layer_weights_s = try self.allocator.alloc([][]f32, self.num_layers);
         self.layer_weights_t = try self.allocator.alloc([][]f32, self.num_layers);
 
+        var prng = std.Random.DefaultPrng.init(self.weight_seed);
+        const rand = prng.random();
+
         var layer: usize = 0;
         while (layer < self.num_layers) : (layer += 1) {
             self.layer_weights_s.?[layer] = try self.allocator.alloc([]f32, self.embedding_dim);
@@ -106,8 +156,8 @@ pub const VerifiedInferenceEngine = struct {
                 var j: usize = 0;
                 while (j < self.embedding_dim) : (j += 1) {
                     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.embedding_dim)));
-                    self.layer_weights_s.?[layer][i][j] = scale * (@as(f32, @floatFromInt((i + j + layer) % 256)) / 128.0 - 1.0);
-                    self.layer_weights_t.?[layer][i][j] = scale * (@as(f32, @floatFromInt((i * j + layer) % 256)) / 128.0 - 1.0);
+                    self.layer_weights_s.?[layer][i][j] = scale * rand.float(f32) * 2.0 - scale;
+                    self.layer_weights_t.?[layer][i][j] = scale * rand.float(f32) * 2.0 - scale;
                 }
             }
         }
@@ -199,6 +249,8 @@ pub const VerifiedInferenceEngine = struct {
 
         self.freeWeights();
 
+        self.stored_commitments.deinit();
+
         self.allocator.destroy(self);
     }
 
@@ -212,19 +264,17 @@ pub const VerifiedInferenceEngine = struct {
         var intermediate_1 = try self.allocator.alloc(f32, output_buf.len);
         defer self.allocator.free(intermediate_1);
 
-        var i: usize = 0;
-        while (i < intermediate_1.len and i < input.len) : (i += 1) {
-            intermediate_1[i] = input[i] * 1.732;
-        }
-        while (i < intermediate_1.len) : (i += 1) {
-            intermediate_1[i] = 0.0;
+        if (self.layer_weights_s != null and self.layer_weights_t != null) {
+            self.matmul(input, intermediate_1, self.layer_weights_s.?, self.layer_weights_t.?);
+        } else {
+            self.scalarMultiply(input, intermediate_1, 1.732);
         }
 
         try self.proof_of_correctness.recordStep(
             1,
             input,
             intermediate_1,
-            obf.ProofOfCorrectness.OperationType.MatrixMultiply,
+            obf.ProofOfCorrectness.OperationType.ScalarMultiply,
         );
 
         const half = intermediate_1.len / 2;
@@ -262,11 +312,16 @@ pub const VerifiedInferenceEngine = struct {
         );
 
         for (output_buf) |*val| {
-            const noisy = self.differential_privacy.addLaplaceNoise(@as(f64, val.*));
+            const noisy = self.differential_privacy.addCalibratedNoise(@as(f64, val.*));
             val.* = @floatCast(noisy);
         }
 
         const output_commitment = try self.commitOutput(output_buf);
+
+        try self.stored_commitments.append(StoredCommitment{
+            .input_commitment = input_commitment,
+            .output_commitment = output_commitment,
+        });
 
         if (self.use_zk_proofs and self.zk_prover != null and self.layer_weights_s != null and self.layer_weights_t != null) {
             const inference_proof = try zk.ZKInferenceProof.initWithProver(self.allocator);
@@ -286,8 +341,30 @@ pub const VerifiedInferenceEngine = struct {
             try self.inference_proofs.append(inference_proof);
         }
 
-        _ = input_commitment;
-        _ = output_commitment;
+        var commitment_verified = true;
+        for (self.stored_commitments.items) |sc| {
+            const in_commitment = self.commitment_scheme.commit(std.mem.sliceAsBytes(input)) catch {
+                commitment_verified = false;
+                break;
+            };
+            if (!std.mem.eql(u8, &sc.input_commitment, &in_commitment)) {
+                commitment_verified = false;
+                break;
+            }
+            const out_commitment = self.commitment_scheme.commit(std.mem.sliceAsBytes(output_buf)) catch {
+                commitment_verified = false;
+                break;
+            };
+            if (!std.mem.eql(u8, &sc.output_commitment, &out_commitment)) {
+                commitment_verified = false;
+                break;
+            }
+        }
+        if (!commitment_verified) {
+            self.verification_count += 1;
+            try self.proof_of_correctness.finalize();
+            return error.CommitmentVerificationFailed;
+        }
 
         self.verification_count += 1;
 
@@ -366,6 +443,58 @@ pub const VerifiedInferenceEngine = struct {
         }
 
         return proof_bundle;
+    }
+
+    fn scalarMultiply(self: *Self, input: []const f32, output: []f32, factor: f32) void {
+        _ = self;
+        var i: usize = 0;
+        while (i < output.len and i < input.len) : (i += 1) {
+            output[i] = input[i] * factor;
+        }
+        while (i < output.len) : (i += 1) {
+            output[i] = 0.0;
+        }
+    }
+
+    fn matmul(self: *Self, input: []const f32, output: []f32, weights_s: [][][]f32, weights_t: [][][]f32) void {
+        _ = self;
+        var buf = output;
+        var i: usize = 0;
+        while (i < buf.len and i < input.len) : (i += 1) {
+            buf[i] = input[i];
+        }
+        while (i < buf.len) : (i += 1) {
+            buf[i] = 0.0;
+        }
+        var layer: usize = 0;
+        while (layer < weights_s.len and layer < weights_t.len) : (layer += 1) {
+            const half = buf.len / 2;
+            if (half == 0) break;
+            var out_idx: usize = 0;
+            while (out_idx < half) : (out_idx += 1) {
+                var s: f32 = 0.0;
+                var in_idx: usize = 0;
+                while (in_idx < half and in_idx < weights_s[layer].len) : (in_idx += 1) {
+                    if (out_idx < weights_s[layer][in_idx].len) {
+                        s += buf[in_idx + half] * weights_s[layer][in_idx][out_idx];
+                    }
+                }
+                const clipped = if (s < -5.0) @as(f32, -5.0) else if (s > 5.0) @as(f32, 5.0) else s;
+                const scale = @exp(clipped);
+                buf[out_idx] *= scale;
+            }
+            out_idx = 0;
+            while (out_idx < half) : (out_idx += 1) {
+                var t: f32 = 0.0;
+                var in_idx: usize = 0;
+                while (in_idx < half and in_idx < weights_t[layer].len) : (in_idx += 1) {
+                    if (out_idx < weights_t[layer][in_idx].len) {
+                        t += buf[in_idx] * weights_t[layer][in_idx][out_idx];
+                    }
+                }
+                buf[out_idx + half] += t;
+            }
+        }
     }
 
     fn commitInput(self: *Self, input: []const f32) ![32]u8 {
@@ -599,7 +728,12 @@ pub const ProofAggregator = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.aggregated_proofs.items) |bundle| {
+            bundle.deinit();
+        }
         self.aggregated_proofs.deinit();
+        @memset(&self.merkle_root, 0);
+        self.proof_count = 0;
         self.allocator.destroy(self);
     }
 
@@ -687,3 +821,5 @@ pub const ProofAggregator = struct {
         return std.mem.eql(u8, &current_hash, &self.merkle_root);
     }
 };
+
+================

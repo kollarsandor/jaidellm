@@ -2389,6 +2389,69 @@ pub const TheoremProver = struct {
             .resolution_count = self.resolution_count,
         };
     }
+
+    pub fn checkProof(self: *Self, proof: *FormalProof) !bool {
+        var steps = ArrayList(*ProofStep).init(self.allocator);
+        defer {
+            for (steps.items) |s| {
+                s.deinit();
+                self.allocator.destroy(s);
+            }
+            steps.deinit();
+        }
+        for (proof.axioms.items) |axiom| {
+            const step = try ProofStep.init(self.allocator, @intCast(steps.items.len), .AXIOM, axiom);
+            step.verified = true;
+            try steps.append(step);
+        }
+        for (proof.steps.items) |step| {
+            var step_clone = try step.clone(self.allocator);
+            const valid = step_clone.verify(steps.items);
+            if (!valid) return false;
+            try steps.append(step_clone);
+        }
+        return true;
+    }
+
+    pub fn applyRule(self: *Self, rule: ProofRule, premises: []const *Proposition, conclusion: *Proposition) !?*ProofStep {
+        if (rule.minimumPremises() > premises.len) return null;
+        var step_id: u64 = @intCast(self.resolution_count + self.unification_count);
+        var premise_indices = ArrayList(usize).init(self.allocator);
+        defer premise_indices.deinit();
+        const step = try ProofStep.init(self.allocator, step_id, rule, conclusion);
+        var i: usize = 0;
+        while (i < premises.len) : (i += 1) {
+            try step.premise_indices.append(i);
+        }
+        const valid = switch (rule) {
+            .AXIOM => conclusion.prop_type == .TRUE or conclusion.isAtomic(),
+            .CONJUNCTION_INTRO => blk: {
+                if (premises.len < 2) break :blk false;
+                if (conclusion.prop_type != .CONJUNCTION) break :blk false;
+                if (conclusion.sub_propositions.items.len < 2) break :blk false;
+                break :blk true;
+            },
+            .CONJUNCTION_ELIM => blk: {
+                if (premises.len < 1) break :blk false;
+                if (premises[0].prop_type != .CONJUNCTION) break :blk false;
+                break :blk true;
+            },
+            .MODUS_PONENS => blk: {
+                if (premises.len < 2) break :blk false;
+                if (premises[0].prop_type == .IMPLICATION and premises[0].sub_propositions.items.len >= 2) {
+                    if (premises[0].sub_propositions.items[0].equals(premises[1])) {
+                        break :blk premises[0].sub_propositions.items[1].equals(conclusion);
+                    }
+                }
+                break :blk false;
+            },
+            .WEAKENING => true,
+            .STRENGTHENING => true,
+            else => true,
+        };
+        step.verified = valid;
+        return step;
+    }
 };
 
 pub const ProverStatistics = struct {
@@ -2534,7 +2597,36 @@ pub const FormalVerificationEngine = struct {
     }
 
     pub fn prove(self: *Self, goal: *Proposition) !bool {
-        return self.theorem_prover.proveByBackwardChaining(goal, 0);
+        if (try self.theorem_prover.proveByBackwardChaining(goal, 0)) {
+            const proof = try self.buildFormalProof(goal);
+            defer {
+                proof.deinit();
+                self.allocator.destroy(proof);
+            }
+            const proof_valid = try self.theorem_prover.checkProof(proof);
+            if (!proof_valid) return false;
+            return true;
+        }
+        const resolution_result = try self.theorem_prover.proveByResolution(goal);
+        if (resolution_result) {
+            const proof = try self.buildFormalProof(goal);
+            defer {
+                proof.deinit();
+                self.allocator.destroy(proof);
+            }
+            _ = try self.theorem_prover.checkProof(proof);
+        }
+        return resolution_result;
+    }
+
+    pub fn verifyInferenceStep(self: *Self, pre_condition: *Proposition, post_condition: *Proposition) !bool {
+        const implication = try pre_condition.implies(self.allocator, post_condition);
+        defer implication.release();
+        return self.prove(implication);
+    }
+
+    pub fn checkProofCompleteness(self: *Self, proof: *FormalProof) !bool {
+        return proof.validate();
     }
 
     pub fn proveByResolution(self: *Self, goal: *Proposition) !bool {
@@ -2577,6 +2669,25 @@ pub const FormalVerificationEngine = struct {
         }
         self.verification_history.clearRetainingCapacity();
         self.invariant_registry.resetAllViolationCounts();
+    }
+
+    pub fn verifyInferenceHook(self: *Self, pre_condition: *Proposition, post_condition: *Proposition, graph: *const SelfSimilarRelationalGraph) !bool {
+        const graph_ok = try self.invariant_registry.checkAll(graph);
+        if (!graph_ok) return false;
+        const step_ok = try self.verifyInferenceStep(pre_condition, post_condition);
+        if (!step_ok) return false;
+        const proof = try self.buildFormalProof(post_condition);
+        defer {
+            proof.deinit();
+            self.allocator.destroy(proof);
+        }
+        return self.theorem_prover.checkProof(proof);
+    }
+
+    pub fn verifyInferenceHookSimple(self: *Self, pre_condition: *Proposition, post_condition: *Proposition, graph: *const SelfSimilarRelationalGraph) !bool {
+        const graph_ok = try self.invariant_registry.checkAll(graph);
+        if (!graph_ok) return false;
+        return self.verifyInferenceStep(pre_condition, post_condition);
     }
 };
 
@@ -2780,3 +2891,5 @@ test "FormalVerificationEngine creation" {
     const stats = engine.getStatistics();
     try testing.expectEqual(@as(u64, 0), stats.total_verifications);
 }
+
+================

@@ -108,7 +108,7 @@ const Shape = struct {
     }
 
     pub fn equals(self: *const Shape, other: *const Shape) bool {
-        return mem.eql(usize, self.dims, other.dims);
+        return mem.eql(usize, self.dims, other.dims) and mem.eql(usize, self.strides, other.strides);
     }
 
     pub fn isContiguous(self: *const Shape) bool {
@@ -145,9 +145,9 @@ pub fn MatmulComptime(comptime M: usize, comptime K: usize, comptime N: usize) t
                     var sum_value: f32 = 0.0;
                     comptime var k: usize = 0;
                     inline while (k < K) : (k += 1) {
-                        sum_value += a.data[i * K + k] * b.data[k * N + j];
+                        sum_value += a.data[i * a.shape.strides[0] + k * a.shape.strides[1]] * b.data[k * b.shape.strides[0] + j * b.shape.strides[1]];
                     }
-                    out.data[i * N + j] = sum_value;
+                    out.data[i * out.shape.strides[0] + j * out.shape.strides[1]] = sum_value;
                 }
             }
         }
@@ -200,8 +200,8 @@ pub const Tensor = struct {
 
     pub fn release(self: *Tensor) void {
         const old = @atomicRmw(usize, self.refcount, .Sub, 1, .acq_rel);
-        self.shape.deinit(self.allocator);
         if (old == 1) {
+            self.shape.deinit(self.allocator);
             self.allocator.free(self.base_data);
             self.allocator.destroy(self.refcount);
             self.allocator.destroy(self.cow);
@@ -224,11 +224,15 @@ pub const Tensor = struct {
     }
 
     fn ensureWritable(self: *Tensor) !void {
-        if (!self.cow.* and @atomicLoad(usize, self.refcount, .acquire) == 1) return;
+        if (@atomicLoad(usize, self.refcount, .acquire) == 1) {
+            self.cow.* = false;
+            return;
+        }
         const total = self.shape.totalSize();
         const new_data = try self.allocator.alignedAlloc(f32, @as(?u29, alignment), total);
         errdefer self.allocator.free(new_data);
-        if (self.shape.isContiguous()) {
+        const contiguous = self.shape.isContiguous();
+        if (contiguous) {
             @memcpy(new_data, self.data[0..total]);
         } else {
             var iterator = TensorIterator.init(&self.shape);
@@ -263,7 +267,8 @@ pub const Tensor = struct {
         var result = try Tensor.init(allocator, self.shape.dims);
         errdefer result.deinit();
         const total = self.shape.totalSize();
-        if (self.shape.isContiguous()) {
+        const contiguous = self.shape.isContiguous();
+        if (contiguous) {
             @memcpy(result.data[0..total], self.data[0..total]);
         } else {
             var iterator = TensorIterator.init(&self.shape);
@@ -288,7 +293,8 @@ pub const Tensor = struct {
     pub fn fill(self: *Tensor, value: f32) !void {
         try self.ensureWritable();
         const total = self.shape.totalSize();
-        if (self.shape.isContiguous()) {
+        const contiguous = self.shape.isContiguous();
+        if (contiguous) {
             @memset(self.data[0..total], value);
             return;
         }
@@ -302,38 +308,57 @@ pub const Tensor = struct {
 
     fn binaryFast(self: *Tensor, other: *const Tensor, comptime op: enum { add, sub, mul, div }) !void {
         if (!self.shape.equals(&other.shape)) return Error.ShapeMismatch;
-        if (op == .div) {
-            var div_iterator = TensorIterator.init(&other.shape);
-            var div_count: usize = 0;
-            while (div_count < other.shape.totalSize()) : (div_count += 1) {
-                if (other.data[div_iterator.offset] == 0.0) return Error.DivideByZero;
-                _ = div_iterator.advance();
-            }
-        }
         try self.ensureWritable();
         const total = self.shape.totalSize();
-        if (self.shape.isContiguous() and other.shape.isContiguous()) {
-            var i: usize = 0;
-            const limit = total - total % vector_width;
-            while (i < limit) : (i += vector_width) {
-                const a: Vec8 = self.data[i..][0..vector_width].*;
-                const b: Vec8 = other.data[i..][0..vector_width].*;
-                self.data[i..][0..vector_width].* = switch (op) {
-                    .add => a + b,
-                    .sub => a - b,
-                    .mul => a * b,
-                    .div => a / b,
-                };
-            }
-            while (i < total) : (i += 1) {
-                switch (op) {
-                    .add => self.data[i] += other.data[i],
-                    .sub => self.data[i] -= other.data[i],
-                    .mul => self.data[i] *= other.data[i],
-                    .div => self.data[i] /= other.data[i],
+        const self_contiguous = self.shape.isContiguous();
+        const other_contiguous = other.shape.isContiguous();
+        if (self_contiguous and other_contiguous) {
+            if (op == .div) {
+                var i: usize = 0;
+                while (i < total) : (i += 1) {
+                    if (other.data[i] == 0.0) return Error.DivideByZero;
+                }
+                i = 0;
+                const limit = total - total % vector_width;
+                while (i < limit) : (i += vector_width) {
+                    const a: Vec8 = self.data[i..][0..vector_width].*;
+                    const b: Vec8 = other.data[i..][0..vector_width].*;
+                    self.data[i..][0..vector_width].* = a / b;
+                }
+                while (i < total) : (i += 1) {
+                    self.data[i] /= other.data[i];
+                }
+            } else {
+                var i: usize = 0;
+                const limit = total - total % vector_width;
+                while (i < limit) : (i += vector_width) {
+                    const a: Vec8 = self.data[i..][0..vector_width].*;
+                    const b: Vec8 = other.data[i..][0..vector_width].*;
+                    self.data[i..][0..vector_width].* = switch (op) {
+                        .add => a + b,
+                        .sub => a - b,
+                        .mul => a * b,
+                        .div => unreachable,
+                    };
+                }
+                while (i < total) : (i += 1) {
+                    switch (op) {
+                        .add => self.data[i] += other.data[i],
+                        .sub => self.data[i] -= other.data[i],
+                        .mul => self.data[i] *= other.data[i],
+                        .div => unreachable,
+                    }
                 }
             }
             return;
+        }
+        if (op == .div) {
+            var check_iterator = TensorIterator.init(&other.shape);
+            var ci: usize = 0;
+            while (ci < total) : (ci += 1) {
+                if (other.data[check_iterator.offset] == 0.0) return Error.DivideByZero;
+                _ = check_iterator.advance();
+            }
         }
         var self_iterator = TensorIterator.init(&self.shape);
         var other_iterator = TensorIterator.init(&other.shape);
@@ -354,7 +379,8 @@ pub const Tensor = struct {
         if (op == .div and scalar == 0.0) return Error.DivideByZero;
         try self.ensureWritable();
         const total = self.shape.totalSize();
-        if (self.shape.isContiguous()) {
+        const contiguous = self.shape.isContiguous();
+        if (contiguous) {
             const scalar_vector: Vec8 = @splat(scalar);
             var i: usize = 0;
             const limit = total - total % vector_width;
@@ -458,9 +484,10 @@ pub const Tensor = struct {
         try self.ensureWritable();
         var iterator = TensorIterator.init(&self.shape);
         const total = self.shape.totalSize();
+        const contiguous = self.shape.isContiguous();
         var i: usize = 0;
         while (i < total) : (i += 1) {
-            const offset = if (self.shape.isContiguous()) i else iterator.offset;
+            const offset = if (contiguous) i else iterator.offset;
             self.data[offset] = switch (op) {
                 .exp => @exp(self.data[offset]),
                 .log => if (self.data[offset] <= 0.0) -math.inf(f32) else @log(self.data[offset]),
@@ -470,7 +497,7 @@ pub const Tensor = struct {
                 .sqrt => if (self.data[offset] < 0.0) math.nan(f32) else @sqrt(self.data[offset]),
                 .abs => @abs(self.data[offset]),
             };
-            if (!self.shape.isContiguous()) _ = iterator.advance();
+            if (!contiguous) _ = iterator.advance();
         }
     }
 
@@ -534,11 +561,12 @@ pub const Tensor = struct {
         try self.ensureWritable();
         var iterator = TensorIterator.init(&self.shape);
         const total = self.shape.totalSize();
+        const contiguous = self.shape.isContiguous();
         var i: usize = 0;
         while (i < total) : (i += 1) {
-            const offset = if (self.shape.isContiguous()) i else iterator.offset;
+            const offset = if (contiguous) i else iterator.offset;
             self.data[offset] = math.pow(f32, self.data[offset], exponent);
-            if (!self.shape.isContiguous()) _ = iterator.advance();
+            if (!contiguous) _ = iterator.advance();
         }
     }
 
@@ -550,11 +578,12 @@ pub const Tensor = struct {
         try self.ensureWritable();
         var iterator = TensorIterator.init(&self.shape);
         const total = self.shape.totalSize();
+        const contiguous = self.shape.isContiguous();
         var i: usize = 0;
         while (i < total) : (i += 1) {
-            const offset = if (self.shape.isContiguous()) i else iterator.offset;
+            const offset = if (contiguous) i else iterator.offset;
             self.data[offset] = math.clamp(self.data[offset], min_value, max_value);
-            if (!self.shape.isContiguous()) _ = iterator.advance();
+            if (!contiguous) _ = iterator.advance();
         }
     }
 
@@ -567,8 +596,9 @@ pub const Tensor = struct {
         var new_shape = try Shape.init(self.allocator, new_dims);
         errdefer new_shape.deinit(self.allocator);
         if (new_shape.totalSize() != self.shape.totalSize()) return Error.InvalidShape;
-        self.shape.deinit(self.allocator);
+        const old_shape = self.shape;
         self.shape = new_shape;
+        old_shape.deinit(self.allocator);
     }
 
     pub fn view(self: *Tensor, new_dims: []const usize) !Tensor {
@@ -597,12 +627,18 @@ pub const Tensor = struct {
             new_strides_stack[axis] = self.shape.strides[axis];
             offset += start * self.shape.strides[axis];
         }
-        if ((offset * @sizeOf(f32)) % 32 != 0) return Error.InvalidShape;
-        var new_shape = try Shape.initWithStrides(self.allocator, new_dims_stack[0..starts.len], new_strides_stack[0..starts.len]);
-        errdefer new_shape.deinit(self.allocator);
-        self.retain();
-        const new_data = self.data[offset..];
-        return .{ .data = @alignCast(new_data), .base_data = self.base_data, .shape = new_shape, .allocator = self.allocator, .refcount = self.refcount, .cow = self.cow };
+        var result = try Tensor.init(self.allocator, new_dims_stack[0..starts.len]);
+        errdefer result.deinit();
+        var src_shape = try Shape.initWithStrides(self.allocator, new_dims_stack[0..starts.len], new_strides_stack[0..starts.len]);
+        defer src_shape.deinit(self.allocator);
+        var src_iterator = TensorIterator.init(&src_shape);
+        const total = src_shape.totalSize();
+        var i: usize = 0;
+        while (i < total) : (i += 1) {
+            result.data[i] = self.data[offset + src_iterator.offset];
+            _ = src_iterator.advance();
+        }
+        return result;
     }
 
     pub fn transpose(self: *Tensor, axes: []const usize) !Tensor {
@@ -699,10 +735,8 @@ pub const Tensor = struct {
         const total = tensor.shape.totalSize();
         var i: usize = 0;
         while (i < total) : (i += 1) {
-            var u = prng.float();
-            var v = prng.float();
-            while (u <= 0.0) u = prng.float();
-            while (v == 0.0) v = prng.float();
+            var u = 1.0 - prng.float();
+            var v = 1.0 - prng.float();
             tensor.data[i] = mean_value + stddev_value * (@sqrt(-2.0 * @log(u)) * @cos(2.0 * math.pi * v));
         }
         return tensor;
@@ -756,7 +790,21 @@ pub const Tensor = struct {
     }
 
     pub fn max(self: *const Tensor, allocator: Allocator, axis: usize) !Tensor {
-        var result = try self.sum(allocator, axis);
+        if (axis >= self.shape.dims.len) return Error.InvalidAxis;
+        var dims_stack: [8]usize = undefined;
+        const result_rank = if (self.shape.dims.len == 1) 1 else self.shape.dims.len - 1;
+        if (self.shape.dims.len == 1) {
+            dims_stack[0] = 1;
+        } else {
+            var j: usize = 0;
+            for (self.shape.dims, 0..) |dim, i| {
+                if (i != axis) {
+                    dims_stack[j] = dim;
+                    j += 1;
+                }
+            }
+        }
+        var result = try Tensor.init(allocator, dims_stack[0..result_rank]);
         try result.fill(-math.inf(f32));
         var iterator = TensorIterator.init(&self.shape);
         var count: usize = 0;
@@ -776,7 +824,21 @@ pub const Tensor = struct {
     }
 
     pub fn min(self: *const Tensor, allocator: Allocator, axis: usize) !Tensor {
-        var result = try self.sum(allocator, axis);
+        if (axis >= self.shape.dims.len) return Error.InvalidAxis;
+        var dims_stack: [8]usize = undefined;
+        const result_rank = if (self.shape.dims.len == 1) 1 else self.shape.dims.len - 1;
+        if (self.shape.dims.len == 1) {
+            dims_stack[0] = 1;
+        } else {
+            var j: usize = 0;
+            for (self.shape.dims, 0..) |dim, i| {
+                if (i != axis) {
+                    dims_stack[j] = dim;
+                    j += 1;
+                }
+            }
+        }
+        var result = try Tensor.init(allocator, dims_stack[0..result_rank]);
         try result.fill(math.inf(f32));
         var iterator = TensorIterator.init(&self.shape);
         var count: usize = 0;
@@ -795,7 +857,7 @@ pub const Tensor = struct {
         return result;
     }
 
-    pub fn variance(self: *const Tensor, allocator: Allocator, axis: usize) !Tensor {
+    pub fn variancePopulation(self: *const Tensor, allocator: Allocator, axis: usize) !Tensor {
         var mean_tensor = try self.mean(allocator, axis);
         defer mean_tensor.deinit();
         var result = try Tensor.init(allocator, mean_tensor.shape.dims);
@@ -818,20 +880,53 @@ pub const Tensor = struct {
         return result;
     }
 
+    pub fn varianceSample(self: *const Tensor, allocator: Allocator, axis: usize) !Tensor {
+        var mean_tensor = try self.mean(allocator, axis);
+        defer mean_tensor.deinit();
+        var result = try Tensor.init(allocator, mean_tensor.shape.dims);
+        var iterator = TensorIterator.init(&self.shape);
+        var count: usize = 0;
+        while (count < self.shape.totalSize()) : (count += 1) {
+            var result_offset: usize = 0;
+            var result_axis: usize = 0;
+            for (0..self.shape.dims.len) |input_axis| {
+                if (input_axis != axis) {
+                    result_offset += iterator.indices[input_axis] * result.shape.strides[result_axis];
+                    result_axis += 1;
+                }
+            }
+            const difference = self.data[iterator.offset] - mean_tensor.data[result_offset];
+            result.data[result_offset] += difference * difference;
+            _ = iterator.advance();
+        }
+        const n = self.shape.dims[axis];
+        if (n > 1) {
+            try result.divScalar(@floatFromInt(n - 1));
+        }
+        return result;
+    }
+
     pub fn stddev(self: *const Tensor, allocator: Allocator, axis: usize) !Tensor {
-        var result = try self.variance(allocator, axis);
+        var result = try self.variancePopulation(allocator, axis);
+        try result.sqrt();
+        return result;
+    }
+
+    pub fn stddevSample(self: *const Tensor, allocator: Allocator, axis: usize) !Tensor {
+        var result = try self.varianceSample(allocator, axis);
         try result.sqrt();
         return result;
     }
 
     pub fn normL2(self: *const Tensor) !f32 {
         var result: f32 = 0.0;
+        const contiguous = self.shape.isContiguous();
         var iterator = TensorIterator.init(&self.shape);
         var count: usize = 0;
         while (count < self.shape.totalSize()) : (count += 1) {
-            const value = if (self.shape.isContiguous()) self.data[count] else self.data[iterator.offset];
+            const value = if (contiguous) self.data[count] else self.data[iterator.offset];
             result += value * value;
-            if (!self.shape.isContiguous()) _ = iterator.advance();
+            if (!contiguous) _ = iterator.advance();
         }
         return @sqrt(result);
     }
@@ -839,12 +934,13 @@ pub const Tensor = struct {
     pub fn norm(self: *const Tensor, order: f32) !f32 {
         if (order <= 0.0) return Error.InvalidShape;
         var result: f32 = 0.0;
+        const contiguous = self.shape.isContiguous();
         var iterator = TensorIterator.init(&self.shape);
         var count: usize = 0;
         while (count < self.shape.totalSize()) : (count += 1) {
-            const value = if (self.shape.isContiguous()) self.data[count] else self.data[iterator.offset];
+            const value = if (contiguous) self.data[count] else self.data[iterator.offset];
             result += math.pow(f32, @abs(value), order);
-            if (!self.shape.isContiguous()) _ = iterator.advance();
+            if (!contiguous) _ = iterator.advance();
         }
         return math.pow(f32, result, 1.0 / order);
     }
@@ -864,7 +960,7 @@ pub const Tensor = struct {
         var i: usize = 0;
         while (i < a.shape.dims[0]) : (i += 1) {
             var j: usize = 0;
-            while (j < b.shape.dims[0]) : (j += 1) result.data[i * result.shape.strides[0] + j] = a.data[i * a.shape.strides[0]] * b.data[j * b.shape.strides[0]];
+            while (j < b.shape.dims[0]) : (j += 1) result.data[i * result.shape.strides[0] + j * result.shape.strides[1]] = a.data[i * a.shape.strides[0]] * b.data[j * b.shape.strides[0]];
         }
         return result;
     }
@@ -883,7 +979,11 @@ pub const Tensor = struct {
         const k = a.shape.dims[1];
         const n = b.shape.dims[1];
         var result = try Tensor.init(allocator, &.{ m, n });
-        var b_transposed_view = try @constCast(b).transpose(&.{ 1, 0 });
+        var a_contiguous = try a.copy(allocator);
+        defer a_contiguous.deinit();
+        var b_mutable = try b.copy(allocator);
+        defer b_mutable.deinit();
+        var b_transposed_view = try b_mutable.transpose(&.{ 1, 0 });
         defer b_transposed_view.deinit();
         var b_transposed = try b_transposed_view.copy(allocator);
         defer b_transposed.deinit();
@@ -913,7 +1013,7 @@ pub const Tensor = struct {
                                 while (kk < k_dim) : (kk += 1) {
                                     sum_value += a_ptr.data[i * a_ptr.shape.strides[0] + kk * a_ptr.shape.strides[1]] * bt_ptr.data[j * bt_ptr.shape.strides[0] + kk * bt_ptr.shape.strides[1]];
                                 }
-                                out_ptr.data[i * out_ptr.shape.strides[0] + j] = sum_value;
+                                out_ptr.data[i * out_ptr.shape.strides[0] + j * out_ptr.shape.strides[1]] = sum_value;
                             }
                         }
                     }
@@ -922,7 +1022,7 @@ pub const Tensor = struct {
         };
         const thread_count = @min(@max(std.Thread.getCpuCount() catch 1, 1), @min(m, 8));
         if (thread_count <= 1) {
-            Worker.run(a, &b_transposed, &result, 0, m, k, n);
+            Worker.run(&a_contiguous, &b_transposed, &result, 0, m, k, n);
         } else {
             var threads: [8]std.Thread = undefined;
             var active: usize = 0;
@@ -930,7 +1030,7 @@ pub const Tensor = struct {
             var start: usize = 0;
             while (start < m and active < thread_count) : (start += chunk) {
                 const end = @min(start + chunk, m);
-                threads[active] = try std.Thread.spawn(.{}, Worker.run, .{ a, &b_transposed, &result, start, end, k, n });
+                threads[active] = try std.Thread.spawn(.{}, Worker.run, .{ &a_contiguous, &b_transposed, &result, start, end, k, n });
                 active += 1;
             }
             for (threads[0..active]) |thread| thread.join();
@@ -939,7 +1039,7 @@ pub const Tensor = struct {
     }
 
     pub fn isClose(self: *const Tensor, other: *const Tensor, rtol: f32, atol: f32) !bool {
-        if (!self.shape.equals(&other.shape)) return false;
+        if (!self.shape.equals(&other.shape)) return Error.ShapeMismatch;
         var a_iterator = TensorIterator.init(&self.shape);
         var b_iterator = TensorIterator.init(&other.shape);
         var i: usize = 0;
@@ -957,8 +1057,9 @@ pub const Tensor = struct {
         var result = try Tensor.init(allocator, self.shape.dims);
         var iterator = TensorIterator.init(&self.shape);
         var i: usize = 0;
+        const max_precise_int: f32 = 16777216.0;
         while (i < self.shape.totalSize()) : (i += 1) {
-            result.data[i] = @floor(self.data[iterator.offset]);
+            result.data[i] = @round(math.clamp(self.data[iterator.offset], -max_precise_int, max_precise_int));
             _ = iterator.advance();
         }
         return result;
@@ -981,9 +1082,12 @@ pub const Tensor = struct {
 
     pub fn arange(allocator: Allocator, start: f32, end: f32, step: f32) !Tensor {
         if (step == 0.0) return Error.InvalidShape;
-        const count_float = @ceil(@abs((end - start) / step));
-        if (count_float <= 0.0) return Error.InvalidShape;
+        if (step > 0 and start >= end) return Error.InvalidShape;
+        if (step < 0 and start <= end) return Error.InvalidShape;
+        const count_float = @ceil((end - start) / step);
+        if (count_float <= 0.0 or !std.math.isFinite(count_float)) return Error.InvalidShape;
         const count: usize = @intFromFloat(count_float);
+        if (count == 0) return Error.InvalidShape;
         var result = try Tensor.init(allocator, &.{count});
         var i: usize = 0;
         while (i < count) : (i += 1) result.data[i] = start + @as(f32, @floatFromInt(i)) * step;
@@ -1018,7 +1122,7 @@ pub const Tensor = struct {
                     pivot = row;
                 }
             }
-            if (max_value == 0.0) return 0.0;
+            if (max_value < 1e-30) return 0.0;
             if (pivot != i) {
                 var col: usize = 0;
                 while (col < n) : (col += 1) {
@@ -1063,7 +1167,7 @@ pub const Tensor = struct {
                     pivot = row;
                 }
             }
-            if (max_value == 0.0) return Error.SingularMatrix;
+            if (max_value < 1e-30) return Error.SingularMatrix;
             if (pivot != i) {
                 var col: usize = 0;
                 while (col < 2 * n) : (col += 1) {

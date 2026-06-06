@@ -94,7 +94,6 @@ pub const MemoryBlock = struct {
     block_id: [ChaosCoreConfig.BLOCK_ID_SIZE]u8,
     content_hash: [ChaosCoreConfig.CONTENT_HASH_SIZE]u8,
     data: []u8,
-    size: usize,
     state: MemoryBlockState,
     affinity_core: ?usize,
     access_count: usize,
@@ -113,7 +112,6 @@ pub const MemoryBlock = struct {
             .block_id = block_id,
             .content_hash = content_hash,
             .data = try allocator.dupe(u8, data),
-            .size = data.len,
             .state = .allocated,
             .affinity_core = preferred_core,
             .access_count = 1,
@@ -154,7 +152,6 @@ pub const MemoryBlock = struct {
             .block_id = self.block_id,
             .content_hash = self.content_hash,
             .data = try allocator.dupe(u8, self.data),
-            .size = self.size,
             .state = self.state,
             .affinity_core = self.affinity_core,
             .access_count = self.access_count,
@@ -179,6 +176,8 @@ pub const TaskDescriptor = struct {
     completion_status: bool,
     start_time: i128,
     end_time: i128,
+    inference_priority: f64,
+    inference_context_id: ?[ChaosCoreConfig.BLOCK_ID_SIZE]u8,
     allocator: Allocator,
 
     pub fn init(
@@ -196,6 +195,31 @@ pub const TaskDescriptor = struct {
             .completion_status = false,
             .start_time = 0,
             .end_time = 0,
+            .inference_priority = 0.0,
+            .inference_context_id = null,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn initWithInferenceContext(
+        allocator: Allocator,
+        task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8,
+        priority: i32,
+        estimated_cycles: usize,
+        inference_context_id: ?[ChaosCoreConfig.BLOCK_ID_SIZE]u8,
+    ) TaskDescriptor {
+        const abs_priority: i32 = if (priority < 0) -priority else priority;
+        return TaskDescriptor{
+            .task_id = task_id,
+            .priority = priority,
+            .data_dependencies = .{},
+            .estimated_cycles = estimated_cycles,
+            .assigned_core = null,
+            .completion_status = false,
+            .start_time = 0,
+            .end_time = 0,
+            .inference_priority = @as(f64, @floatFromInt(@max(priority, 0))) / @as(f64, @floatFromInt(@max(abs_priority, 1))),
+            .inference_context_id = inference_context_id,
             .allocator = allocator,
         };
     }
@@ -215,7 +239,15 @@ pub const TaskDescriptor = struct {
         return 0;
     }
 
-    pub fn clone(self: *const TaskDescriptor, allocator: Allocator) !TaskDescriptor {
+    pub fn setInferenceContext(self: *TaskDescriptor, context_id: ?[ChaosCoreConfig.BLOCK_ID_SIZE]u8) void {
+        self.inference_context_id = context_id;
+    }
+
+    pub fn hasInferenceContext(self: *const TaskDescriptor) bool {
+        return self.inference_context_id != null;
+    }
+
+    pub fn cloneWithAllocator(self: *const TaskDescriptor, new_allocator: Allocator) !TaskDescriptor {
         var new_task = TaskDescriptor{
             .task_id = self.task_id,
             .priority = self.priority,
@@ -225,12 +257,18 @@ pub const TaskDescriptor = struct {
             .completion_status = self.completion_status,
             .start_time = self.start_time,
             .end_time = self.end_time,
-            .allocator = allocator,
+            .inference_priority = self.inference_priority,
+            .inference_context_id = self.inference_context_id,
+            .allocator = new_allocator,
         };
         for (self.data_dependencies.items) |dep| {
-            try new_task.data_dependencies.append(allocator, dep);
+            try new_task.data_dependencies.append(new_allocator, dep);
         }
         return new_task;
+    }
+
+    pub fn clone(self: *const TaskDescriptor, allocator: Allocator) !TaskDescriptor {
+        return self.cloneWithAllocator(allocator);
     }
 };
 
@@ -613,7 +651,7 @@ pub const ContentAddressableStorage = struct {
                 .id = block.block_id,
                 .access_count = block.access_count,
                 .last_access = block.last_access_time,
-                .size = block.size,
+                .size = block.data.len,
                 .entangled = block.state == .entangled,
             });
         }
@@ -663,13 +701,13 @@ pub const ContentAddressableStorage = struct {
                 }
             }
 
-            if (self.used_capacity >= block.size) {
-                self.used_capacity -= block.size;
+            if (self.used_capacity >= block.data.len) {
+                self.used_capacity -= block.data.len;
             } else {
                 self.used_capacity = 0;
             }
 
-            const sz = block.size;
+            const sz = block.data.len;
             block.deinit();
             return sz;
         }
@@ -1383,6 +1421,101 @@ pub const ChaosCoreKernel = struct {
         bytesToHexLower(result[0..], task_id[0..]);
         return result;
     }
+
+    pub fn createInferenceTask(self: *ChaosCoreKernel, priority: i32, data_dependencies: []const [ChaosCoreConfig.BLOCK_ID_SIZE]u8, estimated_cycles: usize, inference_context_id: ?[ChaosCoreConfig.BLOCK_ID_SIZE]u8) ![ChaosCoreConfig.SHA256_DIGEST_SIZE]u8 {
+        const task_id = try self.createTask(priority, data_dependencies, estimated_cycles);
+        if (self.scheduler.getActiveTask(task_id)) |task| {
+            task.inference_priority = @as(f64, @floatFromInt(@max(priority, 0))) / @as(f64, @floatFromInt(@max(@max(priority, 1), 1)));
+            task.inference_context_id = inference_context_id;
+        }
+        return task_id;
+    }
+
+    pub fn getInferenceTaskResult(self: *ChaosCoreKernel, task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8) ?struct { completed: bool, duration: i128 } {
+        if (self.scheduler.active_tasks.get(task_id)) |task| {
+            return .{ .completed = task.completion_status, .duration = task.getDuration() };
+        }
+        return null;
+    }
+
+    pub const InferenceHooks = struct {
+        kernel: *ChaosCoreKernel,
+
+        pub fn init(kernel: *ChaosCoreKernel) InferenceHooks {
+            return InferenceHooks{ .kernel = kernel };
+        }
+
+        pub fn submitInferenceTask(self: *InferenceHooks, priority: i32, deps: []const [ChaosCoreConfig.BLOCK_ID_SIZE]u8, cycles: usize, context_id: ?[ChaosCoreConfig.BLOCK_ID_SIZE]u8) ![ChaosCoreConfig.SHA256_DIGEST_SIZE]u8 {
+            return self.kernel.createInferenceTask(priority, deps, cycles, context_id);
+        }
+
+        pub fn getTaskResult(self: *const InferenceHooks, task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8) ?struct { completed: bool, duration: i128 } {
+            return self.kernel.getInferenceTaskResult(task_id);
+        }
+
+        pub fn storeData(self: *InferenceHooks, data: []const u8, core: ?usize) ![ChaosCoreConfig.BLOCK_ID_SIZE]u8 {
+            return self.kernel.allocateMemory(data, core);
+        }
+
+        pub fn readData(self: *const InferenceHooks, block_id: [ChaosCoreConfig.BLOCK_ID_SIZE]u8) ?[]const u8 {
+            return self.kernel.readMemory(block_id);
+        }
+
+        pub fn runCycle(self: *InferenceHooks) !void {
+            return self.kernel.executeCycle();
+        }
+
+        pub fn getStats(self: *const InferenceHooks) KernelStatistics {
+            return self.kernel.getKernelStatistics();
+        }
+
+        pub fn entangleDataBlocks(self: *InferenceHooks, block_id1: [ChaosCoreConfig.BLOCK_ID_SIZE]u8, block_id2: [ChaosCoreConfig.BLOCK_ID_SIZE]u8) !bool {
+            return self.kernel.entangleData(block_id1, block_id2);
+        }
+
+        pub fn findBlockCore(self: *const InferenceHooks, block_id: [ChaosCoreConfig.BLOCK_ID_SIZE]u8) ?usize {
+            return self.kernel.getBlockLocation(block_id);
+        }
+
+        pub fn selfOrganize(self: *InferenceHooks) !void {
+            return self.kernel.selfOrganize();
+        }
+
+        pub fn lookupByContent(self: *InferenceHooks, data: []const u8) ?[ChaosCoreConfig.BLOCK_ID_SIZE]u8 {
+            return self.kernel.queryByContent(data);
+        }
+
+        pub fn finishInferenceTask(self: *InferenceHooks, task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8) !bool {
+            return self.kernel.finishTask(task_id);
+        }
+
+        pub fn allocateAndEntangle(self: *InferenceHooks, data1: []const u8, data2: []const u8, core: ?usize) !struct { block1: [ChaosCoreConfig.BLOCK_ID_SIZE]u8, block2: [ChaosCoreConfig.BLOCK_ID_SIZE]u8 } {
+            const block1 = try self.kernel.allocateMemory(data1, core);
+            const block2 = try self.kernel.allocateMemory(data2, core);
+            _ = try self.kernel.entangleData(block1, block2);
+            return .{ .block1 = block1, .block2 = block2 };
+        }
+    };
+
+    pub fn createInferenceHooks(self: *ChaosCoreKernel) InferenceHooks {
+        return InferenceHooks.init(self);
+    }
+
+    pub fn inferenceStoreAndSchedule(self: *ChaosCoreKernel, data: []const u8, priority: i32, estimated_cycles: usize, context_id: ?[ChaosCoreConfig.BLOCK_ID_SIZE]u8) !struct { block_id: [ChaosCoreConfig.BLOCK_ID_SIZE]u8, task_id: [ChaosCoreConfig.SHA256_DIGEST_SIZE]u8 } {
+        const block_id = try self.allocateMemory(data, null);
+        var deps = [_][ChaosCoreConfig.BLOCK_ID_SIZE]u8{block_id};
+        const task_id = try self.createInferenceTask(priority, deps[0..], estimated_cycles, context_id);
+        return .{ .block_id = block_id, .task_id = task_id };
+    }
+
+    pub fn inferenceReadBlock(self: *ChaosCoreKernel, block_id: [ChaosCoreConfig.BLOCK_ID_SIZE]u8) ?[]const u8 {
+        return self.readMemory(block_id);
+    }
+
+    pub fn inferenceCycleAndReport(self: *ChaosCoreKernel) !KernelStatistics {
+        try self.executeCycle();
+        return self.getKernelStatistics();
+    }
 };
 
 test "MemoryBlockState toString and fromString" {
@@ -1411,7 +1544,7 @@ test "MemoryBlock initialization and access" {
     defer block.deinit();
 
     try testing.expectEqualStrings("test data", block.data);
-    try testing.expectEqual(@as(usize, 9), block.size);
+    try testing.expectEqual(@as(usize, 9), block.data.len);
     try testing.expectEqual(MemoryBlockState.allocated, block.state);
     try testing.expectEqual(@as(?usize, 0), block.affinity_core);
     try testing.expectEqual(@as(usize, 1), block.access_count);
@@ -1769,3 +1902,5 @@ test "ChaosCoreKernel format helpers" {
     const formatted_task = ChaosCoreKernel.formatTaskId(task_id);
     try testing.expectEqual(@as(usize, 64), formatted_task.len);
 }
+
+================

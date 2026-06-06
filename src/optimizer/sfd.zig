@@ -4,13 +4,13 @@ const ArrayList = std.ArrayList;
 const core_types = @import("../core/types.zig");
 const core_tensor = @import("../core/tensor.zig");
 const core_memory = @import("../core/memory.zig");
+const PRNG = core_types.PRNG;
 
 var global_prng_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 fn nextSeed() u64 {
-    const c = global_prng_counter.fetchAdd(1, .monotonic) +% 1;
-    const now: u64 = @bitCast(std.time.microTimestamp());
-    return std.hash.Wyhash.hash(c, std.mem.asBytes(&now));
+    var prng = PRNG.init(global_prng_counter.fetchAdd(1, .monotonic));
+    return prng.uint64();
 }
 
 fn shapesEqual(a: Shape, b: Shape) bool {
@@ -102,7 +102,7 @@ pub const Precision = enum {
     fp64,
 };
 
-pub const Shape = struct {
+const Shape = struct {
     dims: []const usize,
 
     pub fn totalSize(self: Shape) usize {
@@ -488,8 +488,8 @@ pub const SFDConfig = struct {
 };
 
 pub const KFACBlock = struct {
-    A_inv: Tensor,
-    G_inv: Tensor,
+    A_diag: Tensor,
+    G_diag: Tensor,
     damping: f32,
     alpha: f32,
     update_freq: usize,
@@ -511,8 +511,8 @@ pub const KFACBlock = struct {
         errdefer G.deinit();
 
         return KFACBlock{
-            .A_inv = A,
-            .G_inv = G,
+            .A_diag = A,
+            .G_diag = G,
             .damping = damping,
             .alpha = alpha,
             .update_freq = 10,
@@ -522,13 +522,13 @@ pub const KFACBlock = struct {
     }
 
     pub fn deinit(self: *KFACBlock) void {
-        self.A_inv.deinit();
-        self.G_inv.deinit();
+        self.A_diag.deinit();
+        self.G_diag.deinit();
     }
 
     pub fn updateStatistics(self: *KFACBlock, activations: *const Tensor, gradients: *const Tensor) !void {
-        const a_dim = self.A_inv.shape.dims[0];
-        const g_dim = self.G_inv.shape.dims[0];
+        const a_dim = self.A_diag.shape.dims[0];
+        const g_dim = self.G_diag.shape.dims[0];
 
         var row: usize = 0;
         while (row < a_dim) : (row += 1) {
@@ -539,7 +539,7 @@ pub const KFACBlock = struct {
                 const a_c: f32 = if (col < activations.data.len) activations.data[col] else 0.0;
                 const diag_term: f32 = if (row == col) self.damping else 0.0;
                 const target = a_r * a_c + diag_term;
-                self.A_inv.data[idx] = self.alpha * self.A_inv.data[idx] + (1.0 - self.alpha) * target;
+                self.A_diag.data[idx] = self.alpha * self.A_diag.data[idx] + (1.0 - self.alpha) * target;
             }
         }
 
@@ -552,33 +552,31 @@ pub const KFACBlock = struct {
                 const g_c: f32 = if (col < gradients.data.len) gradients.data[col] else 0.0;
                 const diag_term: f32 = if (row == col) self.damping else 0.0;
                 const target = g_r * g_c + diag_term;
-                self.G_inv.data[idx] = self.alpha * self.G_inv.data[idx] + (1.0 - self.alpha) * target;
+                self.G_diag.data[idx] = self.alpha * self.G_diag.data[idx] + (1.0 - self.alpha) * target;
             }
         }
     }
 
     pub fn preconditionGradient(self: *const KFACBlock, grad: *Tensor) !void {
-        var A_inv_sqrt = try self.computeInverseSqrt(&self.A_inv);
+        var A_inv_sqrt = try self.computeInverseSqrt(&self.A_diag);
         defer A_inv_sqrt.deinit();
 
-        var G_inv_sqrt = try self.computeInverseSqrt(&self.G_inv);
+        var G_inv_sqrt = try self.computeInverseSqrt(&self.G_diag);
         defer G_inv_sqrt.deinit();
 
-        const g_dim = self.G_inv.shape.dims[0];
-        const a_dim = self.A_inv.shape.dims[0];
+        const g_dim = self.G_diag.shape.dims[0];
+        const a_dim = self.A_diag.shape.dims[0];
 
         if (grad.shape.dims.len == 2 and grad.shape.dims[0] == g_dim and grad.shape.dims[1] == a_dim) {
             var original = try grad.clone(self.allocator);
             defer original.deinit();
-            var i: usize = 0;
-            while (i < grad.shape.dims[0]) : (i += 1) {
-                var j: usize = 0;
-                while (j < grad.shape.dims[1]) : (j += 1) {
-                    const left_scale = G_inv_sqrt.data[i * g_dim + i];
-                    const right_scale = A_inv_sqrt.data[j * a_dim + j];
-                    grad.data[i * grad.shape.dims[1] + j] = original.data[i * grad.shape.dims[1] + j] * left_scale * right_scale;
-                }
-            }
+
+            var g_scaled = try Tensor.init(self.allocator, &[_]usize{ g_dim, a_dim });
+            errdefer g_scaled.deinit();
+            try g_scaled.matmul(&G_inv_sqrt, &original);
+
+            try grad.matmul(&g_scaled, &A_inv_sqrt);
+            g_scaled.deinit();
             return;
         }
 
@@ -594,18 +592,115 @@ pub const KFACBlock = struct {
 
     fn computeInverseSqrt(self: *const KFACBlock, M: *const Tensor) !Tensor {
         if (M.shape.dims.len != 2 or M.shape.dims[0] != M.shape.dims[1]) return error.InvalidShape;
-        var result = try Tensor.init(self.allocator, M.shape.dims);
-        errdefer result.deinit();
-        result.fill(0.0);
-
         const n = M.shape.dims[0];
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const diag = M.data[i * n + i] + self.damping;
-            result.data[i * n + i] = 1.0 / @sqrt(@max(diag, 1e-8));
+
+        var m_damped = try Tensor.init(self.allocator, M.shape.dims);
+        errdefer m_damped.deinit();
+        @memcpy(m_damped.data, M.data);
+        var d: usize = 0;
+        while (d < n) : (d += 1) {
+            m_damped.data[d * n + d] += self.damping;
         }
 
-        return result;
+        var frob_sq: f64 = 0.0;
+        for (m_damped.data) |v| {
+            frob_sq += @as(f64, v) * @as(f64, v);
+        }
+        const frob: f32 = @floatCast(@sqrt(frob_sq));
+        if (frob < 1e-12) {
+            var result = try Tensor.eye(self.allocator, M.shape.dims);
+            return result;
+        }
+
+        var y = try Tensor.eye(self.allocator, M.shape.dims);
+        errdefer y.deinit();
+        const inv_frob = 1.0 / frob;
+        y.mulScalar(inv_frob);
+
+        var z = try Tensor.eye(self.allocator, M.shape.dims);
+        errdefer z.deinit();
+        z.mulScalar(frob);
+
+        const max_iters: usize = 20;
+        var iter: usize = 0;
+        while (iter < max_iters) : (iter += 1) {
+            var yz = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer yz.deinit();
+            try yz.matmul(&y, &z);
+
+            var myz = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer myz.deinit();
+            try myz.matmul(&m_damped, &yz);
+
+            var three_i_minus_myz = try Tensor.eye(self.allocator, M.shape.dims);
+            errdefer three_i_minus_myz.deinit();
+            three_i_minus_myz.mulScalar(3.0);
+            var k: usize = 0;
+            while (k < n * n) : (k += 1) {
+                three_i_minus_myz.data[k] -= myz.data[k];
+            }
+            three_i_minus_myz.mulScalar(0.5);
+
+            var y_new = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer y_new.deinit();
+            try y_new.matmul(&three_i_minus_myz, &y);
+            y.deinit();
+            y = y_new;
+
+            var zy = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer zy.deinit();
+            try zy.matmul(&z, &y);
+
+            var zy_m = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer zy_m.deinit();
+            try zy_m.matmul(&zy, &m_damped);
+
+            var three_i_minus_zym = try Tensor.eye(self.allocator, M.shape.dims);
+            errdefer three_i_minus_zym.deinit();
+            three_i_minus_zym.mulScalar(3.0);
+            k = 0;
+            while (k < n * n) : (k += 1) {
+                three_i_minus_zym.data[k] -= zy_m.data[k];
+            }
+            three_i_minus_zym.mulScalar(0.5);
+
+            var z_new = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer z_new.deinit();
+            try z_new.matmul(&z, &three_i_minus_zym);
+            z.deinit();
+            z = z_new;
+
+            myz.deinit();
+            yz.deinit();
+            zy.deinit();
+            zy_m.deinit();
+            three_i_minus_myz.deinit();
+            three_i_minus_zym.deinit();
+
+            var diff = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer diff.deinit();
+            @memcpy(diff.data, y.data);
+            var yy = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer yy.deinit();
+            try yy.matmul(&y, &y);
+            var yym = try Tensor.init(self.allocator, M.shape.dims);
+            errdefer yym.deinit();
+            try yym.matmul(&yy, &m_damped);
+            var ii: usize = 0;
+            var delta_sq: f64 = 0.0;
+            while (ii < n * n) : (ii += 1) {
+                diff.data[ii] -= yym.data[ii];
+                delta_sq += @as(f64, diff.data[ii]) * @as(f64, diff.data[ii]);
+            }
+            diff.deinit();
+            yy.deinit();
+            yym.deinit();
+            if (@sqrt(@as(f32, @floatCast(delta_sq))) < 1e-4) break;
+        }
+
+        m_damped.deinit();
+        z.deinit();
+        return y;
     }
 };
 
@@ -695,33 +790,14 @@ pub const GradientFlowController = struct {
 
         if (self.use_normalized_gradient_flow) {
             for (gradients) |grad| {
-                const norm = grad.normL2();
-                if (norm > self.gradient_clip_norm) {
-                    const scale = self.gradient_clip_norm / (norm + 1e-8);
-                    grad.mulScalar(scale);
-                }
-            }
-
-            for (gradients) |grad| {
                 if (grad.data.len == 0) continue;
 
-                var mean: f32 = 0.0;
-                var variance: f32 = 0.0;
+                const norm = grad.normL2();
+                if (!std.math.isFinite(norm) or norm < 1e-12) continue;
 
-                for (grad.data) |g| {
-                    mean += g;
-                }
-                mean /= @as(f32, @floatFromInt(grad.data.len));
-
-                for (grad.data) |g| {
-                    const diff = g - mean;
-                    variance += diff * diff;
-                }
-                variance /= @as(f32, @floatFromInt(grad.data.len));
-
-                const std_dev = @sqrt(variance + 1e-8);
-                for (grad.data) |*g| {
-                    g.* = (g.* - mean) / std_dev;
+                if (norm > self.gradient_clip_norm) {
+                    const scale = self.gradient_clip_norm / norm;
+                    grad.mulScalar(scale);
                 }
             }
         }
@@ -787,13 +863,13 @@ pub const MARSVarianceReducer = struct {
 
         var i: usize = 0;
         while (i < vr_grad.data.len) : (i += 1) {
-            const g = &vr_grad.data[i];
             const g_current = current_grad.data[i];
             const g_ref = self.reference_gradients[param_idx].data[i];
+            const ref_grad_val = reference_grad.data[i];
 
-            g.* = g_current - reference_grad.data[i] + g_ref;
-            g.* = self.momentum * g.* + (1.0 - self.momentum) * g_current;
-            g.* *= self.scale_factor;
+            const variance_reduced = g_current - ref_grad_val + g_ref;
+            vr_grad.data[i] = self.momentum * variance_reduced + (1.0 - self.momentum) * g_current;
+            vr_grad.data[i] *= self.scale_factor;
         }
 
         return vr_grad;
@@ -934,13 +1010,29 @@ pub const ReversibleOptimizerState = struct {
                 return residual;
             }
         }
-        const residual = try Tensor.zeros(self.allocator, input.shape.dims);
+        var residual = try input.clone(self.allocator);
+        errdefer residual.deinit();
+        var i: usize = 0;
+        while (i < residual.data.len) : (i += 1) {
+            const v = residual.data[i];
+            residual.data[i] = v * v * (1.0 / (1.0 + @abs(v)));
+        }
         return residual;
     }
 
     fn computeGradient(self: *ReversibleOptimizerState, input: *const Tensor, grad_output: *const Tensor) !Tensor {
-        _ = input;
-        const grad_input = try grad_output.clone(self.allocator);
+        var grad_input = try grad_output.clone(self.allocator);
+        errdefer grad_input.deinit();
+        const input_norm = input.normL2();
+        if (std.math.isFinite(input_norm) and input_norm > 1e-8) {
+            var i: usize = 0;
+            while (i < grad_input.data.len) : (i += 1) {
+                const x_val = input.data[i];
+                const abs_x = if (x_val < 0) -x_val else x_val;
+                const scale = @min(1.0, abs_x / input_norm);
+                grad_input.data[i] *= scale;
+            }
+        }
         return grad_input;
     }
 };
@@ -982,32 +1074,34 @@ pub const LRScheduler = struct {
         if (hess_values.len == 1) return hess_values[0];
         const target = hess_values.len / 2;
         var lo: usize = 0;
-        var hi: usize = hess_values.len - 1;
+        var hi: usize = hess_values.len;
         while (lo < hi) {
-            const pivot = hess_values[(lo + hi) / 2];
-            var @"i2" = lo;
-            var j2 = hi;
-            while (@"i2" <= j2) {
-                while (hess_values[@"i2"] < pivot) @"i2" += 1;
-                while (hess_values[j2] > pivot) {
-                    if (j2 == 0) break;
-                    j2 -= 1;
-                }
-                if (@"i2" <= j2) {
-                    const tmp = hess_values[@"i2"];
-                    hess_values[@"i2"] = hess_values[j2];
-                    hess_values[j2] = tmp;
-                    @"i2" += 1;
-                    if (j2 == 0) break;
-                    j2 -= 1;
+            const pivot_val = hess_values[lo + (hi - lo) / 2];
+            var lt: usize = lo;
+            var eq: usize = lo;
+            var gt: usize = hi;
+            while (eq < gt) {
+                if (hess_values[eq] < pivot_val) {
+                    const tmp = hess_values[lt];
+                    hess_values[lt] = hess_values[eq];
+                    hess_values[eq] = tmp;
+                    lt += 1;
+                    eq += 1;
+                } else if (hess_values[eq] == pivot_val) {
+                    eq += 1;
+                } else {
+                    gt -= 1;
+                    const tmp = hess_values[eq];
+                    hess_values[eq] = hess_values[gt];
+                    hess_values[gt] = tmp;
                 }
             }
-            if (target <= j2) {
-                hi = j2;
-            } else if (target >= @"i2") {
-                lo = @"i2";
+            if (target < lt) {
+                hi = lt;
+            } else if (target < gt) {
+                return hess_values[target];
             } else {
-                break;
+                lo = gt;
             }
         }
         return hess_values[target];
@@ -2543,3 +2637,5 @@ test "MARSVarianceReducer config" {
     try std.testing.expectEqual(@as(f32, 2.0), mars.scale_factor);
     try std.testing.expectEqual(@as(usize, 50), mars.snapshot_freq);
 }
+
+================

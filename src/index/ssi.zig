@@ -140,7 +140,11 @@ pub const SSI = struct {
     }
 
     fn bucketIndex(position: u64) usize {
-        return @as(usize, @intCast(position & 63));
+        var h = position *% 0x9E3779B185EBCA87;
+        h = (h ^ (h >> 30)) *% 0xbf58476d1ce4e5b9;
+        h = (h ^ (h >> 27)) *% 0x94d049bb133111eb;
+        h = h ^ (h >> 31);
+        return @as(usize, @intCast(h & (bucket_count - 1)));
     }
 
     fn low32(value: u64) u32 {
@@ -161,6 +165,11 @@ pub const SSI = struct {
 
     fn floatToBits(value: f32) u32 {
         return @as(u32, @bitCast(value));
+    }
+
+    fn safeFloat(v: f32) f32 {
+        if (std.math.isNan(v) or std.math.isInf(v)) return 0.0;
+        return std.math.clamp(v, -3.4e38, 3.4e38);
     }
 
     fn recursiveDeinit(node: *Node, allocator: Allocator) void {
@@ -225,7 +234,6 @@ pub const SSI = struct {
         }
         return self.root.?;
     }
-
 
     fn insertIntoLeaf(self: *SSI, leaf: *Node, tokens: []const u32, position: u64, score: f32, anchor_hash: u64) !bool {
         if (!leaf.is_leaf or leaf.height != 0) {
@@ -303,7 +311,12 @@ pub const SSI = struct {
     pub fn addSequence(self: *SSI, tokens: []const u32, position: u64, is_anchor: bool) !void {
         const anchor_hash = if (is_anchor) computeAnchorHash(tokens, position) else 0;
         try self.addSequenceWithMetadata(tokens, position, 0.0, anchor_hash);
-        try self.compact();
+        if (self.size > 0) {
+            const load_factor = @as(f64, @floatFromInt(self.size)) / @as(f64, @floatFromInt(bucket_count));
+            if (load_factor > 8.0) {
+                try self.compact();
+            }
+        }
     }
 
     pub fn retrieveTopK(self: *const SSI, query_tokens: []const u32, k: usize, allocator: Allocator) ![]types.RankedSegment {
@@ -315,6 +328,13 @@ pub const SSI = struct {
                 return std.math.order(a.score, b.score);
             }
         }.lessThan).init(allocator, {});
+        errdefer {
+            while (heap.removeOrNull()) |item| {
+                var mut = item;
+                mut.deinit(allocator);
+            }
+            heap.deinit();
+        }
         defer heap.deinit();
         const query_hash = hashTokens(query_tokens);
         try self.traverse(self.root, query_hash, &heap, k, allocator);
@@ -355,6 +375,13 @@ pub const SSI = struct {
 
     fn addSegmentToHeap(seg: Segment, query_hash: u64, heap: anytype, k: usize, allocator: Allocator) !void {
         const similarity = computeSimilarity(query_hash, seg.tokenHash());
+        if (heap.count() >= k) {
+            if (heap.peek()) |top| {
+                if (similarity <= top.score) {
+                    return;
+                }
+            }
+        }
         const ranked = types.RankedSegment{
             .tokens = try allocator.dupe(u32, seg.tokens),
             .score = similarity,
@@ -366,19 +393,19 @@ pub const SSI = struct {
             try heap.add(ranked);
             return;
         }
-        if (heap.peek()) |top| {
-            if (similarity <= top.score) {
-                return;
-            }
-        }
         try heap.add(ranked);
         var removed = heap.remove();
         removed.deinit(allocator);
     }
 
     fn computeSimilarity(h1: u64, h2: u64) f32 {
-        const distance = @popCount(h1 ^ h2);
-        return 1.0 - (@as(f32, @floatFromInt(distance)) / 64.0);
+        const pc1 = @popCount(h1);
+        const pc2 = @popCount(h2);
+        if (pc1 == 0 and pc2 == 0) return 1.0;
+        if (pc1 == 0 or pc2 == 0) return 0.0;
+        const intersection = @popCount(h1 & h2);
+        const denom = @sqrt(@as(f32, @floatFromInt(pc1)) * @as(f32, @floatFromInt(pc2)));
+        return @as(f32, @floatFromInt(intersection)) / denom;
     }
 
     pub fn compact(self: *SSI) !void {
@@ -467,7 +494,7 @@ pub const SSI = struct {
         try writer.writeInt(u64, seg.position, .little);
         try writer.writeInt(u32, floatToBits(seg.score), .little);
         try writer.writeInt(u64, seg.anchor_hash, .little);
-        try writer.writeInt(usize, seg.tokens.len, .little);
+        try writer.writeInt(u64, @as(u64, seg.tokens.len), .little);
         for (seg.tokens) |tok| {
             try writer.writeInt(u32, tok, .little);
         }
@@ -477,7 +504,9 @@ pub const SSI = struct {
         const position = try reader.readInt(u64, .little);
         const score = bitsToFloat(try reader.readInt(u32, .little));
         const anchor_hash = try reader.readInt(u64, .little);
-        const token_len = try reader.readInt(usize, .little);
+        const token_len_raw = try reader.readInt(u64, .little);
+        if (token_len_raw > std.math.maxInt(usize)) return error.InvalidData;
+        const token_len: usize = @intCast(token_len_raw);
         const tokens = try allocator.alloc(u32, token_len);
         errdefer allocator.free(tokens);
         for (tokens) |*tok| {
@@ -493,7 +522,7 @@ pub const SSI = struct {
 
     fn serializeNode(node: *const Node, writer: anytype) !void {
         try writeBoolFlag(writer, node.is_leaf);
-        try writer.writeInt(usize, node.height, .little);
+        try writer.writeInt(u64, @as(u64, node.height), .little);
         try writer.writeInt(u64, node.hash, .little);
         if (node.is_leaf) {
             try writeBoolFlag(writer, node.segment != null);
@@ -506,7 +535,7 @@ pub const SSI = struct {
                 chain_len += 1;
                 chain = c.next;
             }
-            try writer.writeInt(usize, chain_len, .little);
+            try writer.writeInt(u64, @as(u64, chain_len), .little);
             chain = node.collision_chain;
             while (chain) |c| {
                 try writeSegment(writer, c.seg);
@@ -515,7 +544,7 @@ pub const SSI = struct {
             return;
         }
         const children = node.children orelse return error.InvalidNodeState;
-        try writer.writeInt(usize, children.len, .little);
+        try writer.writeInt(u64, @as(u64, children.len), .little);
         for (children) |maybe_child| {
             try writeBoolFlag(writer, maybe_child != null);
             if (maybe_child) |child| {
@@ -526,7 +555,9 @@ pub const SSI = struct {
 
     fn deserializeNode(allocator: Allocator, reader: anytype) !*Node {
         const is_leaf = try readBoolFlag(reader);
-        const height = try reader.readInt(usize, .little);
+        const height_raw = try reader.readInt(u64, .little);
+        if (height_raw > std.math.maxInt(usize)) return error.InvalidData;
+        const height: usize = @intCast(height_raw);
         const stored_hash = try reader.readInt(u64, .little);
         const node = try allocator.create(Node);
         var cleanup = true;
@@ -544,7 +575,9 @@ pub const SSI = struct {
             if (has_segment) {
                 node.segment = try readSegment(allocator, reader);
             }
-            const chain_len = try reader.readInt(usize, .little);
+            const chain_len_raw = try reader.readInt(u64, .little);
+            if (chain_len_raw > std.math.maxInt(usize)) return error.InvalidData;
+            const chain_len: usize = @intCast(chain_len_raw);
             var head: ?*CollisionNode = null;
             var tail: ?*CollisionNode = null;
             var index: usize = 0;
@@ -564,7 +597,9 @@ pub const SSI = struct {
             }
             node.collision_chain = head;
         } else {
-            const children_len = try reader.readInt(usize, .little);
+            const children_len_raw = try reader.readInt(u64, .little);
+            if (children_len_raw > std.math.maxInt(usize)) return error.InvalidData;
+            const children_len: usize = @intCast(children_len_raw);
             if (children_len != bucket_count) {
                 return error.InvalidData;
             }
@@ -584,9 +619,9 @@ pub const SSI = struct {
     }
 
     pub fn serialize(self: *SSI, writer: anytype) !void {
-        try writer.writeInt(usize, self.max_height, .little);
-        try writer.writeInt(usize, self.height, .little);
-        try writer.writeInt(usize, self.size, .little);
+        try writer.writeInt(u64, @as(u64, self.max_height), .little);
+        try writer.writeInt(u64, @as(u64, self.height), .little);
+        try writer.writeInt(u64, @as(u64, self.size), .little);
         try writeBoolFlag(writer, self.root != null);
         if (self.root) |root| {
             try serializeNode(root, writer);
@@ -595,9 +630,15 @@ pub const SSI = struct {
 
     pub fn deserialize(allocator: Allocator, reader: anytype) !SSI {
         var ssi = SSI.init(allocator);
-        ssi.max_height = try reader.readInt(usize, .little);
-        ssi.height = try reader.readInt(usize, .little);
-        ssi.size = try reader.readInt(usize, .little);
+        const max_height_raw = try reader.readInt(u64, .little);
+        const height_raw = try reader.readInt(u64, .little);
+        const size_raw = try reader.readInt(u64, .little);
+        if (max_height_raw > std.math.maxInt(usize) or height_raw > std.math.maxInt(usize) or size_raw > std.math.maxInt(usize)) {
+            return error.InvalidData;
+        }
+        ssi.max_height = @intCast(max_height_raw);
+        ssi.height = @intCast(height_raw);
+        ssi.size = @intCast(size_raw);
         const has_root = try readBoolFlag(reader);
         if (has_root) {
             ssi.root = try deserializeNode(allocator, reader);
@@ -637,15 +678,15 @@ pub const SSI = struct {
 
     fn encodeSegmentRow(tensor: *Tensor, row: usize, seg: Segment) void {
         const offset = row * tensor_width;
-        tensor.data[offset + 0] = @as(f32, @floatFromInt(seg.tokens.len));
-        tensor.data[offset + 1] = bitsToFloat(low32(seg.position));
-        tensor.data[offset + 2] = bitsToFloat(high32(seg.position));
-        tensor.data[offset + 3] = seg.score;
-        tensor.data[offset + 4] = bitsToFloat(low32(seg.anchor_hash));
-        tensor.data[offset + 5] = bitsToFloat(high32(seg.anchor_hash));
+        tensor.data[offset + 0] = safeFloat(@as(f32, @floatFromInt(seg.tokens.len)));
+        tensor.data[offset + 1] = safeFloat(bitsToFloat(low32(seg.position)));
+        tensor.data[offset + 2] = safeFloat(bitsToFloat(high32(seg.position)));
+        tensor.data[offset + 3] = safeFloat(seg.score);
+        tensor.data[offset + 4] = safeFloat(bitsToFloat(low32(seg.anchor_hash)));
+        tensor.data[offset + 5] = safeFloat(bitsToFloat(high32(seg.anchor_hash)));
         var i: usize = 0;
         while (i < seg.tokens.len and i < 128) : (i += 1) {
-            tensor.data[offset + 6 + i] = bitsToFloat(seg.tokens[i]);
+            tensor.data[offset + 6 + i] = safeFloat(std.math.clamp(bitsToFloat(seg.tokens[i]), -3.4e38, 3.4e38));
         }
     }
 
@@ -666,7 +707,7 @@ pub const SSI = struct {
                 break;
             }
             const token_len_float = tensor.data[offset + 0];
-            if (!(token_len_float >= 0)) {
+            if (!(token_len_float >= 0) or std.math.isInf(token_len_float)) {
                 continue;
             }
             const token_len_raw: usize = @intFromFloat(token_len_float);
@@ -724,8 +765,20 @@ pub const SSI = struct {
             rebuilt.deinit();
             return;
         };
-        self.deinit();
-        self.* = rebuilt;
+        if (rebuilt.countSegments() != self.size) {
+            rebuilt.deinit();
+            return;
+        }
+        var old_root = self.root;
+        var old_height = self.height;
+        var old_size = self.size;
+        self.root = rebuilt.root;
+        self.height = rebuilt.height;
+        self.size = rebuilt.size;
+        rebuilt.root = old_root;
+        rebuilt.height = old_height;
+        rebuilt.size = old_size;
+        rebuilt.deinit();
     }
 
     pub fn stats(self: *const SSI) struct { nodes: usize, leaves: usize, depth: usize } {
@@ -765,15 +818,28 @@ pub const SSI = struct {
         if (node.children != null) {
             return false;
         }
-        if (node.segment == null) {
-            return false;
+        if (node.segment == null and node.collision_chain == null) {
+            return true;
         }
         return computeLeafHash(node) == node.hash;
     }
 
-    fn validateNode(node: *const Node) bool {
+    fn validateNode(node: *const Node, position_set: anytype) !bool {
         if (node.is_leaf) {
-            return validateLeaf(node);
+            if (!validateLeaf(node)) {
+                return false;
+            }
+            if (node.segment) |seg| {
+                if (position_set.contains(seg.position)) return false;
+                try position_set.put(seg.position, {});
+            }
+            var chain = node.collision_chain;
+            while (chain) |c| {
+                if (position_set.contains(c.seg.position)) return false;
+                try position_set.put(c.seg.position, {});
+                chain = c.next;
+            }
+            return true;
         }
         if (node.height != bucket_width) {
             return false;
@@ -785,7 +851,7 @@ pub const SSI = struct {
         var acc: u64 = 0;
         for (children) |maybe_child| {
             if (maybe_child) |child| {
-                if (!validateNode(child)) {
+                if (!(try validateNode(child, position_set))) {
                     return false;
                 }
                 acc +%= child.hash;
@@ -799,10 +865,14 @@ pub const SSI = struct {
         if (self.height != bucket_width) {
             return false;
         }
-        if (self.countSegments() != self.size) {
+        var position_set = std.AutoHashMap(u64, void).init(self.allocator);
+        defer position_set.deinit();
+        const valid = validateNode(root, &position_set) catch return false;
+        if (!valid) return false;
+        const counted = position_set.count();
+        if (counted != self.size) {
             return false;
         }
-        return validateNode(root);
+        return true;
     }
 };
-

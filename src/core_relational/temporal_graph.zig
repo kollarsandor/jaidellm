@@ -75,6 +75,7 @@ pub const NodeVersion = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        self.data.deinit();
         var iter = self.properties.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -91,11 +92,13 @@ pub const NodeVersion = struct {
             .properties = StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
         };
+        errdefer new_version.deinit();
         var iter = self.properties.iterator();
         while (iter.next()) |entry| {
             const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
             errdefer allocator.free(key_copy);
             const val_copy = try allocator.dupe(u8, entry.value_ptr.*);
+            errdefer allocator.free(val_copy);
             try new_version.properties.put(key_copy, val_copy);
         }
         return new_version;
@@ -185,11 +188,13 @@ pub const EdgeVersion = struct {
             .metadata = StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
         };
+        errdefer new_version.deinit();
         var iter = self.metadata.iterator();
         while (iter.next()) |entry| {
             const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
             errdefer allocator.free(key_copy);
             const val_copy = try allocator.dupe(u8, entry.value_ptr.*);
+            errdefer allocator.free(val_copy);
             try new_version.metadata.put(key_copy, val_copy);
         }
         return new_version;
@@ -380,6 +385,13 @@ pub const TemporalNode = struct {
             .last_modified = self.last_modified,
             .allocator = allocator,
         };
+        errdefer {
+            for (new_node.versions.items) |*v| {
+                v.deinit();
+            }
+            new_node.versions.deinit();
+            allocator.free(new_node.node_id);
+        }
         for (self.versions.items) |*version| {
             const cloned_version = try version.clone(allocator);
             try new_node.versions.append(cloned_version);
@@ -581,6 +593,15 @@ pub const TemporalEdge = struct {
             .last_modified = self.last_modified,
             .allocator = allocator,
         };
+        errdefer {
+            for (new_edge.versions.items) |*v| {
+                v.deinit();
+            }
+            new_edge.versions.deinit();
+            allocator.free(new_edge.edge_id);
+            allocator.free(new_edge.source);
+            allocator.free(new_edge.target);
+        }
         for (self.versions.items) |*version| {
             const cloned_version = try version.clone(allocator);
             try new_edge.versions.append(cloned_version);
@@ -924,7 +945,10 @@ pub const TemporalGraph = struct {
         return Self{
             .nodes = std.HashMap([]const u8, TemporalNode, StringContext, std.hash_map.default_max_load_percentage).init(allocator),
             .edges = std.HashMap(EdgeKey, TemporalEdge, EdgeKeyContext, std.hash_map.default_max_load_percentage).init(allocator),
-            .current_time = @truncate(std.time.nanoTimestamp()),
+            .current_time = blk: {
+                const ts = std.time.nanoTimestamp();
+                break :blk if (ts > std.math.maxInt(Timestamp)) std.math.maxInt(Timestamp) else if (ts < std.math.minInt(Timestamp)) std.math.minInt(Timestamp) else @as(Timestamp, @intCast(ts));
+            },
             .snapshots = ArrayList(GraphSnapshot).init(allocator),
             .history = ArrayList(HistoryEntry).init(allocator),
             .next_snapshot_id = 0,
@@ -1521,11 +1545,35 @@ pub const TemporalGraph = struct {
         };
     }
 
+    pub fn recordInferenceObservation(self: *Self, node_id: []const u8, state: QuantumState, timestamp_ns: Timestamp) !usize {
+        if (self.nodes.getPtr(node_id)) |node| {
+            return node.addVersion(state, timestamp_ns);
+        }
+        try self.addNodeAtTime(node_id, state, timestamp_ns);
+        return 0;
+    }
+
+    pub fn getInferenceContext(self: *const Self, node_id: []const u8) ?QuantumState {
+        if (self.nodes.getPtr(node_id)) |node| {
+            return node.getCurrentState();
+        }
+        return null;
+    }
+
+    pub fn getInferenceEdgeWeight(self: *const Self, source_id: []const u8, target_id: []const u8) ?f64 {
+        const edge_key = EdgeKey{ .source = source_id, .target = target_id };
+        if (self.edges.getPtr(edge_key)) |edge| {
+            return edge.getCurrentWeight();
+        }
+        return null;
+    }
+
     pub fn clone(self: *const Self, allocator: Allocator) !Self {
         var new_graph = Self.init(allocator);
         new_graph.current_time = self.current_time;
         new_graph.next_snapshot_id = self.next_snapshot_id;
         new_graph.next_edge_id = self.next_edge_id;
+        errdefer new_graph.deinit();
 
         var node_iter = self.nodes.iterator();
         while (node_iter.next()) |entry| {
@@ -1559,6 +1607,28 @@ pub const TemporalGraph = struct {
         }
 
         return new_graph;
+    }
+
+    pub fn createInferenceContext(self: *Self) InferenceContext {
+        return InferenceContext.init(self);
+    }
+
+    pub fn inferenceRecordNode(self: *Self, node_id: []const u8, state: QuantumState) !usize {
+        return self.recordInferenceObservation(node_id, state, self.current_time);
+    }
+
+    pub fn inferenceQueryEdgeWeight(self: *const Self, source_id: []const u8, target_id: []const u8) ?f64 {
+        return self.getInferenceEdgeWeight(source_id, target_id);
+    }
+
+    pub fn inferenceQueryNodeState(self: *const Self, node_id: []const u8) ?QuantumState {
+        return self.getInferenceContext(node_id);
+    }
+
+    pub fn inferenceUpdateAndSnapshot(self: *Self, node_id: []const u8, new_state: QuantumState) !struct { version: usize, snapshot_id: usize } {
+        const version = try self.recordInferenceObservation(node_id, new_state, self.current_time);
+        const snapshot_id = try self.createSnapshot();
+        return .{ .version = version, .snapshot_id = snapshot_id };
     }
 };
 
@@ -1594,7 +1664,8 @@ pub fn filterByCoherence(edge: *const TemporalEdge) bool {
 }
 
 pub fn getCurrentTimestamp() Timestamp {
-    return @truncate(std.time.nanoTimestamp());
+    const ts = std.time.nanoTimestamp();
+    return if (ts > std.math.maxInt(Timestamp)) std.math.maxInt(Timestamp) else if (ts < std.math.minInt(Timestamp)) std.math.minInt(Timestamp) else @as(Timestamp, @intCast(ts));
 }
 
 pub fn timestampToMillis(timestamp_ns: Timestamp) i64 {
@@ -1612,6 +1683,69 @@ pub fn timestampToSeconds(timestamp_ns: Timestamp) f64 {
 pub fn secondsToTimestamp(seconds: f64) Timestamp {
     return @intFromFloat(seconds * 1_000_000_000.0);
 }
+
+pub const InferenceContext = struct {
+    graph: *TemporalGraph,
+
+    pub fn init(graph: *TemporalGraph) InferenceContext {
+        return InferenceContext{ .graph = graph };
+    }
+
+    pub fn getNodeState(self: *const InferenceContext, node_id: []const u8) ?QuantumState {
+        return self.graph.getInferenceContext(node_id);
+    }
+
+    pub fn applyInferenceUpdate(self: *InferenceContext, node_id: []const u8, new_state: QuantumState) !usize {
+        return self.graph.updateNode(node_id, new_state);
+    }
+
+    pub fn queryActiveEdges(self: *const InferenceContext, node_id: []const u8, allocator: Allocator) !ArrayList(*const TemporalEdge) {
+        var result = ArrayList(*const TemporalEdge).init(allocator);
+        errdefer result.deinit();
+        var iter = self.graph.edges.iterator();
+        while (iter.next()) |entry| {
+            const edge = entry.value_ptr;
+            if (edge.isValidAt(self.graph.current_time)) {
+                if (std.mem.eql(u8, edge.source, node_id) or std.mem.eql(u8, edge.target, node_id)) {
+                    try result.append(edge);
+                }
+            }
+        }
+        return result;
+    }
+
+    pub fn getNodeVersionAtTime(self: *const InferenceContext, node_id: []const u8, timestamp_ns: Timestamp) ?*const NodeVersion {
+        return self.graph.getNodeAt(node_id, timestamp_ns);
+    }
+
+    pub fn getEdgeVersionAtTime(self: *const InferenceContext, source_id: []const u8, target_id: []const u8, timestamp_ns: Timestamp) ?*const EdgeVersion {
+        return self.graph.getEdgeAt(source_id, target_id, timestamp_ns);
+    }
+
+    pub fn snapshotForInference(self: *InferenceContext) !usize {
+        return self.graph.createSnapshot();
+    }
+
+    pub fn getSnapshotForInference(self: *InferenceContext, snapshot_id: usize) ?*const GraphSnapshot {
+        return self.graph.getSnapshot(snapshot_id);
+    }
+
+    pub fn recordObservation(self: *InferenceContext, node_id: []const u8, state: QuantumState) !usize {
+        return self.graph.recordInferenceObservation(node_id, state, self.graph.current_time);
+    }
+
+    pub fn getEdgeWeightForInference(self: *const InferenceContext, source_id: []const u8, target_id: []const u8) ?f64 {
+        return self.graph.getInferenceEdgeWeight(source_id, target_id);
+    }
+
+    pub fn advanceTimeBy(self: *InferenceContext, delta_ns: Timestamp) void {
+        self.graph.advanceTime(delta_ns);
+    }
+
+    pub fn queryGraphState(self: *const InferenceContext, start_time: Timestamp, end_time: Timestamp) !TemporalQueryResult {
+        return self.graph.queryTimeRange(start_time, end_time);
+    }
+};
 
 test "NodeVersion basic operations" {
     const allocator = std.testing.allocator;
@@ -1779,3 +1913,5 @@ test "timestamp utilities" {
     const seconds = timestampToSeconds(ns);
     try std.testing.expect(seconds == 1.5);
 }
+
+================

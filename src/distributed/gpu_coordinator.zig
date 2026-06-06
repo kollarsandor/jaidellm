@@ -156,9 +156,7 @@ pub const GPUCoordinator = struct {
         }
 
         if (self.nccl_comm) |comm| {
-            if (@hasDecl(nccl, "ncclCommFinalize")) {
-                logNcclFailure(nccl.ncclCommFinalize(comm), "ncclCommFinalize");
-            }
+            logNcclFailure(nccl.ncclCommFinalize(comm), "ncclCommFinalize");
             logNcclFailure(nccl.ncclCommDestroy(comm), "ncclCommDestroy");
             self.nccl_comm = null;
         }
@@ -387,7 +385,7 @@ pub const GPUCoordinator = struct {
 
         try checkCuda(nccl.cudaStreamSynchronize(stream), "cudaStreamSynchronize", error.CudaSynchronizeFailed);
 
-        if (@hasDecl(nccl, "cudaGetLastError")) {
+        if (nccl.cudaGetLastError() != .cudaSuccess) {
             try checkCuda(nccl.cudaGetLastError(), "cudaGetLastError", error.CudaSynchronizeFailed);
         }
     }
@@ -396,7 +394,7 @@ pub const GPUCoordinator = struct {
         try self.setDevice();
         try checkCuda(nccl.cudaDeviceSynchronize(), "cudaDeviceSynchronize", error.CudaSynchronizeFailed);
 
-        if (@hasDecl(nccl, "cudaGetLastError")) {
+        if (nccl.cudaGetLastError() != .cudaSuccess) {
             try checkCuda(nccl.cudaGetLastError(), "cudaGetLastError(device)", error.CudaSynchronizeFailed);
         }
     }
@@ -420,3 +418,5 @@ pub const GPUCoordinator = struct {
         return self.rank == 0;
     }
 };
+
+================

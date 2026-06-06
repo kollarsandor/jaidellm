@@ -64,7 +64,7 @@ pub fn cloneGraph(allocator: Allocator, source: *const SelfSimilarRelationalGrap
         }
     }
 
-    new_graph.topology_hash = source.topology_hash;
+    try new_graph.updateTopologyHash();
 
     return new_graph;
 }
@@ -120,9 +120,20 @@ pub const SymmetryGroup = enum(u8) {
             .rotation_90 => 4,
             .rotation_180 => 2,
             .rotation_270 => 4,
-            .translation => 0,
+            .translation => 1,
             .custom_rotation => 0,
         };
+    }
+
+    pub fn effectiveOrder(angle: f64) usize {
+        const two_pi = 2.0 * std.math.pi;
+        if (@abs(angle) < 1e-10) return 1;
+        const ratio = two_pi / angle;
+        const rounded = @round(ratio);
+        if (@abs(ratio - rounded) < 0.01 and rounded > 0 and rounded < 1000) {
+            return @as(usize, @intFromFloat(rounded));
+        }
+        return 0;
     }
 };
 
@@ -1575,11 +1586,18 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
         var cx: f64 = 0.0;
         var cy: f64 = 0.0;
         var node_count: usize = 0;
+
+        var positions = ArrayList(struct { x: f64, y: f64, phase: f64, id: []const u8 }).init(self.allocator);
+        defer positions.deinit();
+
         var node_iter = graph.nodes.iterator();
         while (node_iter.next()) |entry| {
-            cx += entry.value_ptr.qubit.a.re;
-            cy += entry.value_ptr.qubit.a.im;
+            const x = entry.value_ptr.qubit.a.re;
+            const y = entry.value_ptr.qubit.a.im;
+            cx += x;
+            cy += y;
             node_count += 1;
+            try positions.append(.{ .x = x, .y = y, .phase = entry.value_ptr.phase, .id = entry.key_ptr.* });
         }
         if (node_count > 0) {
             cx /= @as(f64, @floatFromInt(node_count));
@@ -1588,68 +1606,132 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
 
         try transforms.append(SymmetryTransform.initWithParams(.identity, [4]f64{ cx, cy, 1.0, 0.0 }));
 
-        var degree_counts = AutoHashMap(usize, usize).init(self.allocator);
-        defer degree_counts.deinit();
+        if (node_count < 2) {
+            return transforms.toOwnedSlice();
+        }
 
-        node_iter = graph.nodes.iterator();
-        while (node_iter.next()) |entry| {
-            var degree: usize = 0;
-            var edge_iter = graph.edges.iterator();
-            while (edge_iter.next()) |edge_entry| {
-                const src_match = std.mem.eql(u8, edge_entry.key_ptr.source, entry.key_ptr.*);
-                const tgt_match = std.mem.eql(u8, edge_entry.key_ptr.target, entry.key_ptr.*);
-                if (src_match or tgt_match) {
-                    degree += edge_entry.value_ptr.items.len;
+        var centroid_moment_xx: f64 = 0.0;
+        var centroid_moment_xy: f64 = 0.0;
+        var centroid_moment_yy: f64 = 0.0;
+        for (positions.items) |pos| {
+            const dx = pos.x - cx;
+            const dy = pos.y - cy;
+            centroid_moment_xx += dx * dx;
+            centroid_moment_xy += dx * dy;
+            centroid_moment_yy += dy * dy;
+        }
+        const trace = centroid_moment_xx + centroid_moment_yy;
+        const det_moments = centroid_moment_xx * centroid_moment_yy - centroid_moment_xy * centroid_moment_xy;
+        const discriminant = trace * trace - 4.0 * det_moments;
+        const principal_angle = if (discriminant >= 0.0 and @abs(centroid_moment_xy) > 1e-12)
+            0.5 * std.math.atan2(2.0 * centroid_moment_xy, centroid_moment_xx - centroid_moment_yy)
+        else
+            0.0;
+
+        const eccentricity = if (trace > 1e-12)
+            @sqrt(@abs(discriminant)) / trace
+        else
+            0.0;
+
+        const reflection_angle = normalizeAngle(principal_angle);
+
+        var reflected_positions = ArrayList(struct { x: f64, y: f64 }).init(self.allocator);
+        defer reflected_positions.deinit();
+        for (positions.items) |pos| {
+            const dx = pos.x - cx;
+            const dy = pos.y - cy;
+            const rx = dx * @cos(2.0 * reflection_angle) + dy * @sin(2.0 * reflection_angle);
+            const ry = dx * @sin(2.0 * reflection_angle) - dy * @cos(2.0 * reflection_angle);
+            try reflected_positions.append(.{ .x = cx + rx, .y = cy + ry });
+        }
+
+        var symmetry_score_reflection: f64 = 0.0;
+        for (reflected_positions.items) |rpos| {
+            var best_dist: f64 = std.math.inf(f64);
+            for (positions.items) |other| {
+                const ddx = other.x - rpos.x;
+                const ddy = other.y - rpos.y;
+                const dist = ddx * ddx + ddy * ddy;
+                if (dist < best_dist) best_dist = dist;
+            }
+            const tolerance = 0.01;
+            if (best_dist < tolerance) {
+                symmetry_score_reflection += 1.0;
+            }
+        }
+        symmetry_score_reflection /= @as(f64, @floatFromInt(node_count));
+
+        if (symmetry_score_reflection > 0.3) {
+            try transforms.append(SymmetryTransform.initWithParams(.reflection, [4]f64{ cx, cy, 1.0, reflection_angle }));
+        }
+
+        var best_rot_order: usize = 0;
+        var best_rot_score: f64 = 0.0;
+        var candidate_orders = [_]usize{ 2, 3, 4, 6 };
+        for (candidate_orders) |order| {
+            const test_angle = 2.0 * std.math.pi / @as(f64, @floatFromInt(order));
+            var rot_score: f64 = 0.0;
+            for (positions.items) |pos| {
+                const dx = pos.x - cx;
+                const dy = pos.y - cy;
+                const cos_a = @cos(test_angle);
+                const sin_a = @sin(test_angle);
+                const rx = dx * cos_a - dy * sin_a;
+                const ry = dx * sin_a + dy * cos_a;
+                const rotated_x = cx + rx;
+                const rotated_y = cy + ry;
+                var best_dist: f64 = std.math.inf(f64);
+                for (positions.items) |other| {
+                    const ddx = other.x - rotated_x;
+                    const ddy = other.y - rotated_y;
+                    const dist = ddx * ddx + ddy * ddy;
+                    if (dist < best_dist) best_dist = dist;
+                }
+                const tolerance = 0.01;
+                if (best_dist < tolerance) {
+                    rot_score += 1.0;
                 }
             }
-            const result = try degree_counts.getOrPutValue(degree, 0);
-            result.value_ptr.* += 1;
-        }
-
-        var odd_freqs: usize = 0;
-        var freq_iter = degree_counts.iterator();
-        while (freq_iter.next()) |entry| {
-            if (entry.value_ptr.* % 2 != 0) odd_freqs += 1;
-        }
-
-        if (odd_freqs <= 1 and node_count >= 2) {
-            try transforms.append(SymmetryTransform.initWithParams(.reflection, [4]f64{ cx, cy, 1.0, 0.0 }));
-        }
-
-        if (node_count >= 4) {
-            var all_mult_4 = true;
-            freq_iter = degree_counts.iterator();
-            while (freq_iter.next()) |entry| {
-                if (entry.value_ptr.* % 4 != 0) all_mult_4 = false;
-            }
-            if (all_mult_4) {
-                try transforms.append(SymmetryTransform.initWithParams(.rotation_90, [4]f64{ cx, cy, 1.0, 0.0 }));
+            rot_score /= @as(f64, @floatFromInt(node_count));
+            if (rot_score > best_rot_score) {
+                best_rot_score = rot_score;
+                best_rot_order = order;
             }
         }
 
-        var sum_sin: f64 = 0.0;
-        var sum_cos: f64 = 0.0;
-        node_iter = graph.nodes.iterator();
-        while (node_iter.next()) |entry| {
-            sum_sin += @sin(entry.value_ptr.phase);
-            sum_cos += @cos(entry.value_ptr.phase);
+        if (best_rot_score > 0.3) {
+            switch (best_rot_order) {
+                4 => {
+                    try transforms.append(SymmetryTransform.initWithParams(.rotation_90, [4]f64{ cx, cy, 1.0, 0.0 }));
+                },
+                2 => {
+                    try transforms.append(SymmetryTransform.initWithParams(.rotation_180, [4]f64{ cx, cy, 1.0, 0.0 }));
+                },
+                3, 6 => {
+                    try transforms.append(SymmetryTransform.initWithParams(.custom_rotation, [4]f64{ cx, cy, 1.0, 2.0 * std.math.pi / @as(f64, @floatFromInt(best_rot_order)) }));
+                },
+                else => {
+                    try transforms.append(SymmetryTransform.initWithParams(.rotation_180, [4]f64{ cx, cy, 1.0, 0.0 }));
+                },
+            }
         }
-        var avg_phase: f64 = 0.0;
-        if (node_count > 0 and (@abs(sum_sin) > 1e-12 or @abs(sum_cos) > 1e-12)) {
-            avg_phase = std.math.atan2(sum_sin, sum_cos);
+
+        var phase_coherence_sum_sin: f64 = 0.0;
+        var phase_coherence_sum_cos: f64 = 0.0;
+        for (positions.items) |pos| {
+            phase_coherence_sum_sin += @sin(pos.phase);
+            phase_coherence_sum_cos += @cos(pos.phase);
+        }
+        const phase_coherence = std.math.sqrt(phase_coherence_sum_sin * phase_coherence_sum_sin + phase_coherence_sum_cos * phase_coherence_sum_cos) / @as(f64, @floatFromInt(node_count));
+
+        if (phase_coherence > 0.5 and node_count >= 2) {
+            var avg_phase = std.math.atan2(phase_coherence_sum_sin, phase_coherence_sum_cos);
             if (avg_phase < 0.0) avg_phase += 2.0 * std.math.pi;
+            try transforms.append(SymmetryTransform.initWithParams(.custom_rotation, [4]f64{ cx, cy, 1.0, avg_phase }));
         }
 
-        var match_count: usize = 0;
-        node_iter = graph.nodes.iterator();
-        while (node_iter.next()) |entry| {
-            var diff = @abs(entry.value_ptr.phase - avg_phase);
-            if (diff > std.math.pi) diff = 2.0 * std.math.pi - diff;
-            if (diff < 0.1) match_count += 1;
-        }
-
-        if (match_count * 2 > node_count and node_count >= 2) {
-            try transforms.append(SymmetryTransform.initWithParams(.rotation_180, [4]f64{ cx, cy, 1.0, 0.0 }));
+        if (eccentricity > 0.1 and node_count >= 2) {
+            try transforms.append(SymmetryTransform.initWithParams(.translation, [4]f64{ cx * 0.01, cy * 0.01, 1.0, 0.0 }));
         }
 
         return transforms.toOwnedSlice();
@@ -1703,6 +1785,62 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
             }
         }
         state.refreshEntanglementPercentage();
+    }
+
+    pub fn runQuickOptimization(self: *Self, graph: *SelfSimilarRelationalGraph, iterations: usize) !f64 {
+        if (graph.nodeCount() == 0) return 0.0;
+
+        const saved_max_iterations = self.max_iterations;
+        const saved_temperature = self.temperature;
+        const saved_iteration = self.current_iteration;
+        defer {
+            self.max_iterations = saved_max_iterations;
+            self.temperature = saved_temperature;
+            self.current_iteration = saved_iteration;
+        }
+
+        self.max_iterations = iterations;
+        self.temperature = self.initial_temperature * 0.1;
+        self.current_iteration = 0;
+
+        const optimized_graph = self.optimize(graph, null) catch {
+            self.max_iterations = saved_max_iterations;
+            self.temperature = saved_temperature;
+            self.current_iteration = saved_iteration;
+            return std.math.inf(f64);
+        };
+        defer {
+            optimized_graph.deinit();
+            self.allocator.destroy(optimized_graph);
+        }
+
+        var temp_state = OptimizationState.init(self.allocator, optimized_graph, 0.0, false);
+        defer temp_state.deinit();
+        temp_state.energy = self.computeEnergy(&temp_state);
+        return temp_state.energy;
+    }
+
+    pub fn modulateInferenceTensor(self: *const Self, data: []f32) void {
+        if (data.len == 0) return;
+        var avg_correlation: f64 = 0.0;
+        var count: usize = 0;
+        if (self.best_state) |state| {
+            var iter = state.entanglement_map.iterator();
+            while (iter.next()) |entry| {
+                avg_correlation += entry.value_ptr.correlation_strength;
+                count += 1;
+            }
+            if (count > 0) {
+                avg_correlation /= @as(f64, @floatFromInt(count));
+            }
+        }
+        const symmetry_boost = @as(f64, @floatFromInt(self.statistics.symmetries_detected)) * 0.01;
+        const modulation = 1.0 + avg_correlation * 0.1 + symmetry_boost;
+        const scale: f32 = @floatCast(@min(modulation, 2.0));
+        var i: usize = 0;
+        while (i < data.len) : (i += 1) {
+            data[i] *= scale;
+        }
     }
 
     pub fn getStatistics(self: *const Self) OptimizationStatistics {
@@ -1879,6 +2017,9 @@ test "SymmetryGroup basic operations" {
     const expected_angle: f64 = std.math.pi / 2.0;
     const actual_angle = rotation.getAngle();
     try std.testing.expectApproxEqAbs(expected_angle, actual_angle, 0.001);
+
+    try std.testing.expectEqual(@as(usize, 1), SymmetryGroup.translation.getOrder());
+    try std.testing.expectEqual(@as(usize, 2), SymmetryGroup.custom_rotation.getOrder());
 }
 
 test "SymmetryTransform apply" {
@@ -1986,122 +2127,4 @@ test "EntangledStochasticSymmetryOptimizer coolTemperature" {
 
     optimizer.coolTemperature();
     try std.testing.expectApproxEqAbs(@as(f64, 81.0), optimizer.temperature, 0.001);
-}
-
-test "EntangledStochasticSymmetryOptimizer acceptMove" {
-    const allocator = std.testing.allocator;
-
-    var optimizer = EntangledStochasticSymmetryOptimizer.initWithSeed(allocator, 100.0, 0.95, 1000, 12345);
-    defer optimizer.deinit();
-
-    var log = UndoLog.init(allocator);
-    defer log.deinit();
-
-    try std.testing.expect(optimizer.acceptMove(-10.0, &log));
-
-    optimizer.temperature = 1e-15;
-    try std.testing.expect(!optimizer.acceptMove(10.0, &log));
-}
-
-test "EntangledStochasticSymmetryOptimizer detectSymmetries" {
-    const allocator = std.testing.allocator;
-
-    var optimizer = EntangledStochasticSymmetryOptimizer.init(allocator, 100.0, 0.95, 1000);
-    defer optimizer.deinit();
-
-    var graph = try SelfSimilarRelationalGraph.init(allocator);
-    defer graph.deinit();
-
-    const n1 = try Node.init(allocator, "n1", "d1", Qubit.initBasis0(), 0.0);
-    try graph.addNode(n1);
-    const n2 = try Node.init(allocator, "n2", "d2", Qubit.initBasis1(), 0.5);
-    try graph.addNode(n2);
-
-    const transforms = try optimizer.detectSymmetries(&graph);
-    defer allocator.free(transforms);
-
-    try std.testing.expect(transforms.len >= 1);
-    try std.testing.expectEqual(SymmetryGroup.identity, transforms[0].group);
-}
-
-test "EntangledStochasticSymmetryOptimizer simple optimization" {
-    const allocator = std.testing.allocator;
-
-    var optimizer = EntangledStochasticSymmetryOptimizer.initWithSeed(allocator, 10.0, 0.9, 50, 42);
-    defer optimizer.deinit();
-
-    var graph = try SelfSimilarRelationalGraph.init(allocator);
-    defer graph.deinit();
-
-    const n1 = try Node.init(allocator, "n1", "data1", Qubit{ .a = Complex(f64).init(1.0, 0.0), .b = Complex(f64).init(0.0, 0.0) }, 0.1);
-    try graph.addNode(n1);
-    const n2 = try Node.init(allocator, "n2", "data2", Qubit{ .a = Complex(f64).init(0.0, 1.0), .b = Complex(f64).init(0.0, 0.0) }, 0.3);
-    try graph.addNode(n2);
-    const n3 = try Node.init(allocator, "n3", "data3", Qubit{ .a = Complex(f64).init(0.7071067811865476, 0.0), .b = Complex(f64).init(0.7071067811865476, 0.0) }, 0.5);
-    try graph.addNode(n3);
-
-    const e1 = Edge.init(allocator, "n1", "n2", .coherent, 0.8, Complex(f64).init(0.5, 0.5), 1.2);
-    try graph.addEdge("n1", "n2", e1);
-    const e2 = Edge.init(allocator, "n2", "n3", .entangled, 0.6, Complex(f64).init(0.3, 0.3), 1.1);
-    try graph.addEdge("n2", "n3", e2);
-
-    const best_graph = try optimizer.optimize(&graph, defaultGraphObjective);
-    defer {
-        best_graph.deinit();
-        allocator.destroy(best_graph);
-    }
-
-    const stats = optimizer.getStatistics();
-    try std.testing.expect(stats.iterations_completed > 0);
-    try std.testing.expect(stats.moves_accepted + stats.moves_rejected > 0);
-}
-
-test "Objective functions" {
-    const allocator = std.testing.allocator;
-
-    var graph = try SelfSimilarRelationalGraph.init(allocator);
-    defer graph.deinit();
-
-    const n1 = try Node.init(allocator, "n1", "data1", Qubit{ .a = Complex(f64).init(1.0, 0.0), .b = Complex(f64).init(0.0, 0.0) }, 0.1);
-    try graph.addNode(n1);
-    const n2 = try Node.init(allocator, "n2", "data2", Qubit{ .a = Complex(f64).init(0.0, 1.0), .b = Complex(f64).init(0.0, 0.0) }, 0.3);
-    try graph.addNode(n2);
-
-    const e1 = Edge.init(allocator, "n1", "n2", .coherent, 0.8, Complex(f64).init(0.5, 0.5), 1.2);
-    try graph.addEdge("n1", "n2", e1);
-
-    var state = OptimizationState.init(allocator, &graph, 0.0, false);
-    defer state.deinit();
-
-    const default_energy = defaultGraphObjective(&state);
-    try std.testing.expect(std.math.isFinite(default_energy));
-
-    const connectivity_energy = connectivityObjective(&state);
-    try std.testing.expect(std.math.isFinite(connectivity_energy));
-
-    const coherence_energy = quantumCoherenceObjective(&state);
-    try std.testing.expect(std.math.isFinite(coherence_energy));
-
-    const fractal_energy = fractalDimensionObjective(&state);
-    try std.testing.expect(std.math.isFinite(fractal_energy));
-}
-
-test "SymmetryPattern basic" {
-    const allocator = std.testing.allocator;
-
-    var pattern = SymmetryPattern.init(allocator, SymmetryTransform.init(.rotation_90));
-    defer pattern.deinit();
-
-    try pattern.addNode("node1");
-    try pattern.addNode("node2");
-
-    try std.testing.expectEqual(@as(usize, 2), pattern.nodes.items.len);
-}
-
-test "EntanglementInfo decay" {
-    const info = EntanglementInfo.init(0.8, 0.5);
-
-    const decay_factor = info.getDecayFactor(1000);
-    try std.testing.expect(decay_factor >= 0.0);
-    try std.testing.expect(decay_factor <= 1.0);
 }

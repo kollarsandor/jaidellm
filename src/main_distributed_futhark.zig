@@ -189,6 +189,16 @@ pub fn main() !void {
         std.debug.print("============================================================\n\n", .{});
     }
 
+    for (samples) |sample_text| {
+        trainer.buildKnowledgeGraph(sample_text) catch |err| {
+            std.debug.print("[Rank {d}] CREV processTextStream warning: {} (continuing)\n", .{ rank, err });
+        };
+    }
+
+    if (coordinator.isRoot()) {
+        std.debug.print("[Rank 0] Knowledge graph populated.\n", .{});
+    }
+
     var epoch: usize = 0;
     while (epoch < num_epochs) : (epoch += 1) {
         const start_time = std.time.milliTimestamp();
@@ -243,3 +253,5 @@ pub fn main() !void {
         std.debug.print("============================================================\n", .{});
     }
 }
+
+================

@@ -51,70 +51,31 @@ pub const ModalGPUClient = struct {
         const authorization_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_token});
         defer self.allocator.free(authorization_value);
 
-        if (@hasDecl(http.Client, "open")) {
-            const open_params_len = @typeInfo(@TypeOf(http.Client.open)).Fn.params.len;
-            if (open_params_len == 5) {
-                var headers = http.Headers{ .allocator = self.allocator };
-                defer headers.deinit();
+        var server_header_buffer = try self.allocator.alloc(u8, 16 * 1024);
+        defer self.allocator.free(server_header_buffer);
 
-                try headers.append("Authorization", authorization_value);
-                if (body != null) {
-                    try headers.append("Content-Type", "application/json");
-                }
+        var req = try self.http_client.open(method, uri, .{
+            .server_header_buffer = server_header_buffer,
+        });
+        errdefer req.deinit();
 
-                var req = try self.http_client.open(method, uri, headers, .{});
-                defer req.deinit();
-
-                return try self.sendAndReadResponse(&req, body);
-            }
-
-            if (open_params_len == 4) {
-                const server_header_buffer = try self.allocator.alloc(u8, 16 * 1024);
-                defer self.allocator.free(server_header_buffer);
-
-                var req = try self.http_client.open(method, uri, .{
-                    .server_header_buffer = server_header_buffer,
-                });
-                defer req.deinit();
-
-                try req.headers.append("Authorization", authorization_value);
-                if (body != null) {
-                    try req.headers.append("Content-Type", "application/json");
-                }
-
-                return try self.sendAndReadResponse(&req, body);
-            }
-
-            @compileError("Unsupported std.http.Client.open signature");
+        try req.headers.append("Authorization", authorization_value);
+        if (body != null) {
+            try req.headers.append("Content-Type", "application/json");
         }
 
-        if (@hasDecl(http.Client, "request")) {
-            var headers = http.Headers{ .allocator = self.allocator };
-            defer headers.deinit();
-
-            try headers.append("Authorization", authorization_value);
-            if (body != null) {
-                try headers.append("Content-Type", "application/json");
-            }
-
-            var req = try self.http_client.request(method, uri, headers, .{});
-            defer req.deinit();
-
-            return try self.sendAndReadResponse(&req, body);
-        }
-
-        @compileError("Unsupported std.http.Client API");
+        return try self.sendAndReadResponse(&req, body);
     }
 
     fn sendAndReadResponse(self: *ModalGPUClient, req: *http.Client.Request, body: ?[]const u8) ![]const u8 {
         if (body) |request_body| {
             req.transfer_encoding = .{ .content_length = request_body.len };
-            try sendCompat(req);
+            try req.send();
             try req.writer().writeAll(request_body);
             try req.finish();
             try req.wait();
         } else {
-            try sendCompat(req);
+            try req.send();
             try req.finish();
             try req.wait();
         }
@@ -124,15 +85,8 @@ pub const ModalGPUClient = struct {
     }
 
     fn sendCompat(req: *http.Client.Request) !void {
-        const send_params_len = @typeInfo(@TypeOf(http.Client.Request.send)).Fn.params.len;
-        if (send_params_len == 1) {
-            try req.send();
-            return;
-        }
-        if (send_params_len == 2) {
-            try req.send(.{});
-            return;
-        }
-        @compileError("Unsupported std.http.Client.Request.send signature");
+        _ = req;
     }
 };
+
+================

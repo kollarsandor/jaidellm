@@ -845,3 +845,11 @@ template InferenceTraceWithBatch(num_layers, dim, batch_size, precision_bits) {
 }
 
 component main {public [tokens, expected_output, input_commitment, output_commitment]} = FullInferenceProof(8, 32, 64);
+
+
+
+
+
+================================================================
+End of Codebase
+================================================================

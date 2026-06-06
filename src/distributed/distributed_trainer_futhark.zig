@@ -7,12 +7,17 @@ const FutharkArray2DF16 = accel.FutharkArray2DF16;
 const FutharkArray1DF16 = accel.FutharkArray1DF16;
 const FutharkArray3DF16 = accel.FutharkArray3DF16;
 const PinnedMemory = accel.PinnedMemory;
+const LearnedEmbedding = @import("../core/learned_embedding.zig").LearnedEmbedding;
+const EmbeddingAccelerator = accel.EmbeddingAccelerator;
+const futhark = @import("../hw/accel/futhark_bindings.zig");
+const core_relational = @import("../core_relational/mod.zig");
+const CREVPipeline = core_relational.CREVPipeline;
+const ChaosCoreKernel = core_relational.ChaosCoreKernel;
 
 pub const TrainerConfig = struct {
     learning_rate: f32 = 0.001,
     momentum: f32 = 0.0,
     max_line_size: usize = 10 * 1024 * 1024,
-    // checkpoint v5: per-layer serialization (one block of {W_s, W_t, sb, tb, vs, vt, vsb, vtb} per layer).
     checkpoint_version: u32 = 5,
 };
 
@@ -29,6 +34,10 @@ pub const DistributedTrainerFuthark = struct {
     learning_rate: f32,
     momentum: f32,
     config: TrainerConfig,
+    embedding: ?LearnedEmbedding,
+    embedding_accel: ?EmbeddingAccelerator,
+    crev_pipeline: ?CREVPipeline,
+    crev_kernel: ?*ChaosCoreKernel,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -91,6 +100,21 @@ pub const DistributedTrainerFuthark = struct {
         var accelerator = try RSFAccelerator.initMultiLayer(actual_model_dim, num_layers, allocator);
         errdefer accelerator.deinit();
 
+        var embedding = try LearnedEmbedding.init(allocator, 50000, actual_model_dim, 42);
+        errdefer embedding.deinit();
+
+        const embedding_accel: ?EmbeddingAccelerator = null;
+
+        var crev_kernel = try allocator.create(ChaosCoreKernel);
+        crev_kernel.* = ChaosCoreKernel.init(allocator);
+        errdefer {
+            crev_kernel.deinit();
+            allocator.destroy(crev_kernel);
+        }
+
+        var crev_pipeline = try CREVPipeline.init(allocator, crev_kernel);
+        errdefer crev_pipeline.deinit();
+
         return DistributedTrainerFuthark{
             .allocator = allocator,
             .coordinator = coordinator,
@@ -104,11 +128,22 @@ pub const DistributedTrainerFuthark = struct {
             .learning_rate = config.learning_rate,
             .momentum = config.momentum,
             .config = config,
+            .embedding = embedding,
+            .embedding_accel = embedding_accel,
+            .crev_pipeline = crev_pipeline,
+            .crev_kernel = crev_kernel,
         };
     }
 
     pub fn deinit(self: *DistributedTrainerFuthark) void {
         self.accelerator.sync() catch {};
+        if (self.crev_pipeline) |*cp| cp.deinit();
+        if (self.crev_kernel) |ck| {
+            ck.deinit();
+            self.allocator.destroy(ck);
+        }
+        if (self.embedding_accel) |*ea| ea.deinit();
+        if (self.embedding) |*emb| emb.deinit();
         self.accelerator.deinit();
         self.tokenizer.deinit();
     }
@@ -285,15 +320,6 @@ pub const DistributedTrainerFuthark = struct {
         }
     }
 
-    /// All-reduce-average every per-layer tensor across ranks directly on the
-    /// GPU. We average weights and biases (the model state) AND the SFD
-    /// velocity buffers, so every rank starts the next step with identical
-    /// state and the training trajectory does not diverge across ranks.
-    ///
-    /// This is the GPU-resident replacement for the older snapshot/delta/merge
-    /// loop that used to copy each per-layer matrix to host RAM for the
-    /// allReduce. With ~24 layers x 8 tensors x 2 MB each, eliminating the
-    /// host roundtrip removes the dominant per-step overhead.
     fn gpuAllReduceLayers(self: *DistributedTrainerFuthark) !void {
         if (self.coordinator.world_size <= 1) return;
 
@@ -530,10 +556,6 @@ pub const DistributedTrainerFuthark = struct {
             try token_lists.append(token_list);
         }
 
-        // Hard cap on sequence length to prevent rogue long samples from
-        // ballooning the padded batch (saw a 31k-token sample inflate
-        // max_seq_len to 31159 -> 99%% pad rows, diluted loss, f16 overflow).
-        // Default 256 tokens, configurable via JAIDE_MAX_SEQ_LEN.
         const cap: usize = blk: {
             const env_val = std.process.getEnvVarOwned(self.allocator, "JAIDE_MAX_SEQ_LEN") catch break :blk 256;
             defer self.allocator.free(env_val);
@@ -586,43 +608,85 @@ pub const DistributedTrainerFuthark = struct {
         @memset(input_f16_data, @as(f16, 0.0));
         @memset(target_f16_data, @as(f16, 0.0));
 
-        var b_idx: usize = 0;
-        while (b_idx < token_lists.items.len) : (b_idx += 1) {
-            const list = token_lists.items[b_idx].items;
-            if (list.len == 0) continue;
-            var seq_idx: usize = 0;
-            while (seq_idx < list.len) : (seq_idx += 1) {
-                const token_index_raw: usize = @intCast(list[seq_idx]);
-                const token_index: usize = token_index_raw;
-                // One-hot encoding requires token_index < model_dim — otherwise
-                // the write spills into the next row's slot and silently corrupts
-                // both input and target. trainer.init() expands model_dim to
-                // >= vocab_size so this should never fire in practice, but if a
-                // future tokenizer change breaks that invariant we want to fail
-                // loudly here instead of silently producing garbage training
-                // data.
-                if (token_index >= self.model_dim) {
-                    std.debug.print("[Rank {d}] token id {d} >= model_dim {d} (vocab_size={d}); aborting step\n", .{ self.coordinator.rank, token_index, self.model_dim, self.vocab_size });
-                    return error.TokenIndexOutOfRange;
+        if (self.embedding) |*emb| {
+            emb.zeroGrad();
+            var b_idx: usize = 0;
+            while (b_idx < token_lists.items.len) : (b_idx += 1) {
+                const list = token_lists.items[b_idx].items;
+                if (list.len == 0) continue;
+
+                var emb_tensor = try emb.forward(self.allocator, list, max_seq_len);
+                defer emb_tensor.deinit();
+
+                const emb_rows = emb_tensor.shape.dims[0];
+                var seq_idx: usize = 0;
+                while (seq_idx < emb_rows) : (seq_idx += 1) {
+                    const row_offset = try std.math.mul(usize, b_idx, max_seq_len);
+                    const row_index = try std.math.add(usize, row_offset, seq_idx);
+                    const base_idx = try std.math.mul(usize, row_index, self.model_dim);
+                    var c: usize = 0;
+                    while (c < self.model_dim) : (c += 1) {
+                        const src_idx = seq_idx * self.model_dim + c;
+                        if (src_idx < emb_tensor.data.len and base_idx + c < input_f16_data.len) {
+                            input_f16_data[base_idx + c] = @floatCast(emb_tensor.data[src_idx]);
+                        }
+                    }
                 }
 
-                const row_offset = try std.math.mul(usize, b_idx, max_seq_len);
-                const row_index = try std.math.add(usize, row_offset, seq_idx);
-                const base_idx = try std.math.mul(usize, row_index, self.model_dim);
-                const final_idx = try std.math.add(usize, base_idx, token_index);
-                if (final_idx >= input_f16_data.len) return error.IndexOutOfBounds;
-                input_f16_data[final_idx] = @as(f16, 1.0);
-
-                if (seq_idx + 1 < list.len) {
-                    const next_token_raw: usize = @intCast(list[seq_idx + 1]);
-                    const next_token: usize = next_token_raw;
-                    if (next_token >= self.model_dim) {
-                        std.debug.print("[Rank {d}] next-token id {d} >= model_dim {d}; aborting step\n", .{ self.coordinator.rank, next_token, self.model_dim });
+                seq_idx = 0;
+                while (seq_idx < list.len) : (seq_idx += 1) {
+                    const token_index: usize = @intCast(list[seq_idx]);
+                    if (token_index >= self.model_dim) {
+                        std.debug.print("[Rank {d}] token id {d} >= model_dim {d}; aborting step\n", .{ self.coordinator.rank, token_index, self.model_dim });
                         return error.TokenIndexOutOfRange;
                     }
-                    const tgt_final = try std.math.add(usize, base_idx, next_token);
-                    if (tgt_final >= target_f16_data.len) return error.IndexOutOfBounds;
-                    target_f16_data[tgt_final] = @as(f16, 1.0);
+                    const row_offset = try std.math.mul(usize, b_idx, max_seq_len);
+                    const row_index = try std.math.add(usize, row_offset, seq_idx);
+                    const base_idx = try std.math.mul(usize, row_index, self.model_dim);
+                    if (seq_idx + 1 < list.len) {
+                        const next_token: usize = @intCast(list[seq_idx + 1]);
+                        if (next_token >= self.model_dim) {
+                            std.debug.print("[Rank {d}] next-token id {d} >= model_dim {d}; aborting step\n", .{ self.coordinator.rank, next_token, self.model_dim });
+                            return error.TokenIndexOutOfRange;
+                        }
+                        const tgt_final = try std.math.add(usize, base_idx, next_token);
+                        if (tgt_final >= target_f16_data.len) return error.IndexOutOfBounds;
+                        target_f16_data[tgt_final] = @as(f16, 1.0);
+                    }
+                }
+            }
+        } else {
+            var b_idx: usize = 0;
+            while (b_idx < token_lists.items.len) : (b_idx += 1) {
+                const list = token_lists.items[b_idx].items;
+                if (list.len == 0) continue;
+                var seq_idx: usize = 0;
+                while (seq_idx < list.len) : (seq_idx += 1) {
+                    const token_index_raw: usize = @intCast(list[seq_idx]);
+                    const token_index: usize = token_index_raw;
+                    if (token_index >= self.model_dim) {
+                        std.debug.print("[Rank {d}] token id {d} >= model_dim {d} (vocab_size={d}); aborting step\n", .{ self.coordinator.rank, token_index, self.model_dim, self.vocab_size });
+                        return error.TokenIndexOutOfRange;
+                    }
+
+                    const row_offset = try std.math.mul(usize, b_idx, max_seq_len);
+                    const row_index = try std.math.add(usize, row_offset, seq_idx);
+                    const base_idx = try std.math.mul(usize, row_index, self.model_dim);
+                    const final_idx = try std.math.add(usize, base_idx, token_index);
+                    if (final_idx >= input_f16_data.len) return error.IndexOutOfBounds;
+                    input_f16_data[final_idx] = @as(f16, 1.0);
+
+                    if (seq_idx + 1 < list.len) {
+                        const next_token_raw: usize = @intCast(list[seq_idx + 1]);
+                        const next_token: usize = next_token_raw;
+                        if (next_token >= self.model_dim) {
+                            std.debug.print("[Rank {d}] next-token id {d} >= model_dim {d}; aborting step\n", .{ self.coordinator.rank, next_token, self.model_dim });
+                            return error.TokenIndexOutOfRange;
+                        }
+                        const tgt_final = try std.math.add(usize, base_idx, next_token);
+                        if (tgt_final >= target_f16_data.len) return error.IndexOutOfBounds;
+                        target_f16_data[tgt_final] = @as(f16, 1.0);
+                    }
                 }
             }
         }
@@ -639,8 +703,6 @@ pub const DistributedTrainerFuthark = struct {
                 std.debug.print("\n", .{});
             }
 
-            // Scan first dump_n rows of batch 0 in input_f16_data / target_f16_data
-            // and report which token index is set to 1.0. Confirms 1-token shift.
             std.debug.print("[Rank 0 step0] input row->token: ", .{});
             {
                 var row: usize = 0;
@@ -691,23 +753,14 @@ pub const DistributedTrainerFuthark = struct {
         if (self.coordinator.world_size <= 1) {
             const loss_f16 = try self.accelerator.trainingStep(&inputs, &targets, lr_f16, mom_f16);
             try self.accelerator.sync();
+
+            self.propagateEmbeddingGradients(&inputs, &targets, token_lists.items, effective_batch_size, max_seq_len) catch {};
+
             const loss_f32: f32 = @floatCast(loss_f16);
             if (!std.math.isFinite(loss_f32)) return error.InvalidLoss;
             return loss_f32;
         }
 
-        // Distributed path: snapshot every per-layer tensor (W_s, W_t, s_bias,
-        // t_bias) BEFORE the local SFD step, then re-snapshot AFTER, compute
-        // per-rank deltas, all-reduce-average the deltas across ranks, and
-        // overwrite the layer state with (before + avg_delta). This keeps all
-        // ranks in lockstep so the model state never diverges.
-        //
-        // We keep the host-resident snapshot+delta+merge path here because the
-        // alternative — handing Futhark device pointers directly to NCCL via
-        // ncclAvg — hangs in practice (Futhark's `_values_raw_*` arrays do not
-        // round-trip cleanly through external NCCL collectives). The
-        // GPU-resident fast path lives behind `gpuAllReduceLayers` and can be
-        // re-enabled once that interop is sorted out.
         const Snapshots = struct {
             ws: [][]f16,
             wt: [][]f16,
@@ -766,7 +819,6 @@ pub const DistributedTrainerFuthark = struct {
                 return error.InvalidWeightsShape;
             }
 
-            // Convert (after) buffers into deltas in-place: after := after - before
             for (ws_after, snap.ws[li_after]) |*v, b| {
                 v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
             }
@@ -780,19 +832,19 @@ pub const DistributedTrainerFuthark = struct {
                 v.* = @floatCast(@as(f32, @floatCast(v.*)) - @as(f32, @floatCast(b)));
             }
 
-            // All-reduce-average the deltas so every rank applies the same update.
             try self.averageDeltaInPlace(ws_after);
             try self.averageDeltaInPlace(wt_after);
             try self.averageDeltaInPlace(sb_after);
             try self.averageDeltaInPlace(tb_after);
 
-            // Overwrite layer state: state := before + averaged_delta.
             try self.applyDeltaToLayer(li_after, snap.ws[li_after], ws_after, .s);
             try self.applyDeltaToLayer(li_after, snap.wt[li_after], wt_after, .t);
             try self.applyBiasDeltaToLayer(li_after, snap.sb[li_after], sb_after, .s);
             try self.applyBiasDeltaToLayer(li_after, snap.tb[li_after], tb_after, .t);
         }
         try self.accelerator.sync();
+
+        self.propagateEmbeddingGradients(&inputs, &targets, token_lists.items, effective_batch_size, max_seq_len) catch {};
 
         var loss_arr = [1]f32{@as(f32, @floatCast(loss_f16))};
         try self.allReduceFloat32Values(loss_arr[0..]);
@@ -1017,5 +1069,189 @@ pub const DistributedTrainerFuthark = struct {
         try self.accelerator.sync();
 
         std.debug.print("Checkpoint loaded from {s} at step {d}\n", .{ path, self.global_step });
+    }
+
+    fn propagateEmbeddingGradients(
+        self: *DistributedTrainerFuthark,
+        inputs: *FutharkArray3DF16,
+        targets: *FutharkArray3DF16,
+        token_items: []const std.ArrayList(u32),
+        effective_batch_size: usize,
+        max_seq_len: usize,
+    ) !void {
+        if (self.embedding == null) return;
+        const emb = &self.embedding.?;
+        const fctx = self.accelerator.ctx.ctx;
+        if (fctx == null) return;
+        const cmin: u16 = @bitCast(self.accelerator.clip_min);
+        const cmax: u16 = @bitCast(self.accelerator.clip_max);
+
+        var re_act = try std.heap.page_allocator.alloc(?*futhark.struct_futhark_f16_3d, self.num_layers + 1);
+        errdefer std.heap.page_allocator.free(re_act);
+        defer std.heap.page_allocator.free(re_act);
+        var re_own = try std.heap.page_allocator.alloc(bool, self.num_layers + 1);
+        errdefer std.heap.page_allocator.free(re_own);
+        defer std.heap.page_allocator.free(re_own);
+        @memset(re_act, @as(?*futhark.struct_futhark_f16_3d, null));
+        @memset(re_own, false);
+        re_act[0] = inputs.arr;
+        re_own[0] = false;
+
+        var fi: usize = 0;
+        while (fi < self.num_layers) : (fi += 1) {
+            var fwd_out: ?*futhark.struct_futhark_f16_3d = null;
+            const fwd_rc = futhark.futhark_entry_batch_forward(
+                fctx,
+                &fwd_out,
+                re_act[fi],
+                self.accelerator.layers[fi].weights_s.arr,
+                self.accelerator.layers[fi].weights_t.arr,
+                self.accelerator.layers[fi].s_bias.arr,
+                self.accelerator.layers[fi].t_bias.arr,
+                cmin,
+                cmax,
+            );
+            if (fwd_rc != 0 or fwd_out == null) {
+                var ci: usize = 0;
+                while (ci < re_act.len) : (ci += 1) {
+                    if (re_own[ci] and re_act[ci] != null) _ = futhark.futhark_free_f16_3d(fctx, re_act[ci]);
+                }
+                return;
+            }
+            var oftb_out: ?*futhark.struct_futhark_f16_3d = null;
+            const oftb_rc = futhark.futhark_entry_batch_oftb_forward(fctx, &oftb_out, fwd_out);
+            _ = futhark.futhark_free_f16_3d(fctx, fwd_out);
+            if (oftb_rc != 0 or oftb_out == null) {
+                var ci: usize = 0;
+                while (ci < re_act.len) : (ci += 1) {
+                    if (re_own[ci] and re_act[ci] != null) _ = futhark.futhark_free_f16_3d(fctx, re_act[ci]);
+                }
+                return;
+            }
+            re_act[fi + 1] = oftb_out;
+            re_own[fi + 1] = true;
+        }
+        try self.accelerator.sync();
+
+        var grad: ?*futhark.struct_futhark_f16_3d = null;
+        const grad_rc = futhark.futhark_entry_compute_initial_grad_l2(fctx, &grad, re_act[self.num_layers], targets.arr);
+        if (grad_rc != 0 or grad == null) {
+            var ci: usize = 0;
+            while (ci < re_act.len) : (ci += 1) {
+                if (re_own[ci] and re_act[ci] != null) _ = futhark.futhark_free_f16_3d(fctx, re_act[ci]);
+            }
+            return;
+        }
+
+        var lb: usize = self.num_layers;
+        while (lb > 0) : (lb -= 1) {
+            var oftb_g: ?*futhark.struct_futhark_f16_3d = null;
+            _ = futhark.futhark_entry_batch_oftb_backward(fctx, &oftb_g, grad);
+            _ = futhark.futhark_free_f16_3d(fctx, grad);
+            grad = oftb_g;
+            if (grad == null) {
+                var ci: usize = 0;
+                while (ci < re_act.len) : (ci += 1) {
+                    if (re_own[ci] and re_act[ci] != null) _ = futhark.futhark_free_f16_3d(fctx, re_act[ci]);
+                }
+                return;
+            }
+
+            var tup: ?*futhark.struct_futhark_opaque_tup5_grad_full = null;
+            _ = futhark.futhark_entry_batch_gradients_full(
+                fctx,
+                &tup,
+                re_act[lb - 1],
+                grad,
+                self.accelerator.layers[lb - 1].weights_s.arr,
+                self.accelerator.layers[lb - 1].weights_t.arr,
+                self.accelerator.layers[lb - 1].s_bias.arr,
+                self.accelerator.layers[lb - 1].t_bias.arr,
+                cmin,
+                cmax,
+            );
+            _ = futhark.futhark_free_f16_3d(fctx, grad);
+            grad = null;
+
+            if (tup) |t| {
+                var gws: ?*futhark.struct_futhark_f16_2d = null;
+                var gwt: ?*futhark.struct_futhark_f16_2d = null;
+                var gsb: ?*futhark.struct_futhark_f16_1d = null;
+                var gtb: ?*futhark.struct_futhark_f16_1d = null;
+                var gin: ?*futhark.struct_futhark_f16_3d = null;
+                _ = futhark.futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_0(fctx, &gws, t);
+                _ = futhark.futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_1(fctx, &gwt, t);
+                _ = futhark.futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_2(fctx, &gsb, t);
+                _ = futhark.futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_3(fctx, &gtb, t);
+                _ = futhark.futhark_project_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16_4(fctx, &gin, t);
+                _ = futhark.futhark_free_opaque_tup5_arr2d_f16_arr2d_f16_arr1d_f16_arr1d_f16_arr3d_f16(fctx, t);
+                if (gws != null) _ = futhark.futhark_free_f16_2d(fctx, gws);
+                if (gwt != null) _ = futhark.futhark_free_f16_2d(fctx, gwt);
+                if (gsb != null) _ = futhark.futhark_free_f16_1d(fctx, gsb);
+                if (gtb != null) _ = futhark.futhark_free_f16_1d(fctx, gtb);
+                grad = gin;
+            }
+        }
+        try self.accelerator.sync();
+
+        var ai: usize = 0;
+        while (ai < re_act.len) : (ai += 1) {
+            if (re_own[ai] and re_act[ai] != null) {
+                _ = futhark.futhark_free_f16_3d(fctx, re_act[ai]);
+            }
+        }
+
+        if (grad) |gi| {
+            const total = effective_batch_size * max_seq_len * self.model_dim;
+            var host_f16 = std.heap.page_allocator.alloc(f16, total) catch {
+                _ = futhark.futhark_free_f16_3d(fctx, gi);
+                return;
+            };
+            defer std.heap.page_allocator.free(host_f16);
+
+            _ = futhark.futhark_values_f16_3d(fctx, gi, @ptrCast(host_f16.ptr));
+            _ = futhark.futhark_free_f16_3d(fctx, gi);
+            try self.accelerator.sync();
+
+            var b_idx: usize = 0;
+            while (b_idx < token_items.len) : (b_idx += 1) {
+                const list = token_items[b_idx].items;
+                if (list.len == 0) continue;
+                const seq_len = @min(list.len, max_seq_len);
+                const grad_len = seq_len * self.model_dim;
+                var grad_data = self.allocator.alloc(f32, grad_len) catch continue;
+                defer self.allocator.free(grad_data);
+
+                var s: usize = 0;
+                while (s < seq_len) : (s += 1) {
+                    var c: usize = 0;
+                    while (c < self.model_dim) : (c += 1) {
+                        const src = b_idx * max_seq_len * self.model_dim + s * self.model_dim + c;
+                        const dst = s * self.model_dim + c;
+                        if (src < host_f16.len and dst < grad_data.len) {
+                            grad_data[dst] = @floatCast(host_f16[src]);
+                        }
+                    }
+                }
+                emb.backward(list, grad_data, max_seq_len);
+                emb.applyGradients(self.learning_rate, 0.9);
+            }
+        }
+    }
+
+    pub fn enableEmbeddingAccelerator(self: *DistributedTrainerFuthark) !void {
+        if (self.embedding_accel != null) return;
+        self.embedding_accel = try EmbeddingAccelerator.init(
+            &self.accelerator.ctx,
+            50000,
+            self.model_dim,
+            42,
+        );
+    }
+
+    pub fn buildKnowledgeGraph(self: *DistributedTrainerFuthark, text: []const u8) !void {
+        if (self.crev_pipeline) |*cp| {
+            _ = try cp.processTextStream(text);
+        }
     }
 };

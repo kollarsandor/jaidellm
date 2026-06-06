@@ -11,11 +11,12 @@ pub const TypeTheoryError = error{
     LinearityViolation,
     InvalidTypeConstruction,
     VariableNotInContext,
+    DuplicateBinding,
     InvalidApplication,
     InvalidProjection,
     CategoryLawViolation,
     OutOfMemory,
-    InvalidIdentityElimination,
+    InvalidIdentityComposition,
 };
 
 pub const TypeKind = enum(u8) {
@@ -115,7 +116,7 @@ pub const TypeKind = enum(u8) {
 
 pub const RecordField = struct {
     name: []const u8,
-    field_type: *Type,
+    field_type: ?*Type,
     allocator: Allocator,
 
     const Self = @This();
@@ -132,13 +133,19 @@ pub const RecordField = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.field_type.deinit();
-        self.allocator.destroy(self.field_type);
-        self.allocator.free(self.name);
+        if (self.field_type) |ft| {
+            ft.deinit();
+            self.allocator.destroy(ft);
+            self.field_type = null;
+        }
+        if (self.name.len > 0) {
+            self.allocator.free(self.name);
+            self.name = "";
+        }
     }
 
     pub fn clone(self: *const Self, allocator: Allocator) error{OutOfMemory}!*Self {
-        const cloned_type = try self.field_type.clone(allocator);
+        const cloned_type = try self.field_type.?.clone(allocator);
         errdefer {
             cloned_type.deinit();
             allocator.destroy(cloned_type);
@@ -320,6 +327,7 @@ pub const Type = struct {
     pub fn deinit(self: *Self) void {
         if (self.name.len > 0) {
             self.allocator.free(self.name);
+            self.name = "";
         }
         for (self.parameters.items) |param| {
             param.deinit();
@@ -333,19 +341,24 @@ pub const Type = struct {
         self.fields.deinit();
         if (self.bound_variable) |bv| {
             self.allocator.free(bv);
+            self.bound_variable = null;
         }
         if (self.body_type) |body| {
             body.deinit();
             self.allocator.destroy(body);
+            self.body_type = null;
         }
         if (self.left_type) |left| {
             left.deinit();
             self.allocator.destroy(left);
+            self.left_type = null;
         }
         if (self.right_type) |right| {
             right.deinit();
             self.allocator.destroy(right);
+            self.right_type = null;
         }
+        self.hash_cache = null;
     }
 
     pub fn clone(self: *const Self, allocator: Allocator) error{OutOfMemory}!*Self {
@@ -404,7 +417,7 @@ pub const Type = struct {
         while (field_idx < self.fields.items.len) : (field_idx += 1) {
             const field = self.fields.items[field_idx];
             if (!std.mem.eql(u8, field.name, other.fields.items[field_idx].name)) return false;
-            if (!field.field_type.equals(other.fields.items[field_idx].field_type)) return false;
+            if (!field.field_type.?.equals(other.fields.items[field_idx].field_type.?)) return false;
         }
         if (self.bound_variable) |bv1| {
             if (other.bound_variable) |bv2| {
@@ -449,7 +462,7 @@ pub const Type = struct {
         }
         for (self.fields.items) |field| {
             hasher.update(field.name);
-            const field_type_hash = field.field_type.computeHash();
+            const field_type_hash = field.field_type.?.computeHash();
             hasher.update(&field_type_hash);
         }
         if (self.bound_variable) |bv| {
@@ -514,7 +527,54 @@ pub const Type = struct {
 
     pub fn substitute(self: *Self, var_name: []const u8, replacement: *const Type) !void {
         if (self.kind == .VARIABLE and std.mem.eql(u8, self.name, var_name)) {
-            const cloned = try replacement.clone(self.allocator);
+            const name_copy = if (replacement.name.len > 0) try self.allocator.dupe(u8, replacement.name) else "";
+            errdefer if (name_copy.len > 0) self.allocator.free(name_copy);
+
+            var new_parameters = ArrayList(*Type).init(self.allocator);
+            errdefer new_parameters.deinit();
+            for (replacement.parameters.items) |param| {
+                try new_parameters.append(try param.clone(self.allocator));
+            }
+
+            var new_fields = ArrayList(*RecordField).init(self.allocator);
+            errdefer new_fields.deinit();
+            for (replacement.fields.items) |field| {
+                try new_fields.append(try field.clone(self.allocator));
+            }
+
+            const new_bound_variable: ?[]const u8 = if (replacement.bound_variable) |bv| try self.allocator.dupe(u8, bv) else null;
+            errdefer if (new_bound_variable) |bv| self.allocator.free(bv);
+
+            const new_body_type: ?*Type = if (replacement.body_type) |body| try body.clone(self.allocator) else null;
+            errdefer if (new_body_type) |bt| {
+                bt.deinit();
+                self.allocator.destroy(bt);
+            };
+
+            const new_left_type: ?*Type = if (replacement.left_type) |left| try left.clone(self.allocator) else null;
+            errdefer if (new_left_type) |lt| {
+                lt.deinit();
+                self.allocator.destroy(lt);
+            };
+
+            const new_right_type: ?*Type = if (replacement.right_type) |right| try right.clone(self.allocator) else null;
+            errdefer if (new_right_type) |rt| {
+                rt.deinit();
+                self.allocator.destroy(rt);
+            };
+
+            for (self.parameters.items) |p| {
+                p.deinit();
+                self.allocator.destroy(p);
+            }
+            self.parameters.deinit();
+
+            for (self.fields.items) |field| {
+                field.deinit();
+                self.allocator.destroy(field);
+            }
+            self.fields.deinit();
+
             if (self.name.len > 0) {
                 self.allocator.free(self.name);
             }
@@ -533,34 +593,26 @@ pub const Type = struct {
                 right.deinit();
                 self.allocator.destroy(right);
             }
-            for (self.parameters.items) |p| {
-                p.deinit();
-                self.allocator.destroy(p);
-            }
-            self.parameters.deinit();
-            for (self.fields.items) |field| {
-                field.deinit();
-                self.allocator.destroy(field);
-            }
-            self.fields.deinit();
-            self.kind = cloned.kind;
-            self.name = cloned.name;
-            self.universe_level = cloned.universe_level;
-            self.parameters = cloned.parameters;
-            self.fields = cloned.fields;
-            self.bound_variable = cloned.bound_variable;
-            self.body_type = cloned.body_type;
-            self.left_type = cloned.left_type;
-            self.right_type = cloned.right_type;
-            self.quantum_dimension = cloned.quantum_dimension;
+
+            self.kind = replacement.kind;
+            self.name = name_copy;
+            self.universe_level = replacement.universe_level;
+            self.parameters = new_parameters;
+            self.fields = new_fields;
+            self.bound_variable = new_bound_variable;
+            self.body_type = new_body_type;
+            self.left_type = new_left_type;
+            self.right_type = new_right_type;
+            self.quantum_dimension = replacement.quantum_dimension;
             self.hash_cache = null;
-            self.allocator.destroy(cloned);
         } else {
             for (self.parameters.items) |param| {
                 try param.substitute(var_name, replacement);
             }
             for (self.fields.items) |field| {
-                try field.field_type.substitute(var_name, replacement);
+                if (field.field_type) |ft| {
+                    try ft.substitute(var_name, replacement);
+                }
             }
             if (self.left_type) |left| {
                 try left.substitute(var_name, replacement);
@@ -585,7 +637,7 @@ pub const Type = struct {
             if (param.containsFreeVariable(var_name)) return true;
         }
         for (self.fields.items) |field| {
-            if (field.field_type.containsFreeVariable(var_name)) return true;
+            if (field.field_type.?.containsFreeVariable(var_name)) return true;
         }
         if (self.left_type) |left| {
             if (left.containsFreeVariable(var_name)) return true;
@@ -640,6 +692,7 @@ pub const TypeBinding = struct {
 pub const TypeContext = struct {
     bindings: ArrayList(*TypeBinding),
     parent: ?*TypeContext,
+    owns_parent: bool,
     allocator: Allocator,
     depth: u32,
 
@@ -649,6 +702,7 @@ pub const TypeContext = struct {
         return Self{
             .bindings = ArrayList(*TypeBinding).init(allocator),
             .parent = null,
+            .owns_parent = false,
             .allocator = allocator,
             .depth = 0,
         };
@@ -658,6 +712,7 @@ pub const TypeContext = struct {
         return Self{
             .bindings = ArrayList(*TypeBinding).init(allocator),
             .parent = parent,
+            .owns_parent = false,
             .allocator = allocator,
             .depth = parent.depth + 1,
         };
@@ -669,6 +724,12 @@ pub const TypeContext = struct {
             self.allocator.destroy(binding);
         }
         self.bindings.deinit();
+        if (self.owns_parent) {
+            if (self.parent) |p| {
+                p.deinit();
+                self.allocator.destroy(p);
+            }
+        }
     }
 
     pub fn extend(self: *Self, name: []const u8, bound_type: *Type) !void {
@@ -714,9 +775,17 @@ pub const TypeContext = struct {
     pub fn clone(self: *const Self, allocator: Allocator) !*Self {
         const ctx = try allocator.create(Self);
         errdefer allocator.destroy(ctx);
+        const cloned_parent = if (self.parent) |p| try p.clone(allocator) else null;
+        errdefer {
+            if (cloned_parent) |cp| {
+                cp.deinit();
+                allocator.destroy(cp);
+            }
+        }
         ctx.* = Self{
             .bindings = ArrayList(*TypeBinding).init(allocator),
-            .parent = if (self.parent) |p| try p.clone(allocator) else null,
+            .parent = cloned_parent,
+            .owns_parent = cloned_parent != null,
             .allocator = allocator,
             .depth = self.depth,
         };
@@ -730,7 +799,7 @@ pub const TypeContext = struct {
     pub fn merge(self: *Self, other: *const Self) !void {
         for (other.bindings.items) |binding| {
             if (self.contains(binding.name)) {
-                return TypeTheoryError.VariableNotInContext;
+                return TypeTheoryError.DuplicateBinding;
             }
             try self.bindings.append(try binding.clone(self.allocator));
         }
@@ -1354,7 +1423,7 @@ pub const IdentityType = struct {
 
     pub fn transitivity(self: *const Self, other: *const Self, allocator: Allocator) !*Self {
         if (!self.right_term.equals(other.left_term)) {
-            return TypeTheoryError.InvalidIdentityElimination;
+            return TypeTheoryError.InvalidIdentityComposition;
         }
         if (!self.base_type.equals(other.base_type)) {
             return TypeTheoryError.TypeMismatch;
@@ -4339,3 +4408,5 @@ test "term construction application" {
     try std.testing.expect(app.kind == .APPLICATION);
     try std.testing.expect(app.sub_terms.items.len == 2);
 }
+
+================

@@ -189,15 +189,17 @@ pub const CircomProver = struct {
     }
 
     pub fn compileCircuit(self: *Self) !void {
+        const output_dir = try std.fmt.allocPrint(self.allocator, "src/zk", .{});
+        defer self.allocator.free(output_dir);
+
         const args = &[_][]const u8{
-            self.snarkjs_path,
             "circom",
             self.config.circuit_path,
             "--r1cs",
             "--wasm",
             "--sym",
             "-o",
-            "src/zk",
+            output_dir,
         };
 
         var child = ChildProcess.init(args, self.allocator);
@@ -206,20 +208,24 @@ pub const CircomProver = struct {
         try child.spawn();
         const term = try child.wait();
 
-        if (term != .{.Exited = 0}) {
-            return ZKProofError.CircomCompilationFailed;
+        switch (term) {
+            .Exited => |code| if (code != 0) return ZKProofError.CircomCompilationFailed,
+            else => return ZKProofError.CircomCompilationFailed,
         }
 
         self.circuit_compiled = true;
     }
 
     pub fn setupKeys(self: *Self, ptau_path: []const u8) !void {
+        const r1cs_path = try std.fmt.allocPrint(self.allocator, "src/zk/inference_trace.r1cs", .{});
+        defer self.allocator.free(r1cs_path);
+
         const contribute_args = &[_][]const u8{
             self.snarkjs_path,
             "snarkjs",
             "groth16",
             "setup",
-            "src/zk/inference_trace.r1cs",
+            r1cs_path,
             ptau_path,
             self.config.zkey_path,
         };
@@ -230,8 +236,9 @@ pub const CircomProver = struct {
         try child.spawn();
         const term = try child.wait();
 
-        if (term != .{.Exited = 0}) {
-            return ZKProofError.KeysNotGenerated;
+        switch (term) {
+            .Exited => |code| if (code != 0) return ZKProofError.KeysNotGenerated,
+            else => return ZKProofError.KeysNotGenerated,
         }
 
         const export_args = &[_][]const u8{
@@ -250,8 +257,9 @@ pub const CircomProver = struct {
         try export_child.spawn();
         const export_term = try export_child.wait();
 
-        if (export_term != .{.Exited = 0}) {
-            return ZKProofError.KeysNotGenerated;
+        switch (export_term) {
+            .Exited => |code| if (code != 0) return ZKProofError.KeysNotGenerated,
+            else => return ZKProofError.KeysNotGenerated,
         }
 
         self.keys_generated = true;
@@ -310,8 +318,9 @@ pub const CircomProver = struct {
         try child.spawn();
         const term = try child.wait();
 
-        if (term != .{.Exited = 0}) {
-            return ZKProofError.ProofGenerationFailed;
+        switch (term) {
+            .Exited => |code| if (code != 0) return ZKProofError.ProofGenerationFailed,
+            else => return ZKProofError.ProofGenerationFailed,
         }
     }
 
@@ -338,8 +347,9 @@ pub const CircomProver = struct {
 
         const term = try child.wait();
 
-        if (term != .{.Exited = 0}) {
-            return false;
+        switch (term) {
+            .Exited => |code| if (code != 0) return false,
+            else => return false,
         }
 
         return std.mem.indexOf(u8, stdout, "OK") != null;
@@ -430,28 +440,49 @@ pub const InferenceWitness = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn setTokens(self: *Self, input_tokens: []const f32, scale: i64) void {
+    pub fn setTokens(self: *Self, input_tokens: []const f32, scale: i128) void {
         var i: usize = 0;
         while (i < self.dim and i < input_tokens.len) : (i += 1) {
-            self.tokens[i] = @intFromFloat(input_tokens[i] * @as(f32, @floatFromInt(scale)));
+            const scaled = @as(f64, input_tokens[i]) * @as(f64, @floatFromInt(scale));
+            if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
+                self.tokens[i] = std.math.maxInt(i64);
+            } else if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i64)))) {
+                self.tokens[i] = std.math.minInt(i64);
+            } else {
+                self.tokens[i] = @intFromFloat(scaled);
+            }
         }
     }
 
-    pub fn setExpectedOutput(self: *Self, output: []const f32, scale: i64) void {
+    pub fn setExpectedOutput(self: *Self, output: []const f32, scale: i128) void {
         var i: usize = 0;
         while (i < self.dim and i < output.len) : (i += 1) {
-            self.expected_output[i] = @intFromFloat(output[i] * @as(f32, @floatFromInt(scale)));
+            const scaled = @as(f64, output[i]) * @as(f64, @floatFromInt(scale));
+            if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
+                self.expected_output[i] = std.math.maxInt(i64);
+            } else if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i64)))) {
+                self.expected_output[i] = std.math.minInt(i64);
+            } else {
+                self.expected_output[i] = @intFromFloat(scaled);
+            }
         }
     }
 
-    pub fn setLayerWeights(self: *Self, layer: usize, weights_s: []const []const f32, weights_t: []const []const f32, scale: i64) void {
+    pub fn setLayerWeights(self: *Self, layer: usize, weights_s: []const []const f32, weights_t: []const []const f32, scale: i128) void {
         if (layer >= self.num_layers) return;
 
         var i: usize = 0;
         while (i < self.dim and i < weights_s.len) : (i += 1) {
             var j: usize = 0;
             while (j < self.dim and j < weights_s[i].len) : (j += 1) {
-                self.layer_weights_s[layer][i][j] = @intFromFloat(weights_s[i][j] * @as(f32, @floatFromInt(scale)));
+                const scaled = @as(f64, weights_s[i][j]) * @as(f64, @floatFromInt(scale));
+                if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
+                    self.layer_weights_s[layer][i][j] = std.math.maxInt(i64);
+                } else if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i64)))) {
+                    self.layer_weights_s[layer][i][j] = std.math.minInt(i64);
+                } else {
+                    self.layer_weights_s[layer][i][j] = @intFromFloat(scaled);
+                }
             }
         }
 
@@ -459,7 +490,14 @@ pub const InferenceWitness = struct {
         while (i < self.dim and i < weights_t.len) : (i += 1) {
             var j: usize = 0;
             while (j < self.dim and j < weights_t[i].len) : (j += 1) {
-                self.layer_weights_t[layer][i][j] = @intFromFloat(weights_t[i][j] * @as(f32, @floatFromInt(scale)));
+                const scaled = @as(f64, weights_t[i][j]) * @as(f64, @floatFromInt(scale));
+                if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(i64)))) {
+                    self.layer_weights_t[layer][i][j] = std.math.maxInt(i64);
+                } else if (scaled <= @as(f64, @floatFromInt(std.math.minInt(i64)))) {
+                    self.layer_weights_t[layer][i][j] = std.math.minInt(i64);
+                } else {
+                    self.layer_weights_t[layer][i][j] = @intFromFloat(scaled);
+                }
             }
         }
     }
@@ -643,10 +681,14 @@ pub const ZKInferenceProver = struct {
 
         witness.computeCommitments();
 
+        var nonce_bytes: [16]u8 = undefined;
+        crypto.random.bytes(&nonce_bytes);
+        const nonce_hex = std.fmt.bytesToHex(nonce_bytes, .lower);
+
         const input_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/input_{}.json",
-            .{ self.config.witness_dir, self.proof_counter },
+            "{s}/input_{s}.json",
+            .{ self.config.witness_dir, nonce_hex },
         );
         defer self.allocator.free(input_path);
 
@@ -654,8 +696,8 @@ pub const ZKInferenceProver = struct {
 
         const witness_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/witness_{}.wtns",
-            .{ self.config.witness_dir, self.proof_counter },
+            "{s}/witness_{s}.wtns",
+            .{ self.config.witness_dir, nonce_hex },
         );
         defer self.allocator.free(witness_path);
 
@@ -663,15 +705,15 @@ pub const ZKInferenceProver = struct {
 
         const proof_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/proof_{}.json",
-            .{ self.config.proof_dir, self.proof_counter },
+            "{s}/proof_{s}.json",
+            .{ self.config.proof_dir, nonce_hex },
         );
         defer self.allocator.free(proof_path);
 
         const public_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/public_{}.json",
-            .{ self.config.proof_dir, self.proof_counter },
+            "{s}/public_{s}.json",
+            .{ self.config.proof_dir, nonce_hex },
         );
         defer self.allocator.free(public_path);
 
@@ -695,25 +737,33 @@ pub const ZKInferenceProver = struct {
     }
 
     pub fn verifyProofBundle(self: *Self, bundle: *ZKProofBundle) !bool {
+        var random_bytes: [16]u8 = undefined;
+        crypto.random.bytes(&random_bytes);
+        const nonce = std.fmt.bytesToHex(random_bytes, .lower);
+
+        var tmp_dir_buf: [256]u8 = undefined;
+        const tmp_dir_path = try std.fmt.bufPrint(&tmp_dir_buf, "/tmp/zk_verify_{s}", .{nonce});
+        try fs.cwd().makePath(tmp_dir_path, .{});
+
         const proof_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/verify_temp_proof.json",
-            .{self.config.proof_dir},
+            "{s}/proof.json",
+            .{tmp_dir_path},
         );
         defer self.allocator.free(proof_path);
 
         const public_path = try std.fmt.allocPrint(
             self.allocator,
-            "{s}/verify_temp_public.json",
-            .{self.config.proof_dir},
+            "{s}/public.json",
+            .{tmp_dir_path},
         );
         defer self.allocator.free(public_path);
 
-        var proof_file = try fs.cwd().createFile(proof_path, .{});
+        var proof_file = try fs.cwd().createFile(proof_path, .{ .exclusive = true });
         defer proof_file.close();
         try proof_file.writeAll(bundle.proof_json);
 
-        var public_file = try fs.cwd().createFile(public_path, .{});
+        var public_file = try fs.cwd().createFile(public_path, .{ .exclusive = true });
         defer public_file.close();
         try public_file.writeAll(bundle.public_json);
 
@@ -721,6 +771,7 @@ pub const ZKInferenceProver = struct {
 
         fs.cwd().deleteFile(proof_path) catch {};
         fs.cwd().deleteFile(public_path) catch {};
+        fs.cwd().deleteDir(tmp_dir_path) catch {};
 
         return result;
     }
@@ -812,8 +863,8 @@ pub const CommitmentScheme = struct {
 
 pub const RangeProof = struct {
     allocator: Allocator,
-    min_value: i64,
-    max_value: i64,
+    min_value: i128,
+    max_value: i128,
     proof_bits: ArrayList(ProofBit),
 
     const ProofBit = struct {
@@ -824,7 +875,7 @@ pub const RangeProof = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, min: i64, max: i64) !*Self {
+    pub fn init(allocator: Allocator, min: i128, max: i128) !*Self {
         const self = try allocator.create(Self);
         self.* = Self{
             .allocator = allocator,
@@ -840,19 +891,25 @@ pub const RangeProof = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn prove(self: *Self, value: i64) !void {
+    pub fn prove(self: *Self, value: i128) !void {
+        if (self.min_value > self.max_value) {
+            return error.ValueOutOfRange;
+        }
         if (value < self.min_value or value > self.max_value) {
             return error.ValueOutOfRange;
         }
 
-        const range = self.max_value - self.min_value;
-        const bits_needed = if (range == 0) 1 else std.math.bitSizeOf(@TypeOf(range)) - @clz(@as(u64, @intCast(range)));
+        const range = @as(u128, @intCast(self.max_value)) - @as(u128, @intCast(self.min_value));
+        const bits_needed: usize = if (range == 0) 1 else blk: {
+            const bits = std.math.bitSizeOf(u128) - @clz(range);
+            break :blk @min(bits, 127);
+        };
 
-        const normalized_value = value - self.min_value;
+        const normalized_value = @as(u128, @intCast(value)) - @as(u128, @intCast(self.min_value));
 
         var i: usize = 0;
         while (i < bits_needed) : (i += 1) {
-            const bit: u1 = @intCast((normalized_value >> i) & 1);
+            const bit: u1 = @intCast((normalized_value >> @intCast(i)) & 1);
 
             var nonce: [32]u8 = undefined;
             crypto.random.bytes(nonce[0..]);
@@ -872,7 +929,7 @@ pub const RangeProof = struct {
     }
 
     pub fn verify(self: *Self) !bool {
-        var reconstructed_value: i64 = 0;
+        var reconstructed_value: u128 = 0;
         var i: usize = 0;
         while (i < self.proof_bits.items.len) : (i += 1) {
             const bit_proof = self.proof_bits.items[i];
@@ -886,12 +943,18 @@ pub const RangeProof = struct {
                 return false;
             }
 
+            if (bit_proof.bit_value > 1) {
+                return false;
+            }
+
             if (bit_proof.bit_value == 1) {
-                reconstructed_value |= (@as(i64, 1) << i);
+                if (i < 127) {
+                    reconstructed_value |= (@as(u128, 1) << @intCast(i));
+                }
             }
         }
 
-        const final_value = reconstructed_value + self.min_value;
+        const final_value = @as(i128, @intCast(reconstructed_value)) + self.min_value;
         return final_value >= self.min_value and final_value <= self.max_value;
     }
 };
@@ -1145,11 +1208,20 @@ pub const DifferentialPrivacy = struct {
         const u = std.crypto.random.float(f64) - 0.5;
         const b = self.sensitivity / self.epsilon;
         const sgn = if (u < 0) @as(f64, -1.0) else @as(f64, 1.0);
-        const abs_u = if (u < 0) -u else u;
-        if (abs_u >= 0.5) {
-            return value;
-        }
+        const abs_u = @abs(u);
         const noise = -b * sgn * @log(1.0 - 2.0 * abs_u);
+        return value + noise;
+    }
+
+    pub fn addCalibratedNoise(self: *Self, value: f64) f64 {
+        const calibrated_scale = self.sensitivity / self.epsilon;
+        var rand1: f64 = 0.0;
+        while (rand1 == 0.0) {
+            rand1 = std.crypto.random.float(f64);
+        }
+        const rand2 = std.crypto.random.float(f64);
+        const z = @sqrt(-2.0 * @log(rand1)) * @cos(2.0 * std.math.pi * rand2);
+        const noise = z * calibrated_scale;
         return value + noise;
     }
 };
@@ -1402,3 +1474,5 @@ pub const SecureAggregation = struct {
         return self.aggregated_result;
     }
 };
+
+================

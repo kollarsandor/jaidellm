@@ -5,6 +5,8 @@ const meta = std.meta;
 const testing = std.testing;
 const Allocator = mem.Allocator;
 
+pub const Tensor = @import("tensor.zig").Tensor;
+
 pub const FixedPointError = error{ Overflow, DivisionByZero };
 
 pub const FixedPoint16 = packed struct {
@@ -187,7 +189,7 @@ pub const Fixed32_32 = packed struct {
     }
 };
 
-pub const Tensor = struct {
+pub const GenericTensor = struct {
     data: []u8,
     shape: []usize,
     strides: []usize,
@@ -195,7 +197,7 @@ pub const Tensor = struct {
     allocator: Allocator,
     refcount: *usize,
 
-    pub fn init(allocator: Allocator, shape: []const usize, comptime T: type) !Tensor {
+    pub fn init(allocator: Allocator, shape: []const usize, comptime T: type) !GenericTensor {
         const elem_size = @sizeOf(T);
         var size: usize = 1;
         var i: usize = 0;
@@ -224,18 +226,18 @@ pub const Tensor = struct {
         };
     }
 
-    pub fn retain(self: *Tensor) void {
+    pub fn retain(self: *GenericTensor) void {
         _ = @atomicRmw(usize, self.refcount, .Add, 1, .seq_cst);
     }
 
-    pub fn release(self: *Tensor) void {
+    pub fn release(self: *GenericTensor) void {
         const old = @atomicRmw(usize, self.refcount, .Sub, 1, .seq_cst);
         if (old == 1) {
             self.deinit();
         }
     }
 
-    pub fn deinit(self: *Tensor) void {
+    pub fn deinit(self: *GenericTensor) void {
         self.allocator.free(self.data);
         self.allocator.free(self.shape);
         self.allocator.free(self.strides);
@@ -247,7 +249,7 @@ pub const Tensor = struct {
         IndexOutOfBounds,
     };
 
-    pub fn get(comptime T: type, self: *const Tensor, indices: []const usize) TensorError!T {
+    pub fn get(comptime T: type, self: *const GenericTensor, indices: []const usize) TensorError!T {
         if (indices.len != self.shape.len) return TensorError.IndicesLengthMismatch;
         var idx: usize = 0;
         var i: usize = 0;
@@ -265,7 +267,7 @@ pub const Tensor = struct {
         return ptr[idx];
     }
 
-    pub fn set(comptime T: type, self: *Tensor, indices: []const usize, value: T) TensorError!void {
+    pub fn set(comptime T: type, self: *GenericTensor, indices: []const usize, value: T) TensorError!void {
         if (indices.len != self.shape.len) return TensorError.IndicesLengthMismatch;
         var idx: usize = 0;
         var i: usize = 0;
@@ -304,12 +306,17 @@ pub const ContextWindow = struct {
         self.allocator.free(self.tokens);
     }
 
-    pub fn add(self: *ContextWindow, token: u32) !void {
+    pub fn add(self: *ContextWindow, token: u32) void {
+        if (self.capacity == 0) return;
         if (self.size < self.capacity) {
             self.tokens[self.size] = token;
             self.size += 1;
         } else {
-            return error.WindowFull;
+            var i: usize = 0;
+            while (i < self.capacity - 1) : (i += 1) {
+                self.tokens[i] = self.tokens[i + 1];
+            }
+            self.tokens[self.capacity - 1] = token;
         }
     }
 
@@ -472,6 +479,12 @@ pub const PRNG = struct {
         return @as(f32, @floatFromInt(x)) / divisor;
     }
 
+    pub fn float64(self: *PRNG) f64 {
+        const bits = self.next();
+        const divisor: f64 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
+        return @as(f64, @floatFromInt(bits)) / divisor;
+    }
+
     pub fn uint64(self: *PRNG) u64 {
         return self.next();
     }
@@ -496,17 +509,19 @@ pub const PRNG = struct {
         const range = max_val - min_val;
         var val = self.next();
         const thresh = std.math.maxInt(u64) - ((std.math.maxInt(u64) % range) + 1) % range;
+        var retries: usize = 0;
+        const max_retries: usize = 128;
         while (val > thresh) {
             val = self.next();
+            retries += 1;
+            if (retries >= max_retries) break;
         }
         return min_val + (val % range);
     }
 
     pub fn normal(self: *PRNG, mean: f64, stddev: f64) f64 {
-        var u = self.float();
-        var v = self.float();
-        while (u == 0.0) u = self.float();
-        while (v == 0.0) v = self.float();
+        const u = 1.0 - self.float64();
+        const v = self.float64();
         const z = math.sqrt(-2.0 * @log(u)) * math.cos(2.0 * math.pi * v);
         return mean + stddev * z;
     }
@@ -563,30 +578,63 @@ pub fn max(comptime T: type, a: T, b: T) T {
     return if (a > b) a else b;
 }
 
-pub fn sum(comptime T: type, slice: []const T) T {
+pub fn sum(comptime T: type, slice: []const T) Error!T {
     var total: T = 0;
     var i: usize = 0;
     while (i < slice.len) : (i += 1) {
-        total += slice[i];
+        switch (@typeInfo(T)) {
+            .Int => {
+                const r = @addWithOverflow(total, slice[i]);
+                if (r[1] != 0) return Error.Overflow;
+                total = r[0];
+            },
+            .Float => {
+                total += slice[i];
+            },
+            else => total += slice[i],
+        }
     }
     return total;
 }
 
-pub fn prod(comptime T: type, slice: []const T) T {
+pub fn prod(comptime T: type, slice: []const T) Error!T {
     var total: T = 1;
     var i: usize = 0;
     while (i < slice.len) : (i += 1) {
-        total *= slice[i];
+        switch (@typeInfo(T)) {
+            .Int => {
+                const r = @mulWithOverflow(total, slice[i]);
+                if (r[1] != 0) return Error.Overflow;
+                total = r[0];
+            },
+            .Float => {
+                total *= slice[i];
+                if (!math.isFinite(total)) return Error.Overflow;
+            },
+            else => total *= slice[i],
+        }
     }
     return total;
 }
 
-pub fn dotProduct(comptime T: type, a: []const T, b: []const T) !T {
+pub fn dotProduct(comptime T: type, a: []const T, b: []const T) Error!T {
     if (a.len != b.len) return error.ShapeMismatch;
     var result: T = 0;
     var i: usize = 0;
     while (i < a.len) : (i += 1) {
-        result += a[i] * b[i];
+        switch (@typeInfo(T)) {
+            .Int => {
+                const mr = @mulWithOverflow(a[i], b[i]);
+                if (mr[1] != 0) return Error.Overflow;
+                const ar = @addWithOverflow(result, mr[0]);
+                if (ar[1] != 0) return Error.Overflow;
+                result = ar[0];
+            },
+            .Float => {
+                result += a[i] * b[i];
+            },
+            else => result += a[i] * b[i],
+        }
     }
     return result;
 }
@@ -599,40 +647,58 @@ pub fn crossProduct(comptime T: type, a: [3]T, b: [3]T) [3]T {
     };
 }
 
-pub fn norm(comptime T: type, vec: []const T) f32 {
-    var sq_sum: f32 = 0.0;
+pub fn norm(comptime T: type, vec: []const T) f64 {
+    var sq_sum: f64 = 0.0;
     var i: usize = 0;
     while (i < vec.len) : (i += 1) {
-        const f = @as(f32, @floatFromInt(vec[i]));
+        const f: f64 = switch (@typeInfo(T)) {
+            .Int => @floatFromInt(vec[i]),
+            .Float => @floatCast(vec[i]),
+            else => @compileError("norm not supported for type " ++ @typeName(T)),
+        };
         sq_sum += f * f;
     }
     return math.sqrt(sq_sum);
 }
 
-pub fn lerp(comptime T: type, a: T, b: T, t: f32) T {
-    const fa = @as(f32, @floatFromInt(a));
-    const fb = @as(f32, @floatFromInt(b));
-    return @intFromFloat(fa + (fb - fa) * t);
+pub fn lerp(comptime T: type, a: T, b: T, t: f64) T {
+    return switch (@typeInfo(T)) {
+        .Int => blk: {
+            const fa: f64 = @floatFromInt(a);
+            const fb: f64 = @floatFromInt(b);
+            break :blk @intFromFloat(fa + (fb - fa) * t);
+        },
+        .Float => blk: {
+            const fa: f64 = @floatCast(a);
+            const fb: f64 = @floatCast(b);
+            break :blk @floatCast(fa + (fb - fa) * t);
+        },
+        else => @compileError("lerp not supported for type " ++ @typeName(T)),
+    };
 }
 
-pub fn factorial(n: usize) usize {
+pub fn factorial(n: usize) Error!usize {
     if (n <= 1) return 1;
     var result: usize = 1;
     var i: usize = 2;
     while (i <= n) : (i += 1) {
-        result *= i;
+        const r = @mulWithOverflow(result, i);
+        if (r[1] != 0) return Error.Overflow;
+        result = r[0];
     }
     return result;
 }
 
-pub fn binomial(n: usize, k: usize) usize {
+pub fn binomial(n: usize, k: usize) Error!usize {
     if (k > n) return 0;
     if (k == 0 or k == n) return 1;
     const k_opt = if (k > n - k) n - k else k;
     var result: usize = 1;
     var i: usize = 0;
     while (i < k_opt) : (i += 1) {
-        result *= (n - i);
+        const r = @mulWithOverflow(result, (n - i));
+        if (r[1] != 0) return Error.Overflow;
+        result = r[0];
         result /= (i + 1);
     }
     return result;
@@ -649,25 +715,64 @@ pub fn gcd(a: usize, b: usize) usize {
     return x;
 }
 
-pub fn lcm(a: usize, b: usize) usize {
+pub fn lcm(a: usize, b: usize) Error!usize {
     if (a == 0 or b == 0) return 0;
-    return a / gcd(a, b) * b;
+    const g = gcd(a, b);
+    const q = a / g;
+    const r = @mulWithOverflow(q, b);
+    if (r[1] != 0) return Error.Overflow;
+    return r[0];
 }
 
-pub fn pow(comptime T: type, base: T, exp: usize) T {
-    var result: T = 1;
-    var e = exp;
-    var b = base;
-    while (e > 0) {
-        if (e % 2 == 1) result *= b;
-        b *= b;
-        e /= 2;
+pub fn pow(comptime T: type, base: T, exp: usize) Error!T {
+    const ti = @typeInfo(T);
+    switch (ti) {
+        .Int => {
+            var result: T = 1;
+            var e = exp;
+            var b = base;
+            while (e > 0) {
+                if (e % 2 == 1) {
+                    const r = @mulWithOverflow(result, b);
+                    if (r[1] != 0) return Error.Overflow;
+                    result = r[0];
+                }
+                if (e > 1) {
+                    const r = @mulWithOverflow(b, b);
+                    if (r[1] != 0) return Error.Overflow;
+                    b = r[0];
+                }
+                e /= 2;
+            }
+            return result;
+        },
+        .Float => {
+            var result: T = 1;
+            var e = exp;
+            var b = base;
+            while (e > 0) {
+                if (e % 2 == 1) {
+                    result *= b;
+                    if (!math.isFinite(result)) return Error.Overflow;
+                }
+                if (e > 1) {
+                    b *= b;
+                    if (!math.isFinite(b)) return Error.Overflow;
+                }
+                e /= 2;
+            }
+            return result;
+        },
+        else => @compileError("pow not supported for type " ++ @typeName(T)),
     }
-    return result;
 }
 
-pub fn log2(comptime T: type, x: T) f32 {
-    return @log2(@as(f32, @floatFromInt(x)));
+pub fn log2(comptime T: type, x: T) f64 {
+    return switch (@typeInfo(T)) {
+        .Int => @log2(@as(f64, @floatFromInt(x))),
+        .Float => @log2(@as(f64, @floatCast(x))),
+        else => @compileError("log2 not supported for type " ++ @typeName(T)),
+    };
 }
 
 pub fn isPowerOfTwo(n: usize) bool {
@@ -747,10 +852,27 @@ pub fn reverseBits(comptime T: type, x: T) T {
 
 pub fn bitReverseCopy(comptime T: type, src: []const T, dst: []T) void {
     if (src.len != dst.len) return;
+    if (src.len == 0) return;
+    const n = src.len;
+    var log_n: usize = 0;
+    {
+        var v = n - 1;
+        while (v > 0) : (v >>= 1) {
+            log_n += 1;
+        }
+    }
     var i: usize = 0;
-    while (i < src.len) : (i += 1) {
-        const rev_idx = reverseBits(usize, i) % src.len;
-        dst[rev_idx] = src[i];
+    while (i < n) : (i += 1) {
+        var rev: usize = 0;
+        var val = i;
+        var j: usize = 0;
+        while (j < log_n) : (j += 1) {
+            rev = (rev << 1) | (val & 1);
+            val >>= 1;
+        }
+        if (rev < n) {
+            dst[rev] = src[i];
+        }
     }
 }
 
@@ -898,9 +1020,77 @@ pub const Queue = std.fifo.LinearFifo(u64, .Dynamic);
 pub const BloomFilter = struct {
     bits: BitSet,
     hash_functions: u8,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, expected_items: usize, hash_functions: u8) !BloomFilter {
+        const bit_count = @max(expected_items * 10, @as(usize, 64));
+        const bset = try BitSet.init(allocator, bit_count);
+        return .{ .bits = bset, .hash_functions = hash_functions, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *BloomFilter) void {
+        self.bits.deinit();
+    }
+
+    fn hashKey(self: *const BloomFilter, key: u64, hash_idx: u8) usize {
+        var h = key +% @as(u64, hash_idx) *% 0x9E3779B97F4A7C15;
+        h ^= h >> 32;
+        h *%= 0xBF58476D1CE4E5B9;
+        h ^= h >> 32;
+        const len: u64 = @intCast(self.bits.len);
+        return @intCast(h % len);
+    }
+
+    pub fn add(self: *BloomFilter, key: u64) void {
+        var i: u8 = 0;
+        while (i < self.hash_functions) : (i += 1) {
+            self.bits.set(self.hashKey(key, i));
+        }
+    }
+
+    pub fn mightContain(self: *const BloomFilter, key: u64) bool {
+        var i: u8 = 0;
+        while (i < self.hash_functions) : (i += 1) {
+            if (!self.bits.isSet(self.hashKey(key, i))) return false;
+        }
+        return true;
+    }
+
+    pub fn check(self: *const BloomFilter, key: u64) bool {
+        return self.mightContain(key);
+    }
 };
 
-pub const VoxelGrid = [32][32][32]u8;
+pub const VoxelGrid = struct {
+    data: []u8,
+    dim_x: usize,
+    dim_y: usize,
+    dim_z: usize,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) !VoxelGrid {
+        const dim_x: usize = 32;
+        const dim_y: usize = 32;
+        const dim_z: usize = 32;
+        const data = try allocator.alloc(u8, dim_x * dim_y * dim_z);
+        @memset(data, 0);
+        return .{ .data = data, .dim_x = dim_x, .dim_y = dim_y, .dim_z = dim_z, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *VoxelGrid) void {
+        self.allocator.free(self.data);
+    }
+
+    pub fn get(self: *const VoxelGrid, x: usize, y: usize, z: usize) ?u8 {
+        if (x >= self.dim_x or y >= self.dim_y or z >= self.dim_z) return null;
+        return self.data[x * self.dim_y * self.dim_z + y * self.dim_z + z];
+    }
+
+    pub fn set(self: *VoxelGrid, x: usize, y: usize, z: usize, value: u8) void {
+        if (x >= self.dim_x or y >= self.dim_y or z >= self.dim_z) return;
+        self.data[x * self.dim_y * self.dim_z + y * self.dim_z + z] = value;
+    }
+};
 
 pub const Particle = struct {
     position: Vector3D,
@@ -927,11 +1117,40 @@ pub const FluidCell = struct {
     velocity: Vector3D,
 };
 
-pub const FluidGrid = [64][64][64]FluidCell;
+pub const FluidGrid = struct {
+    data: []FluidCell,
+    dim_x: usize,
+    dim_y: usize,
+    dim_z: usize,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) !FluidGrid {
+        const dim_x: usize = 64;
+        const dim_y: usize = 64;
+        const dim_z: usize = 64;
+        const data = try allocator.alloc(FluidCell, dim_x * dim_y * dim_z);
+        @memset(data, .{ .density = .{ .value = 0 }, .velocity = .{ .x = .{ .value = 0 }, .y = .{ .value = 0 }, .z = .{ .value = 0 } } });
+        return .{ .data = data, .dim_x = dim_x, .dim_y = dim_y, .dim_z = dim_z, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *FluidGrid) void {
+        self.allocator.free(self.data);
+    }
+
+    pub fn get(self: *const FluidGrid, x: usize, y: usize, z: usize) ?*const FluidCell {
+        if (x >= self.dim_x or y >= self.dim_y or z >= self.dim_z) return null;
+        return &self.data[x * self.dim_y * self.dim_z + y * self.dim_z + z];
+    }
+
+    pub fn getPtr(self: *FluidGrid, x: usize, y: usize, z: usize) ?*FluidCell {
+        if (x >= self.dim_x or y >= self.dim_y or z >= self.dim_z) return null;
+        return &self.data[x * self.dim_y * self.dim_z + y * self.dim_z + z];
+    }
+};
 
 pub const NeuralLayer = struct {
-    weights: Tensor,
-    biases: Tensor,
+    weights: GenericTensor,
+    biases: GenericTensor,
     activation: *const fn (f32) f32,
 };
 
@@ -947,7 +1166,45 @@ pub const AntColonyPath = []usize;
 
 pub const AntColony = struct {
     ants: []AntColonyPath,
-    pheromone: Matrix4x4,
+    pheromone: []FixedPoint32,
+    node_count: usize,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, node_count: usize, ant_count: usize) !AntColony {
+        const pheromone = try allocator.alloc(FixedPoint32, node_count * node_count);
+        var idx: usize = 0;
+        while (idx < pheromone.len) : (idx += 1) {
+            pheromone[idx] = .{ .value = 0 };
+        }
+        const ants = try allocator.alloc(AntColonyPath, ant_count);
+        var ant_idx: usize = 0;
+        while (ant_idx < ant_count) : (ant_idx += 1) {
+            ants[ant_idx] = try allocator.alloc(usize, node_count);
+            @memset(ants[ant_idx], 0);
+        }
+        return .{
+            .ants = ants,
+            .pheromone = pheromone,
+            .node_count = node_count,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *AntColony) void {
+        for (self.ants) |ant_path| {
+            self.allocator.free(ant_path);
+        }
+        self.allocator.free(self.pheromone);
+        self.allocator.free(self.ants);
+    }
+
+    pub fn getPheromone(self: *const AntColony, from: usize, to: usize) FixedPoint32 {
+        return self.pheromone[from * self.node_count + to];
+    }
+
+    pub fn setPheromone(self: *AntColony, from: usize, to: usize, value: FixedPoint32) void {
+        self.pheromone[from * self.node_count + to] = value;
+    }
 };
 
 pub const SwarmParticle = struct {
@@ -1144,8 +1401,8 @@ pub const QuantizedTensor = struct {
 };
 
 pub const OptimizerState = struct {
-    params: []Tensor,
-    gradients: []Tensor,
+    params: []GenericTensor,
+    gradients: []GenericTensor,
     fisher_diag: []f32,
 };
 
@@ -1192,6 +1449,9 @@ pub const SSIHashTree = struct {
     fn deinitNode(self: *SSIHashTree, node: *HashNode) void {
         if (node.left) |left| self.deinitNode(left);
         if (node.right) |right| self.deinitNode(right);
+        for (node.value) |*seg| {
+            self.allocator.free(seg.tokens);
+        }
         self.allocator.free(node.value);
         self.allocator.destroy(node);
     }
@@ -1205,15 +1465,33 @@ pub const SSIHashTree = struct {
                 node = &n.right;
             } else {
                 const new_val = try self.allocator.realloc(n.value, n.value.len + 1);
-                new_val[n.value.len] = seg;
+                const duped_tokens = try self.allocator.dupe(u32, seg.tokens);
+                new_val[new_val.len - 1] = .{
+                    .tokens = duped_tokens,
+                    .score = seg.score,
+                    .position = seg.position,
+                    .anchor = seg.anchor,
+                };
                 n.value = new_val;
                 return;
             }
         }
-        const new_node = try self.allocator.create(HashNode);
+        const duped_tokens = try self.allocator.dupe(u32, seg.tokens);
+        const seg_copy = RankedSegment{
+            .tokens = duped_tokens,
+            .score = seg.score,
+            .position = seg.position,
+            .anchor = seg.anchor,
+        };
+        const new_val = try self.allocator.dupe(RankedSegment, &.{seg_copy});
+        const new_node = self.allocator.create(HashNode) catch {
+            self.allocator.free(duped_tokens);
+            self.allocator.free(new_val);
+            return error.OutOfMemory;
+        };
         new_node.* = .{
             .key = key,
-            .value = try self.allocator.dupe(RankedSegment, &.{seg}),
+            .value = new_val,
             .left = null,
             .right = null,
         };
@@ -1229,12 +1507,41 @@ pub const MorphGraphNode = struct {
 pub const RelevanceScore = FixedPoint32;
 
 pub const InferenceTrace = struct {
-    inputs: Tensor,
-    outputs: Tensor,
+    inputs: GenericTensor,
+    outputs: GenericTensor,
     proofs: []u8,
 };
 
-pub const Texture = [1024][1024]ColorRGBA;
+pub const Texture = struct {
+    data: []ColorRGBA,
+    width: usize,
+    height: usize,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, width: usize, height: usize) !Texture {
+        const data = try allocator.alloc(ColorRGBA, width * height);
+        var idx: usize = 0;
+        while (idx < data.len) : (idx += 1) {
+            data[idx] = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
+        }
+        return .{ .data = data, .width = width, .height = height, .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Texture) void {
+        self.allocator.free(self.data);
+    }
+
+    pub fn get(self: *const Texture, x: usize, y: usize) ?ColorRGBA {
+        if (x >= self.width or y >= self.height) return null;
+        return self.data[y * self.width + x];
+    }
+
+    pub fn set(self: *Texture, x: usize, y: usize, color: ColorRGBA) void {
+        if (x >= self.width or y >= self.height) return;
+        self.data[y * self.width + x] = color;
+    }
+};
+
 pub const ShaderProgram = u32;
 pub const RenderPipeline = []ShaderProgram;
 
@@ -1355,16 +1662,16 @@ test "FixedPoint16 arithmetic" {
     try testing.expectApproxEqAbs(@as(f32, 3.0), quot.toFloat(), 0.01);
 }
 
-test "Tensor operations" {
+test "GenericTensor operations" {
     const allocator = testing.allocator;
-    var tensor = try Tensor.init(allocator, &[_]usize{ 2, 3 }, f32);
+    var tensor = try GenericTensor.init(allocator, &[_]usize{ 2, 3 }, f32);
     defer tensor.deinit();
 
-    try Tensor.set(f32, &tensor, &[_]usize{ 0, 0 }, 1.0);
-    try Tensor.set(f32, &tensor, &[_]usize{ 1, 2 }, 5.0);
+    try GenericTensor.set(f32, &tensor, &[_]usize{ 0, 0 }, 1.0);
+    try GenericTensor.set(f32, &tensor, &[_]usize{ 1, 2 }, 5.0);
 
-    const val1 = try Tensor.get(f32, &tensor, &[_]usize{ 0, 0 });
-    const val2 = try Tensor.get(f32, &tensor, &[_]usize{ 1, 2 });
+    const val1 = try GenericTensor.get(f32, &tensor, &[_]usize{ 0, 0 });
+    const val2 = try GenericTensor.get(f32, &tensor, &[_]usize{ 1, 2 });
 
     try testing.expectEqual(@as(f32, 1.0), val1);
     try testing.expectEqual(@as(f32, 5.0), val2);
@@ -1430,6 +1737,9 @@ test "PRNG functionality" {
     const f = prng.float();
     try testing.expect(f >= 0.0 and f < 1.0);
 
+    const f64_val = prng.float64();
+    try testing.expect(f64_val >= 0.0 and f64_val < 1.0);
+
     const u = prng.uint64();
     try testing.expect(u > 0);
 
@@ -1460,11 +1770,11 @@ test "PRNG normal distribution" {
 }
 
 test "Utility functions" {
-    try testing.expectEqual(@as(usize, 120), factorial(5));
-    try testing.expectEqual(@as(usize, 10), binomial(5, 2));
+    try testing.expectEqual(@as(usize, 120), try factorial(5));
+    try testing.expectEqual(@as(usize, 10), try binomial(5, 2));
     try testing.expectEqual(@as(usize, 6), gcd(12, 18));
-    try testing.expectEqual(@as(usize, 36), lcm(12, 18));
-    try testing.expectEqual(@as(i32, 8), pow(i32, 2, 3));
+    try testing.expectEqual(@as(usize, 36), try lcm(12, 18));
+    try testing.expectEqual(@as(i32, 8), try pow(i32, 2, 3));
 }
 
 test "Math utility functions" {
@@ -1479,8 +1789,8 @@ test "Math utility functions" {
     try testing.expectEqual(@as(i32, 7), max(i32, 3, 7));
 
     const arr = [_]i32{ 1, 2, 3, 4, 5 };
-    try testing.expectEqual(@as(i32, 15), sum(i32, &arr));
-    try testing.expectEqual(@as(i32, 120), prod(i32, &arr));
+    try testing.expectEqual(@as(i32, 15), try sum(i32, &arr));
+    try testing.expectEqual(@as(i32, 120), try prod(i32, &arr));
 }
 
 test "Vector operations" {
@@ -1518,19 +1828,36 @@ test "ContextWindow" {
     var window = try ContextWindow.init(allocator, 10);
     defer window.deinit();
 
-    try window.add(1);
-    try window.add(2);
-    try window.add(3);
+    window.add(1);
+    window.add(2);
+    window.add(3);
 
     try testing.expectEqual(@as(usize, 3), window.size);
     try testing.expectEqual(@as(u32, 1), window.get(0).?);
     try testing.expectEqual(@as(u32, 2), window.get(1).?);
 
-    const slice = window.slice();
-    try testing.expectEqual(@as(usize, 3), slice.len);
+    const s = window.slice();
+    try testing.expectEqual(@as(usize, 3), s.len);
 
     window.clear();
     try testing.expectEqual(@as(usize, 0), window.size);
+}
+
+test "ContextWindow sliding" {
+    const allocator = testing.allocator;
+    var window = try ContextWindow.init(allocator, 3);
+    defer window.deinit();
+
+    window.add(1);
+    window.add(2);
+    window.add(3);
+    try testing.expectEqual(@as(usize, 3), window.size);
+
+    window.add(4);
+    try testing.expectEqual(@as(usize, 3), window.size);
+    try testing.expectEqual(@as(u32, 2), window.get(0).?);
+    try testing.expectEqual(@as(u32, 3), window.get(1).?);
+    try testing.expectEqual(@as(u32, 4), window.get(2).?);
 }
 
 test "RankedSegment" {
@@ -1583,4 +1910,86 @@ test "SSIHashTree" {
     try tree.insert(100, seg2);
 
     try testing.expect(tree.root != null);
+}
+
+test "BloomFilter" {
+    const allocator = testing.allocator;
+    var bf = try BloomFilter.init(allocator, 100, 3);
+    defer bf.deinit();
+
+    bf.add(42);
+    bf.add(100);
+    bf.add(999);
+
+    try testing.expect(bf.mightContain(42));
+    try testing.expect(bf.mightContain(100));
+    try testing.expect(bf.mightContain(999));
+}
+
+test "VoxelGrid" {
+    const allocator = testing.allocator;
+    var grid = try VoxelGrid.init(allocator);
+    defer grid.deinit();
+
+    grid.set(0, 0, 0, 42);
+    grid.set(31, 31, 31, 99);
+
+    try testing.expectEqual(@as(u8, 42), grid.get(0, 0, 0).?);
+    try testing.expectEqual(@as(u8, 99), grid.get(31, 31, 31).?);
+    try testing.expectEqual(@as(u8, 0), grid.get(5, 5, 5).?);
+}
+
+test "FluidGrid" {
+    const allocator = testing.allocator;
+    var grid = try FluidGrid.init(allocator);
+    defer grid.deinit();
+
+    grid.getPtr(0, 0, 0).?.density = try FixedPoint16.fromFloat(1.5);
+
+    try testing.expectApproxEqAbs(@as(f32, 1.5), grid.get(0, 0, 0).?.density.toFloat(), 0.01);
+}
+
+test "AntColony" {
+    const allocator = testing.allocator;
+    var colony = try AntColony.init(allocator, 5, 10);
+    defer colony.deinit();
+
+    try colony.setPheromone(0, 1, try FixedPoint32.fromFloat(0.5));
+    const p = colony.getPheromone(0, 1);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), p.toFloat(), 0.01);
+}
+
+test "Texture" {
+    const allocator = testing.allocator;
+    var tex = try Texture.init(allocator, 64, 64);
+    defer tex.deinit();
+
+    tex.set(10, 20, .{ .r = 255, .g = 128, .b = 0, .a = 255 });
+    const c = tex.get(10, 20).?;
+    try testing.expectEqual(@as(u8, 255), c.r);
+    try testing.expectEqual(@as(u8, 128), c.g);
+}
+
+test "factorial overflow" {
+    const result = factorial(100);
+    try testing.expectError(Error.Overflow, result);
+}
+
+test "pow overflow" {
+    const result = pow(u8, 2, 10);
+    try testing.expectError(Error.Overflow, result);
+}
+
+test "norm and lerp with floats" {
+    const vec = [_]f32{ 3.0, 4.0 };
+    const n = norm(f32, &vec);
+    try testing.expectApproxEqAbs(@as(f64, 5.0), n, 0.01);
+
+    const lerped = lerp(f32, 1.0, 3.0, 0.5);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), lerped, 0.01);
+}
+
+test "log2 with floats" {
+    const result = log2(f32, 8.0);
+    try testing.expectApproxEqAbs(@as(f64, 3.0), result, 0.01);
 }

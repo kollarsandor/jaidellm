@@ -751,8 +751,19 @@ pub const IllegalFlow = struct {
     const Self = @This();
 
     pub fn computeSeverity(self: *Self) void {
-        const diff = @intFromEnum(self.source_level) - @intFromEnum(self.target_level);
-        self.severity = @min(diff * SecurityProofsConfig.SEVERITY_MULTIPLIER, SecurityProofsConfig.SEVERITY_MAX);
+        const src = @intFromEnum(self.source_level);
+        const tgt = @intFromEnum(self.target_level);
+        if (src <= tgt) {
+            self.severity = 0;
+            return;
+        }
+        const diff: u8 = src - tgt;
+        const product = @mulWithOverflow(diff, SecurityProofsConfig.SEVERITY_MULTIPLIER);
+        if (product[1] != 0) {
+            self.severity = SecurityProofsConfig.SEVERITY_MAX;
+        } else {
+            self.severity = @min(product[0], SecurityProofsConfig.SEVERITY_MAX);
+        }
     }
 };
 
@@ -908,29 +919,24 @@ pub const InformationFlowAnalysis = struct {
         while (node_iter.next()) |entry| {
             const node_id = entry.key_ptr.*;
             var reachable = ArrayList(u64).init(self.allocator);
+            errdefer reachable.deinit();
 
             var visited = AutoHashMap(u64, void).init(self.allocator);
             defer visited.deinit();
 
-            var queue = ArrayList(u64).init(self.allocator);
-            defer queue.deinit();
+            var fifo = std.fifo.LinearFifo(u64, .Dynamic).init(self.allocator);
+            defer fifo.deinit();
 
-            try queue.append(node_id);
+            try visited.put(node_id, {});
+            try fifo.writeItem(node_id);
 
-            while (queue.items.len > 0) {
-                const current = queue.orderedRemove(0);
-
-                if (visited.contains(current)) continue;
-                try visited.put(current, {});
-
-                if (current != node_id) {
-                    try reachable.append(current);
-                }
-
+            while (fifo.readItem()) |current| {
                 const successors = self.flow_graph.getSuccessors(current);
                 for (successors) |succ| {
                     if (!visited.contains(succ)) {
-                        try queue.append(succ);
+                        try visited.put(succ, {});
+                        try reachable.append(succ);
+                        try fifo.writeItem(succ);
                     }
                 }
             }
@@ -1046,6 +1052,53 @@ pub const InformationFlowAnalysis = struct {
     pub fn isSecure(self: *Self) !bool {
         _ = try self.detectIllegalFlows();
         return self.illegal_flows.items.len == 0;
+    }
+
+    pub fn getFlowSeverity(self: *Self, source_id: u64, target_id: u64) ?u8 {
+        for (self.illegal_flows.items) |flow| {
+            if (flow.source_id == source_id and flow.target_id == target_id) {
+                return flow.severity;
+            }
+        }
+        return null;
+    }
+
+    pub fn computeInferenceSeverity(self: *Self, source_id: u64, target_id: u64) u8 {
+        const source_level = self.flow_graph.nodes.get(source_id) orelse return 0;
+        const target_level = self.flow_graph.nodes.get(target_id) orelse return 0;
+        if (!source_level.greaterThan(target_level)) return 0;
+        var flow = IllegalFlow{
+            .source_id = source_id,
+            .target_id = target_id,
+            .source_level = source_level,
+            .target_level = target_level,
+            .flow_type = .IMPLICIT,
+            .severity = 0,
+        };
+        flow.computeSeverity();
+        return flow.severity;
+    }
+
+    pub fn assessInferenceRisk(self: *Self) !usize {
+        if (!self.closure_computed) {
+            try self.computeSecurityClosure();
+        }
+        var high_severity_count: usize = 0;
+        var reach_iter = self.reachability.iterator();
+        while (reach_iter.next()) |entry| {
+            const source_id = entry.key_ptr.*;
+            const source_level = self.flow_graph.nodes.get(source_id) orelse continue;
+            for (entry.value_ptr.items) |target_id| {
+                const target_level = self.flow_graph.nodes.get(target_id) orelse continue;
+                if (source_level.greaterThan(target_level)) {
+                    const severity = self.computeInferenceSeverity(source_id, target_id);
+                    if (severity >= SecurityProofsConfig.SEVERITY_MAX / 2) {
+                        high_severity_count += 1;
+                    }
+                }
+            }
+        }
+        return high_severity_count;
     }
 };
 
@@ -3575,3 +3628,5 @@ test "SecurityProofEngine integrity proof" {
     try std.testing.expect(proof.proof_type == .INTEGRITY);
     try std.testing.expect(proof.is_valid);
 }
+
+================

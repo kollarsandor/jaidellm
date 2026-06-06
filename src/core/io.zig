@@ -32,6 +32,7 @@ pub const IoError = error{
     Overflow,
     PathTooLong,
     InvalidBufferSize,
+    ResourceReleased,
 };
 
 fn generateRuntimeSeed() u64 {
@@ -78,6 +79,8 @@ pub const MMAP = struct {
     is_writable: bool,
     actual_size: usize,
     mutex: std.Thread.Mutex,
+    released: bool,
+    last_read: ?[]u8,
 
     pub fn open(allocator: Allocator, path: []const u8, mode: fs.File.OpenFlags) !MMAP {
         const file = try fs.cwd().openFile(path, mode);
@@ -135,12 +138,20 @@ pub const MMAP = struct {
             .is_writable = is_writable,
             .actual_size = file_size,
             .mutex = .{},
+            .released = false,
+            .last_read = null,
         };
     }
 
     pub fn close(self: *MMAP) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.released) return;
+        self.released = true;
+        if (self.last_read) |lr| {
+            self.allocator.free(lr);
+            self.last_read = null;
+        }
         if (self.buffer) |buf| {
             std.posix.munmap(buf);
             self.buffer = null;
@@ -148,14 +159,38 @@ pub const MMAP = struct {
         self.file.close();
     }
 
-    pub fn read(self: *MMAP, offset: usize, len: usize) ![]const u8 {
+    pub fn deinit(self: *MMAP) void {
+        self.close();
+    }
+
+    pub fn read(self: *MMAP, offset: usize, len: usize) ![]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.released) return IoError.ResourceReleased;
         const buf = self.buffer orelse return IoError.BufferNotMapped;
         if (offset > self.actual_size) return IoError.OutOfBounds;
         const end = try addChecked(offset, len);
         const read_end = @min(end, self.actual_size);
-        const result = try self.allocator.alloc(u8, read_end - offset);
+        const actual_len = read_end - offset;
+        if (self.last_read) |lr| {
+            self.allocator.free(lr);
+            self.last_read = null;
+        }
+        const result = try self.allocator.alloc(u8, actual_len);
+        @memcpy(result, buf[offset..read_end]);
+        self.last_read = result;
+        return result;
+    }
+
+    pub fn copyRead(self: *MMAP, allocator: Allocator, offset: usize, len: usize) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.released) return IoError.ResourceReleased;
+        const buf = self.buffer orelse return IoError.BufferNotMapped;
+        if (offset > self.actual_size) return IoError.OutOfBounds;
+        const end = try addChecked(offset, len);
+        const read_end = @min(end, self.actual_size);
+        const result = try allocator.alloc(u8, read_end - offset);
         @memcpy(result, buf[offset..read_end]);
         return result;
     }
@@ -168,6 +203,7 @@ pub const MMAP = struct {
     pub fn write(self: *MMAP, offset: usize, data: []const u8, sync_mode: SyncMode) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.released) return IoError.ResourceReleased;
         if (!self.is_writable) return IoError.ReadOnlyFile;
         const buf = self.buffer orelse return IoError.BufferNotMapped;
         if (offset > self.actual_size) return IoError.OutOfBounds;
@@ -182,6 +218,7 @@ pub const MMAP = struct {
     pub fn append(self: *MMAP, data: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.released) return IoError.ResourceReleased;
         if (!self.is_writable) return IoError.ReadOnlyFile;
         const buf = self.buffer orelse return IoError.BufferNotMapped;
 
@@ -190,10 +227,9 @@ pub const MMAP = struct {
         if (new_size > IoConfig.MAX_FILE_SIZE) return error.FileTooLarge;
 
         try self.file.setEndPos(new_size);
-        try self.file.pwriteAll(data, current_size);
+        errdefer self.file.setEndPos(current_size) catch {};
 
-        std.posix.munmap(buf);
-        self.buffer = null;
+        try self.file.pwriteAll(data, current_size);
 
         const aligned_size = mem.alignForward(usize, new_size, IoConfig.PAGE_SIZE);
 
@@ -201,15 +237,18 @@ pub const MMAP = struct {
         if (self.is_writable) prot_flags |= std.posix.PROT.WRITE;
         const map_flags: u32 = if (self.is_writable) std.posix.MAP.SHARED else std.posix.MAP.PRIVATE;
 
-        const new_buf = try std.posix.mmap(
+        const new_buf = std.posix.mmap(
             null,
             aligned_size,
             prot_flags,
             map_flags,
             self.file.handle,
             0
-        );
+        ) catch {
+            return IoError.BufferNotMapped;
+        };
 
+        std.posix.munmap(buf);
         self.buffer = new_buf;
         self.actual_size = new_size;
     }
@@ -217,6 +256,7 @@ pub const MMAP = struct {
     pub fn sync(self: *MMAP) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (self.released) return IoError.ResourceReleased;
         const buf = self.buffer orelse return IoError.BufferNotMapped;
         try std.posix.msync(buf, std.posix.MSF.SYNC);
     }
@@ -298,7 +338,22 @@ pub const DurableWriter = struct {
     }
 
     pub fn writeAll(self: *DurableWriter, data: []const u8) !void {
-        try self.write(data);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.flushInternal();
+        var remaining = data;
+        while (remaining.len > 0) {
+            const space = self.buffer.len - self.pos;
+            if (space == 0) {
+                try self.flushInternal();
+                continue;
+            }
+            const to_copy = @min(remaining.len, space);
+            @memcpy(self.buffer[self.pos..self.pos + to_copy], remaining[0..to_copy]);
+            self.pos += to_copy;
+            remaining = remaining[to_copy..];
+        }
+        try self.flushInternal();
     }
 };
 
@@ -415,6 +470,9 @@ pub const BufferedReader = struct {
                 if (mem.indexOfScalar(u8, chunk, '\n')) |idx| {
                     try list.appendSlice(chunk[0..idx]);
                     self.pos += idx + 1;
+                    if (list.items.len > 0 and list.items[list.items.len - 1] == '\r') {
+                        _ = list.pop();
+                    }
                     return list.toOwnedSlice();
                 } else {
                     try list.appendSlice(chunk);
@@ -423,6 +481,9 @@ pub const BufferedReader = struct {
             } else {
                 if (!try self.fillBuffer()) {
                     if (list.items.len == 0) return null;
+                    if (list.items.len > 0 and list.items[list.items.len - 1] == '\r') {
+                        _ = list.pop();
+                    }
                     return list.toOwnedSlice();
                 }
             }
@@ -508,6 +569,13 @@ pub const BufferedWriter = struct {
             self.pos = 0;
         }
     }
+
+    pub fn sync(self: *BufferedWriter) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.flushInternal();
+        try self.file.sync();
+    }
 };
 
 pub fn stableHash(data: []const u8, seed: u64) u64 {
@@ -517,20 +585,20 @@ pub fn stableHash(data: []const u8, seed: u64) u64 {
 }
 
 var g_hash_seed_initialized = std.atomic.Value(bool).init(false);
-var g_hash_seed: u64 = undefined;
+var g_hash_seed = std.atomic.Value(u64).init(0);
 var g_hash_seed_mutex: std.Thread.Mutex = .{};
 
 fn getHashSeed() u64 {
     if (g_hash_seed_initialized.load(.acquire)) {
-        return g_hash_seed;
+        return g_hash_seed.load(.acquire);
     }
     g_hash_seed_mutex.lock();
     defer g_hash_seed_mutex.unlock();
     if (!g_hash_seed_initialized.load(.acquire)) {
-        g_hash_seed = generateRuntimeSeed();
+        g_hash_seed.store(generateRuntimeSeed(), .release);
         g_hash_seed_initialized.store(true, .release);
     }
-    return g_hash_seed;
+    return g_hash_seed.load(.acquire);
 }
 
 pub fn hash64(data: []const u8) u64 {
@@ -636,9 +704,18 @@ pub fn copyFileWithProgress(
     defer src_file.close();
 
     const dst_file = try fs.cwd().createFile(dst, .{ .truncate = true, .mode = IoConfig.SECURE_FILE_MODE });
+    var dst_closed = false;
     errdefer {
-        dst_file.close();
+        if (!dst_closed) {
+            dst_file.close();
+            dst_closed = true;
+        }
         fs.cwd().deleteFile(dst) catch {};
+    }
+    defer {
+        if (!dst_closed) {
+            dst_file.close();
+        }
     }
 
     const stat = try src_file.stat();
@@ -659,7 +736,6 @@ pub fn copyFileWithProgress(
     }
 
     try dst_file.sync();
-    dst_file.close();
 }
 
 pub fn moveFile(allocator: Allocator, old: []const u8, new: []const u8) !void {
@@ -759,15 +835,18 @@ pub inline fn fromBigEndian(T: type, bytes: *const [@sizeOf(T)]u8) T {
     return mem.readInt(T, bytes, .big);
 }
 
+var sequential_write_mutex: std.Thread.Mutex = .{};
+
 pub fn sequentialWrite(allocator: Allocator, path: []const u8, data: []const []const u8) !void {
+    sequential_write_mutex.lock();
+    defer sequential_write_mutex.unlock();
     var writer = try BufferedWriter.init(allocator, path, IoConfig.LARGE_CHUNK_SIZE);
     defer writer.deinit();
 
     for (data) |chunk| {
         try writer.writeBytes(chunk);
     }
-    try writer.flush();
-    try writer.file.sync();
+    try writer.sync();
 }
 
 pub fn sequentialRead(allocator: Allocator, path: []const u8, chunk_callback: *const fn([]const u8) anyerror!void) !void {
@@ -896,6 +975,31 @@ test "BufferedReader zero init" {
     try std.testing.expectEqualStrings("line3", line3);
 }
 
+test "BufferedReader readLine strips carriage return" {
+    const gpa = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile("test_crlf.txt", .{});
+    try file.writeAll("line1\r\nline2\r\nline3");
+    file.close();
+
+    var reader = try BufferedReader.initWithDir(tmp_dir.dir, "test_crlf.txt");
+    defer reader.deinit();
+
+    const line1 = (try reader.readLine(gpa)).?;
+    defer gpa.free(line1);
+    try std.testing.expectEqualStrings("line1", line1);
+
+    const line2 = (try reader.readLine(gpa)).?;
+    defer gpa.free(line2);
+    try std.testing.expectEqualStrings("line2", line2);
+
+    const line3 = (try reader.readLine(gpa)).?;
+    defer gpa.free(line3);
+    try std.testing.expectEqualStrings("line3", line3);
+}
+
 test "Stable hash mixing" {
     const data = "test";
     const seed: u64 = 12345;
@@ -920,4 +1024,18 @@ test "Atomic write" {
     const content = try readFile(gpa, test_path);
     defer gpa.free(content);
     try std.testing.expectEqualStrings("data", content);
+}
+
+test "MMAP deinit prevents double close" {
+    const gpa = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const file = try tmp_dir.dir.createFile("test_mmap_deinit.bin", .{});
+    try file.writeAll("test deinit safety");
+    file.close();
+
+    var mmap = try MMAP.openWithDir(gpa, tmp_dir.dir, "test_mmap_deinit.bin", .{ .mode = .read_only });
+    mmap.deinit();
+    mmap.deinit();
 }

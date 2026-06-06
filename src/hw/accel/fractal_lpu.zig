@@ -50,7 +50,6 @@ pub const FractalTile = struct {
 
     pub fn init(allocator: Allocator, level: usize, base: u64, size: usize, coherence: f64) !Self {
         const clamped_coherence = @max(0.0, @min(1.0, coherence));
-        const safe_level: u5 = @intCast(@min(level, 31));
         const arbiter_id: u32 = @intCast(level);
         const num_children: usize = 4;
         const children = try allocator.alloc(?*FractalTile, num_children);
@@ -63,7 +62,6 @@ pub const FractalTile = struct {
         while (i < num_cu) : (i += 1) {
             compute_units[i] = ComputeUnit.init(i, base + i * cu_size);
         }
-        _ = safe_level;
         return Self{
             .level = level,
             .base_addr = base,
@@ -206,13 +204,14 @@ pub const FractalLPU = struct {
     }
 
     fn mapNodeToTile(self: *Self, tile: *FractalTile, hash: u64, weight: f64) !void {
+        if (tile.level >= self.config.box_counting_levels) return;
         try tile.mapSSRGNode(hash, weight);
         if (weight > self.config.coherence_threshold) {
-            for (tile.children) |child_opt| {
-                if (child_opt) |child| {
+            var idx: usize = 0;
+            while (idx < tile.children.len) : (idx += 1) {
+                if (tile.children[idx]) |child| {
                     const child_weight = weight * 0.9;
                     try self.mapNodeToTile(child, hash, child_weight);
-                    break;
                 }
             }
         }
@@ -250,3 +249,5 @@ pub const FractalLPU = struct {
         return count;
     }
 };
+
+================

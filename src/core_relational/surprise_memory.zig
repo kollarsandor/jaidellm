@@ -36,8 +36,13 @@ fn sanitizeThreshold(value: f64) f64 {
     return sanitizeUnit(value, DEFAULT_SURPRISE_THRESHOLD);
 }
 
-fn stableNow(previous: ?i128) i128 {
-    const observed = std.time.nanoTimestamp();
+fn monotonicNowNs() i128 {
+    const instant = std.time.Instant.now() catch return std.time.nanoTimestamp();
+    return @as(i128, @intCast(instant.since(std.time.Instant.unix_epoch catch unreachable)));
+}
+
+fn stableMonotonicNow(previous: ?i128) i128 {
+    const observed = monotonicNowNs();
     if (previous) |prior| {
         if (observed < prior) return prior;
     }
@@ -79,12 +84,12 @@ pub const SurpriseRecord = struct {
     last_access_time: i128,
     retention_priority: f64,
     access_frequency: usize,
+    monotonic_created: i128,
 
-    fn recomputeRetention(self: *SurpriseRecord, now: i128) void {
-        const effective_now = if (now < self.last_access_time) self.last_access_time else now;
-        const age_ns = effective_now - self.last_access_time;
-        const clamped_age: i64 = @intCast(@min(age_ns, @as(i128, std.math.maxInt(i64))));
-        const age_ms: f64 = @as(f64, @floatFromInt(clamped_age)) / NANOSECONDS_TO_MILLISECONDS;
+    fn recomputeRetention(self: *SurpriseRecord, now_monotonic: i128) void {
+        const effective_now = if (now_monotonic < self.monotonic_created) self.monotonic_created else now_monotonic;
+        const age_ns = effective_now - self.monotonic_created;
+        const age_ms: f64 = @as(f64, @floatFromInt(@as(i64, @intCast(@min(age_ns, @as(i128, std.math.maxInt(i64))))))) / NANOSECONDS_TO_MILLISECONDS;
         const recency_factor = 1.0 / (1.0 + age_ms);
         const freq_f: f64 = @floatFromInt(self.access_frequency);
         const frequency_factor = freq_f / (freq_f + FREQUENCY_SATURATION);
@@ -92,8 +97,7 @@ pub const SurpriseRecord = struct {
         self.retention_priority = sanitizeUnit(self.surprise_score, 0.0) * sanitizeUnit(weight, 1.0);
     }
 
-    pub fn init(block_id: [HASH_SIZE]u8, score: f64) SurpriseRecord {
-        const now = stableNow(null);
+    pub fn init(block_id: [HASH_SIZE]u8, score: f64, now: i128) SurpriseRecord {
         var record = SurpriseRecord{
             .block_id = block_id,
             .surprise_score = sanitizeUnit(score, 0.0),
@@ -101,20 +105,22 @@ pub const SurpriseRecord = struct {
             .last_access_time = now,
             .retention_priority = 0.0,
             .access_frequency = 1,
+            .monotonic_created = now,
         };
         record.recomputeRetention(now);
         return record;
     }
 
-    pub fn updateRetention(self: *SurpriseRecord) void {
-        self.recomputeRetention(stableNow(self.last_access_time));
+    pub fn updateRetention(self: *SurpriseRecord, now: i128) void {
+        const effective_now = if (now < self.last_access_time) self.last_access_time else now;
+        self.recomputeRetention(effective_now);
     }
 
-    pub fn recordAccess(self: *SurpriseRecord) void {
-        const now = stableNow(self.last_access_time);
+    pub fn recordAccess(self: *SurpriseRecord, now: i128) void {
+        const effective_now = if (now < self.last_access_time) self.last_access_time else now;
         self.access_frequency += 1;
-        self.last_access_time = now;
-        self.recomputeRetention(now);
+        self.last_access_time = effective_now;
+        self.recomputeRetention(effective_now);
     }
 
     pub fn getRetentionPriority(self: *const SurpriseRecord) f64 {
@@ -156,7 +162,6 @@ pub const SurpriseMemoryStatistics = struct {
         self.total_surprise_sum += score;
         if (score > clean_threshold) {
             self.high_surprise_blocks += 1;
-            self.novel_block_allocations += 1;
         } else {
             self.low_surprise_blocks += 1;
         }
@@ -176,7 +181,6 @@ pub const SurpriseMemoryStatistics = struct {
         }
         if (score > clean_threshold) {
             if (self.high_surprise_blocks > 0) self.high_surprise_blocks -= 1;
-            if (self.novel_block_allocations > 0) self.novel_block_allocations -= 1;
         } else {
             if (self.low_surprise_blocks > 0) self.low_surprise_blocks -= 1;
         }
@@ -198,6 +202,14 @@ const CandidateItem = struct {
     priority: f64,
 };
 
+pub const InferenceSurpriseResult = struct {
+    surprise_metrics: SurpriseMetrics,
+    should_cache: bool,
+    should_propagate: bool,
+    retention_priority: f64,
+    block_id: ?[HASH_SIZE]u8,
+};
+
 pub const SurpriseMemoryManager = struct {
     storage: *ContentAddressableStorage,
     flow_analyzer: *DataFlowAnalyzer,
@@ -208,8 +220,15 @@ pub const SurpriseMemoryManager = struct {
     mutex: Mutex,
     owns_storage: bool,
     owns_analyzer: bool,
+    monotonic_epoch: i128,
 
     const Self = @This();
+
+    fn stableNow(self: *Self) i128 {
+        const now = stableMonotonicNow(self.monotonic_epoch);
+        self.monotonic_epoch = now;
+        return now;
+    }
 
     fn computeContentHash(data: []const u8) [HASH_SIZE]u8 {
         var hash_out: [32]u8 = undefined;
@@ -301,12 +320,23 @@ pub const SurpriseMemoryManager = struct {
     }
 
     fn recomputeStatisticsLocked(self: *Self) void {
+        const saved_novel = self.statistics.novel_block_allocations;
+        const saved_evictions = self.statistics.evictions_due_to_low_surprise;
         var stats = SurpriseMemoryStatistics.init(self.surprise_threshold);
-        stats.evictions_due_to_low_surprise = self.statistics.evictions_due_to_low_surprise;
+        stats.novel_block_allocations = saved_novel;
+        stats.evictions_due_to_low_surprise = saved_evictions;
         var iter = self.surprise_records.iterator();
         while (iter.next()) |entry| {
-            stats.addBlock(entry.value_ptr.surprise_score, self.surprise_threshold);
+            const score = sanitizeUnit(entry.value_ptr.surprise_score, 0.0);
+            stats.total_blocks += 1;
+            stats.total_surprise_sum += score;
+            if (score > stats.surprise_threshold) {
+                stats.high_surprise_blocks += 1;
+            } else {
+                stats.low_surprise_blocks += 1;
+            }
         }
+        stats.recalculateAverage();
         self.statistics = stats;
     }
 
@@ -317,7 +347,7 @@ pub const SurpriseMemoryManager = struct {
         var samples: usize = 0;
         var iter = self.surprise_records.iterator();
         while (iter.next()) |entry| {
-            const ts = entry.value_ptr.last_access_time;
+            const ts = entry.value_ptr.monotonic_created;
             const age_ns = if (now > ts) now - ts else @as(i128, 0);
             const bounded_age = @min(age_ns, TEMPORAL_NOVELTY_WINDOW_NS);
             total_age += @as(f64, @floatFromInt(bounded_age));
@@ -364,7 +394,7 @@ pub const SurpriseMemoryManager = struct {
         return .{ .min_jaccard = min_jaccard_dist, .min_hash = min_hash_dist, .compared = compared };
     }
 
-    fn computeSurpriseLocked(self: *Self, new_data: []const u8, exclude_block_id: ?[HASH_SIZE]u8) !SurpriseMetrics {
+    fn computeSurpriseLocked(self: *Self, new_data: []const u8, exclude_block_id: ?[HASH_SIZE]u8, now: i128) !SurpriseMetrics {
         if (new_data.len > MAX_INPUT_SIZE) {
             return error.InputTooLarge;
         }
@@ -373,7 +403,6 @@ pub const SurpriseMemoryManager = struct {
             return SurpriseMetrics.init(1.0, 1.0, 1.0);
         }
 
-        const now = stableNow(null);
         const sample = try self.sampleExistingBlocksLocked(new_data, exclude_block_id);
         if (sample.compared == 0) {
             return SurpriseMetrics.init(1.0, 1.0, 1.0);
@@ -383,9 +412,10 @@ pub const SurpriseMemoryManager = struct {
     }
 
     fn refreshRecordPrioritiesLocked(self: *Self) void {
+        const now_mono = self.stableNow();
         var iter = self.surprise_records.iterator();
         while (iter.next()) |entry| {
-            entry.value_ptr.updateRetention();
+            entry.value_ptr.recomputeRetention(now_mono);
         }
     }
 
@@ -405,6 +435,53 @@ pub const SurpriseMemoryManager = struct {
         return lexLessThan(a.block_id, b.block_id);
     }
 
+    fn siftDownMaxHeap(items: []CandidateItem, root: usize, end: usize) void {
+        var r = root;
+        while (true) {
+            const left = 2 * r + 1;
+            if (left >= end) break;
+            const right = left + 1;
+            var largest = r;
+            if (candidateLess({}, items[largest], items[left])) {
+                largest = left;
+            }
+            if (right < end and candidateLess({}, items[largest], items[right])) {
+                largest = right;
+            }
+            if (largest == r) break;
+            const tmp = items[r];
+            items[r] = items[largest];
+            items[largest] = tmp;
+            r = largest;
+        }
+    }
+
+    fn partialSort(items: []CandidateItem, k: usize) void {
+        if (items.len <= 1 or k == 0) return;
+        const effective_k = @min(k, items.len);
+
+        var i: usize = effective_k / 2;
+        while (i > 0) : (i -= 1) {
+            siftDownMaxHeap(items, i - 1, effective_k);
+        }
+
+        var j: usize = effective_k;
+        while (j < items.len) : (j += 1) {
+            if (candidateLess({}, items[j], items[0])) {
+                items[0] = items[j];
+                siftDownMaxHeap(items, 0, effective_k);
+            }
+        }
+
+        var end: usize = effective_k;
+        while (end > 1) : (end -= 1) {
+            const tmp = items[0];
+            items[0] = items[end - 1];
+            items[end - 1] = tmp;
+            siftDownMaxHeap(items, 0, end - 1);
+        }
+    }
+
     pub fn init(allocator: Allocator, storage: *ContentAddressableStorage, analyzer: *DataFlowAnalyzer) Self {
         _ = MemoryBlock;
         _ = MemoryBlockState;
@@ -419,6 +496,7 @@ pub const SurpriseMemoryManager = struct {
             .mutex = Mutex{},
             .owns_storage = false,
             .owns_analyzer = false,
+            .monotonic_epoch = monotonicNowNs(),
         };
     }
 
@@ -430,8 +508,6 @@ pub const SurpriseMemoryManager = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         self.surprise_records.deinit();
         if (self.owns_storage) {
             self.storage.deinit();
@@ -457,15 +533,17 @@ pub const SurpriseMemoryManager = struct {
     pub fn computeSurprise(self: *Self, new_data: []const u8) !SurpriseMetrics {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.computeSurpriseLocked(new_data, null);
+        const now = self.stableNow();
+        return self.computeSurpriseLocked(new_data, null, now);
     }
 
-    fn storeBlockInternal(self: *Self, data: []const u8, preferred_core: ?usize, surprise: SurpriseMetrics) ![HASH_SIZE]u8 {
+    fn storeBlockInternal(self: *Self, data: []const u8, preferred_core: ?usize, surprise: SurpriseMetrics, now: i128) ![HASH_SIZE]u8 {
         const block_id = try self.storage.store(data, preferred_core);
         errdefer _ = self.storage.removeBlock(block_id);
-        const record = SurpriseRecord.init(block_id, surprise.combined_surprise);
+        const record = SurpriseRecord.init(block_id, surprise.combined_surprise, now);
         try self.surprise_records.put(block_id, record);
         self.statistics.addBlock(surprise.combined_surprise, self.surprise_threshold);
+        self.statistics.novel_block_allocations += 1;
         return block_id;
     }
 
@@ -479,23 +557,20 @@ pub const SurpriseMemoryManager = struct {
 
         if (self.storage.retrieveByContent(data)) |block_id| {
             if (self.surprise_records.getPtr(block_id)) |record| {
-                record.recordAccess();
+                record.recordAccess(self.stableNow());
                 return block_id;
             }
 
-            const recovered_surprise = try self.computeSurpriseLocked(data, block_id);
-            try self.surprise_records.put(block_id, SurpriseRecord.init(block_id, recovered_surprise.combined_surprise));
+            const now = self.stableNow();
+            const recovered_surprise = try self.computeSurpriseLocked(data, block_id, now);
+            try self.surprise_records.put(block_id, SurpriseRecord.init(block_id, recovered_surprise.combined_surprise, now));
             self.statistics.addBlock(recovered_surprise.combined_surprise, self.surprise_threshold);
             return block_id;
         }
 
-        const surprise = try self.computeSurpriseLocked(data, null);
-        return try self.storeBlockInternal(data, preferred_core, surprise);
-    }
-
-    fn partialSort(items: []CandidateItem, k: usize) void {
-        if (items.len <= 1 or k == 0) return;
-        std.mem.sort(CandidateItem, items, {}, candidateLess);
+        const now = self.stableNow();
+        const surprise = try self.computeSurpriseLocked(data, null, now);
+        return try self.storeBlockInternal(data, preferred_core, surprise, now);
     }
 
     pub fn evictLowSurpriseBlocks(self: *Self, target_capacity: usize) !usize {
@@ -540,17 +615,18 @@ pub const SurpriseMemoryManager = struct {
     }
 
     pub fn organizeByEntanglement(self: *Self) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var high_surprise_ids = ArrayList([HASH_SIZE]u8).init(self.allocator);
         errdefer high_surprise_ids.deinit();
 
-        self.mutex.lock();
         var iter = self.surprise_records.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.surprise_score > self.surprise_threshold and high_surprise_ids.items.len < MAX_ENTANGLEMENT_PAIRS) {
                 try high_surprise_ids.append(entry.key_ptr.*);
             }
         }
-        self.mutex.unlock();
         defer high_surprise_ids.deinit();
 
         var entangled_pairs: usize = 0;
@@ -573,19 +649,7 @@ pub const SurpriseMemoryManager = struct {
         return self.statistics;
     }
 
-    pub fn getStatisticsConst(self: *Self) SurpriseMemoryStatistics {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.statistics;
-    }
-
     pub fn getSurpriseRecord(self: *Self, block_id: [HASH_SIZE]u8) ?SurpriseRecord {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.surprise_records.get(block_id);
-    }
-
-    pub fn getSurpriseRecordConst(self: *Self, block_id: [HASH_SIZE]u8) ?SurpriseRecord {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.surprise_records.get(block_id);
@@ -601,6 +665,57 @@ pub const SurpriseMemoryManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.surprise_records.count();
+    }
+
+    pub fn processInferenceInput(self: *Self, input_data: []const u8, preferred_core: ?usize) !InferenceSurpriseResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (input_data.len > MAX_INPUT_SIZE) {
+            return error.InputTooLarge;
+        }
+
+        const now = self.stableNow();
+        const metrics = try self.computeSurpriseLocked(input_data, null, now);
+        const should_cache = metrics.combined_surprise > self.surprise_threshold;
+        const should_propagate = metrics.combined_surprise > self.surprise_threshold * 0.5;
+
+        var retention: f64 = 0.0;
+        var cached_block_id: ?[HASH_SIZE]u8 = null;
+
+        if (self.storage.retrieveByContent(input_data)) |block_id| {
+            if (self.surprise_records.getPtr(block_id)) |record| {
+                retention = record.retention_priority;
+                record.recordAccess(now);
+            }
+            cached_block_id = block_id;
+        } else if (should_cache) {
+            const block_id = try self.storeBlockInternal(input_data, preferred_core, metrics, now);
+            retention = sanitizeUnit(metrics.combined_surprise, 0.0);
+            cached_block_id = block_id;
+        }
+
+        return InferenceSurpriseResult{
+            .surprise_metrics = metrics,
+            .should_cache = should_cache,
+            .should_propagate = should_propagate,
+            .retention_priority = retention,
+            .block_id = cached_block_id,
+        };
+    }
+
+    pub fn cacheInferenceResult(self: *Self, input_data: []const u8, output_data: []const u8, preferred_core: ?usize) ![HASH_SIZE]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var combined = ArrayList(u8).init(self.allocator);
+        defer combined.deinit();
+        try combined.appendSlice(input_data);
+        try combined.appendSlice(output_data);
+
+        const now = self.stableNow();
+        const surprise = try self.computeSurpriseLocked(combined.items, null, now);
+        return try self.storeBlockInternal(combined.items, preferred_core, surprise, now);
     }
 };
 
@@ -636,9 +751,10 @@ test "surprise_metrics_validation" {
 }
 
 test "surprise_record_retention" {
-    var record = SurpriseRecord.init([_]u8{0} ** HASH_SIZE, 0.8);
+    const now = monotonicNowNs();
+    var record = SurpriseRecord.init([_]u8{0} ** HASH_SIZE, 0.8, now);
     const initial_priority = record.getRetentionPriority();
-    record.recordAccess();
+    record.recordAccess(stableMonotonicNow(now));
     try std.testing.expectEqual(@as(usize, 2), record.getAccessFrequency());
     try std.testing.expect(record.getRetentionPriority() >= initial_priority);
 }
@@ -654,6 +770,7 @@ test "statistics_incremental_update" {
     stats.removeBlock(0.8, 0.5);
     try std.testing.expectEqual(@as(usize, 1), stats.total_blocks);
     try std.testing.expectEqual(@as(usize, 0), stats.high_surprise_blocks);
+    try std.testing.expectEqual(@as(usize, 0), stats.novel_block_allocations);
 }
 
 test "hash_distance_calculation" {

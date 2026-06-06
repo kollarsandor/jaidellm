@@ -90,6 +90,136 @@ pub const ExtractionStage = enum(u8) {
     }
 };
 
+const WordToken = struct {
+    text: []const u8,
+    start: usize,
+    end: usize,
+};
+
+const MorphemeMatch = struct {
+    match_start: usize,
+    match_end: usize,
+};
+
+fn tokenizeIntoWords(text: []const u8, tokens: *ArrayList(WordToken)) !void {
+    var i: usize = 0;
+    while (i < text.len) {
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r' or text[i] == ',' or text[i] == ';' or text[i] == ':')) {
+            i += 1;
+        }
+        if (i >= text.len) break;
+        const start = i;
+        while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\n' and text[i] != '\r' and text[i] != ',' and text[i] != ';' and text[i] != ':') {
+            i += 1;
+        }
+        if (start < i) {
+            try tokens.append(.{ .text = text[start..i], .start = start, .end = i });
+        }
+    }
+}
+
+fn stemWord(word: []const u8) []const u8 {
+    if (word.len > 5 and std.mem.endsWith(u8, word, "ting")) {
+        return word[0 .. word.len - 4];
+    }
+    if (word.len > 4 and std.mem.endsWith(u8, word, "ing")) {
+        if (word.len > 5 and word[word.len - 4] == word[word.len - 5]) {
+            return word[0 .. word.len - 4];
+        }
+        return word[0 .. word.len - 3];
+    }
+    if (word.len > 4 and std.mem.endsWith(u8, word, "ated")) {
+        return word[0 .. word.len - 4];
+    }
+    if (word.len > 3 and std.mem.endsWith(u8, word, "ed")) {
+        if (word.len > 4 and word[word.len - 3] == word[word.len - 4]) {
+            return word[0 .. word.len - 3];
+        }
+        return word[0 .. word.len - 2];
+    }
+    if (word.len > 4 and std.mem.endsWith(u8, word, "ies")) {
+        return word[0 .. word.len - 3];
+    }
+    if (word.len > 4 and std.mem.endsWith(u8, word, "ches") or (word.len > 4 and std.mem.endsWith(u8, word, "shes")) or (word.len > 4 and std.mem.endsWith(u8, word, "sses"))) {
+        return word[0 .. word.len - 2];
+    }
+    if (word.len > 3 and std.mem.endsWith(u8, word, "es")) {
+        return word[0 .. word.len - 2];
+    }
+    if (word.len > 2 and std.mem.endsWith(u8, word, "s") and !std.mem.endsWith(u8, word, "ss") and !std.mem.endsWith(u8, word, "us")) {
+        return word[0 .. word.len - 1];
+    }
+    if (word.len > 4 and std.mem.endsWith(u8, word, "ally")) {
+        return word[0 .. word.len - 4];
+    }
+    if (word.len > 3 and std.mem.endsWith(u8, word, "ly")) {
+        return word[0 .. word.len - 2];
+    }
+    if (word.len > 4 and std.mem.endsWith(u8, word, "ment")) {
+        return word[0 .. word.len - 4];
+    }
+    if (word.len > 4 and std.mem.endsWith(u8, word, "ness")) {
+        return word[0 .. word.len - 4];
+    }
+    if (word.len > 3 and std.mem.endsWith(u8, word, "er") and !std.mem.endsWith(u8, word, "ver") and !std.mem.endsWith(u8, word, "her")) {
+        if (word.len > 4 and word[word.len - 3] == word[word.len - 4]) {
+            return word[0 .. word.len - 3];
+        }
+        return word[0 .. word.len - 2];
+    }
+    if (word.len > 4 and std.mem.endsWith(u8, word, "est")) {
+        return word[0 .. word.len - 3];
+    }
+    return word;
+}
+
+fn wordsMatchStem(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    var a_buf: [256]u8 = undefined;
+    var b_buf: [256]u8 = undefined;
+    if (a.len >= a_buf.len or b.len >= b_buf.len) return std.mem.eql(u8, a, b);
+    const a_lower = std.ascii.lowerString(&a_buf, a);
+    const b_lower = std.ascii.lowerString(&b_buf, b);
+    if (std.mem.eql(u8, a_lower, b_lower)) return true;
+    const a_stem = stemWord(a_lower);
+    const b_stem = stemWord(b_lower);
+    if (a_stem.len > 0 and b_stem.len > 0 and std.mem.eql(u8, a_stem, b_stem)) return true;
+    return false;
+}
+
+fn matchPatternMorphemeAware(sentence: []const u8, pattern: []const u8, allocator: Allocator) ?MorphemeMatch {
+    var sent_tokens = ArrayList(WordToken).init(allocator);
+    defer sent_tokens.deinit();
+    tokenizeIntoWords(sentence, &sent_tokens) catch return null;
+
+    var pat_tokens = ArrayList(WordToken).init(allocator);
+    defer pat_tokens.deinit();
+    tokenizeIntoWords(pattern, &pat_tokens) catch return null;
+
+    if (pat_tokens.items.len == 0 or sent_tokens.items.len == 0) return null;
+    if (pat_tokens.items.len > sent_tokens.items.len) return null;
+
+    var si: usize = 0;
+    while (si <= sent_tokens.items.len - pat_tokens.items.len) {
+        var all_match = true;
+        for (pat_tokens.items, 0..) |pat_tok, pi| {
+            if (!wordsMatchStem(sent_tokens.items[si + pi].text, pat_tok.text)) {
+                all_match = false;
+                break;
+            }
+        }
+        if (all_match) {
+            const last_idx = si + pat_tokens.items.len - 1;
+            return MorphemeMatch{
+                .match_start = sent_tokens.items[si].start,
+                .match_end = sent_tokens.items[last_idx].end,
+            };
+        }
+        si += 1;
+    }
+    return null;
+}
+
 pub const RelationalTriplet = struct {
     subject: []u8,
     relation: []u8,
@@ -108,22 +238,24 @@ pub const RelationalTriplet = struct {
         confidence_in: f64,
     ) !RelationalTriplet {
         const now = std.time.nanoTimestamp();
-        var t = RelationalTriplet{
-            .subject = &[_]u8{},
-            .relation = &[_]u8{},
-            .object = &[_]u8{},
+
+        const s = try allocator.dupe(u8, subject);
+        errdefer allocator.free(s);
+        const r = try allocator.dupe(u8, relation);
+        errdefer allocator.free(r);
+        const o = try allocator.dupe(u8, object);
+        errdefer allocator.free(o);
+
+        return RelationalTriplet{
+            .subject = s,
+            .relation = r,
+            .object = o,
             .confidence = clamp01(confidence_in),
             .source_hash = hashTripletIdentity(subject, relation, object),
             .extraction_time = now,
             .allocator = allocator,
             .metadata = StringHashMap([]u8).init(allocator),
         };
-        errdefer t.deinit();
-
-        t.subject = try allocator.dupe(u8, subject);
-        t.relation = try allocator.dupe(u8, relation);
-        t.object = try allocator.dupe(u8, object);
-        return t;
     }
 
     pub fn initWithHash(
@@ -135,28 +267,29 @@ pub const RelationalTriplet = struct {
         source_hash: [32]u8,
         extraction_time: i128,
     ) !RelationalTriplet {
-        var t = RelationalTriplet{
-            .subject = &[_]u8{},
-            .relation = &[_]u8{},
-            .object = &[_]u8{},
+        const s = try allocator.dupe(u8, subject);
+        errdefer allocator.free(s);
+        const r = try allocator.dupe(u8, relation);
+        errdefer allocator.free(r);
+        const o = try allocator.dupe(u8, object);
+        errdefer allocator.free(o);
+
+        return RelationalTriplet{
+            .subject = s,
+            .relation = r,
+            .object = o,
             .confidence = clamp01(confidence_in),
             .source_hash = source_hash,
             .extraction_time = extraction_time,
             .allocator = allocator,
             .metadata = StringHashMap([]u8).init(allocator),
         };
-        errdefer t.deinit();
-
-        t.subject = try allocator.dupe(u8, subject);
-        t.relation = try allocator.dupe(u8, relation);
-        t.object = try allocator.dupe(u8, object);
-        return t;
     }
 
     pub fn deinit(self: *RelationalTriplet) void {
-        if (self.subject.len != 0) self.allocator.free(self.subject);
-        if (self.relation.len != 0) self.allocator.free(self.relation);
-        if (self.object.len != 0) self.allocator.free(self.object);
+        self.allocator.free(self.subject);
+        self.allocator.free(self.relation);
+        self.allocator.free(self.object);
 
         var it = self.metadata.iterator();
         while (it.next()) |entry| {
@@ -171,10 +304,17 @@ pub const RelationalTriplet = struct {
     }
 
     pub fn clone(self: *const RelationalTriplet, allocator: Allocator) !RelationalTriplet {
+        const s = try allocator.dupe(u8, self.subject);
+        errdefer allocator.free(s);
+        const r = try allocator.dupe(u8, self.relation);
+        errdefer allocator.free(r);
+        const o = try allocator.dupe(u8, self.object);
+        errdefer allocator.free(o);
+
         var t = RelationalTriplet{
-            .subject = &[_]u8{},
-            .relation = &[_]u8{},
-            .object = &[_]u8{},
+            .subject = s,
+            .relation = r,
+            .object = o,
             .confidence = self.confidence,
             .source_hash = self.source_hash,
             .extraction_time = self.extraction_time,
@@ -182,10 +322,6 @@ pub const RelationalTriplet = struct {
             .metadata = StringHashMap([]u8).init(allocator),
         };
         errdefer t.deinit();
-
-        t.subject = try allocator.dupe(u8, self.subject);
-        t.relation = try allocator.dupe(u8, self.relation);
-        t.object = try allocator.dupe(u8, self.object);
 
         var it = self.metadata.iterator();
         while (it.next()) |entry| {
@@ -486,6 +622,68 @@ pub const KnowledgeGraphIndex = struct {
         return results;
     }
 
+    fn queryMorphemeAware(
+        self: *KnowledgeGraphIndex,
+        subject: ?[]const u8,
+        relation: ?[]const u8,
+        object: ?[]const u8,
+        allocator: Allocator,
+    ) !ArrayList(*RelationalTriplet) {
+        var results = ArrayList(*RelationalTriplet).init(allocator);
+
+        for (self.all_triplets.items) |t| {
+            var subj_match = true;
+            var rel_match = true;
+            var obj_match = true;
+
+            if (subject) |s| {
+                var s_buf: [256]u8 = undefined;
+                var t_buf: [256]u8 = undefined;
+                if (s.len < s_buf.len and t.subject.len < t_buf.len) {
+                    const s_lower = std.ascii.lowerString(&s_buf, s);
+                    const t_lower = std.ascii.lowerString(&t_buf, t.subject);
+                    const s_stem = stemWord(s_lower);
+                    const t_stem = stemWord(t_lower);
+                    subj_match = std.mem.eql(u8, s_stem, t_stem) or std.mem.eql(u8, s, t.subject);
+                } else {
+                    subj_match = std.mem.eql(u8, s, t.subject);
+                }
+            }
+            if (relation) |r| {
+                var r_buf: [256]u8 = undefined;
+                var t_buf: [256]u8 = undefined;
+                if (r.len < r_buf.len and t.relation.len < t_buf.len) {
+                    const r_lower = std.ascii.lowerString(&r_buf, r);
+                    const t_lower = std.ascii.lowerString(&t_buf, t.relation);
+                    const r_stem = stemWord(r_lower);
+                    const t_stem = stemWord(t_lower);
+                    rel_match = std.mem.eql(u8, r_stem, t_stem) or std.mem.eql(u8, r, t.relation);
+                } else {
+                    rel_match = std.mem.eql(u8, r, t.relation);
+                }
+            }
+            if (object) |o| {
+                var o_buf: [256]u8 = undefined;
+                var t_buf: [256]u8 = undefined;
+                if (o.len < o_buf.len and t.object.len < t_buf.len) {
+                    const o_lower = std.ascii.lowerString(&o_buf, o);
+                    const t_lower = std.ascii.lowerString(&t_buf, t.object);
+                    const o_stem = stemWord(o_lower);
+                    const t_stem = stemWord(t_lower);
+                    obj_match = std.mem.eql(u8, o_stem, t_stem) or std.mem.eql(u8, o, t.object);
+                } else {
+                    obj_match = std.mem.eql(u8, o, t.object);
+                }
+            }
+
+            if (subj_match and rel_match and obj_match) {
+                try results.append(t);
+            }
+        }
+
+        return results;
+    }
+
     pub fn queryBySubject(self: *KnowledgeGraphIndex, subject: []const u8) []*RelationalTriplet {
         if (self.subject_index.getPtr(subject)) |list| return list.items;
         return &[_]*RelationalTriplet{};
@@ -764,6 +962,14 @@ pub const TokenizerConfig = struct {
     }
 };
 
+pub const InferenceHook = struct {
+    pre_process: ?*const fn (*anyopaque, []const u8) void,
+    post_process: ?*const fn (*anyopaque, *PipelineResult) void,
+    pre_query: ?*const fn (*anyopaque, ?[]const u8, ?[]const u8, ?[]const u8) void,
+    post_query: ?*const fn (*anyopaque, usize) void,
+    context: *anyopaque,
+};
+
 pub const CREVPipeline = struct {
     kernel: *ChaosCoreKernel,
     triplet_buffer: StreamBuffer,
@@ -781,6 +987,7 @@ pub const CREVPipeline = struct {
     relation_statistics: StringHashMap(RelationStatistics),
     entity_statistics: StringHashMap(EntityStatistics),
     is_running: bool,
+    inference_hooks: ArrayList(InferenceHook),
 
     pub const RelationStatistics = struct {
         count: usize,
@@ -852,6 +1059,7 @@ pub const CREVPipeline = struct {
             .relation_statistics = StringHashMap(RelationStatistics).init(allocator),
             .entity_statistics = StringHashMap(EntityStatistics).init(allocator),
             .is_running = true,
+            .inference_hooks = ArrayList(InferenceHook).init(allocator),
         };
         errdefer pipeline.deinit();
         try pipeline.initializeDefaultPatterns();
@@ -893,6 +1101,8 @@ pub const CREVPipeline = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.entity_statistics.deinit();
+
+        self.inference_hooks.deinit();
     }
 
     pub fn processTextStream(self: *CREVPipeline, text: []const u8) !PipelineResult {
@@ -1049,23 +1259,22 @@ pub const CREVPipeline = struct {
         }
 
         for (sentences.items) |sentence| {
-            var best_match: ?struct { rel_pos: usize, pat: RelationPattern } = null;
+            var best_match: ?struct { match_start: usize, match_end: usize, pat: RelationPattern } = null;
             for (self.relation_patterns.items) |pattern| {
-                if (std.mem.indexOf(u8, sentence, pattern.pattern)) |rel_pos| {
-                    if (best_match == null or pattern.pattern.len > best_match.?.pat.pattern.len) {
-                        best_match = .{ .rel_pos = rel_pos, .pat = pattern };
+                if (matchPatternMorphemeAware(sentence, pattern.pattern, self.allocator)) |m| {
+                    const match_len = m.match_end - m.match_start;
+                    const best_len = if (best_match) |bm| bm.match_end - bm.match_start else usize(0);
+                    if (best_match == null or match_len > best_len) {
+                        best_match = .{ .match_start = m.match_start, .match_end = m.match_end, .pat = pattern };
                     }
                 }
             }
 
             if (best_match) |m| {
-                const rel_pos = m.rel_pos;
-                const pattern = m.pat;
-
-                const subject = std.mem.trim(u8, sentence[0..rel_pos], " \t\r\n,;:");
-                const object_start = rel_pos + pattern.pattern.len;
-                if (object_start < sentence.len) {
-                    const object = std.mem.trim(u8, sentence[object_start..], " \t\r\n.,;:!?");
+                const subject = std.mem.trim(u8, sentence[0..m.match_start], " \t\r\n,;:");
+                if (m.match_end < sentence.len) {
+                    const object = std.mem.trim(u8, sentence[m.match_end..], " \t\r\n.,;:!?");
+                    const pattern = m.pat;
 
                     if (subject.len >= self.tokenizer_config.min_entity_length and
                         subject.len <= self.tokenizer_config.max_entity_length and
@@ -1463,6 +1672,54 @@ pub const CREVPipeline = struct {
 
     pub fn getKnowledgeGraphSize(self: *CREVPipeline) usize {
         return self.knowledge_index.count();
+    }
+
+    pub fn registerInferenceHook(self: *CREVPipeline, hook: InferenceHook) !void {
+        try self.inference_hooks.append(hook);
+    }
+
+    pub fn clearInferenceHooks(self: *CREVPipeline) void {
+        self.inference_hooks.clearRetainingCapacity();
+    }
+
+    pub fn processInferenceText(self: *CREVPipeline, text: []const u8) !PipelineResult {
+        for (self.inference_hooks.items) |hook| {
+            if (hook.pre_process) |cb| {
+                cb(hook.context, text);
+            }
+        }
+
+        var result = try self.processTextStream(text);
+
+        for (self.inference_hooks.items) |hook| {
+            if (hook.post_process) |cb| {
+                cb(hook.context, &result);
+            }
+        }
+
+        return result;
+    }
+
+    pub fn queryInferenceKnowledge(self: *CREVPipeline, subject: ?[]const u8, relation: ?[]const u8, object: ?[]const u8) !ArrayList(*RelationalTriplet) {
+        for (self.inference_hooks.items) |hook| {
+            if (hook.pre_query) |cb| {
+                cb(hook.context, subject, relation, object);
+            }
+        }
+
+        var results = try self.knowledge_index.queryMorphemeAware(subject, relation, object, self.allocator);
+
+        for (self.inference_hooks.items) |hook| {
+            if (hook.post_query) |cb| {
+                cb(hook.context, results.items.len);
+            }
+        }
+
+        return results;
+    }
+
+    pub fn getInferencePipelineStatistics(self: *CREVPipeline) PipelineStatistics {
+        return self.getPipelineStatistics();
     }
 
     pub fn isRunning(self: *const CREVPipeline) bool {

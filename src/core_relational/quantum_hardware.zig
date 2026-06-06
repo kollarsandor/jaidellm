@@ -189,11 +189,41 @@ pub const IBMDocumentedBackendSpecs = struct {
     }
 };
 
+pub var mock_mode: bool = false;
+
+pub fn enableMockMode() void {
+    mock_mode = true;
+}
+
+pub fn disableMockMode() void {
+    mock_mode = false;
+}
+
+pub fn isMockMode() bool {
+    return mock_mode;
+}
+
+pub fn integrateHardwareWithInference(
+    allocator: Allocator,
+    backend_name: []const u8,
+    circuit_depth: u32,
+    two_qubit_gates: u32,
+) !f64 {
+    var client = try IBMQuantumClient.init(allocator, "crn:v1:bluemix:public:quantum-computing:us-east:a/test:test::", "");
+    defer client.deinit();
+    const backend = client.getBackend(backend_name) orelse return error.BackendNotFound;
+    return backend.estimateFidelity(circuit_depth, two_qubit_gates);
+}
+
 pub fn fetchIBMQuantumCalibration(
     allocator: Allocator,
     backend_name: []const u8,
     api_key: []const u8,
 ) !?IBMBackendCalibrationData {
+    if (mock_mode) {
+        return generateDocumentedCalibration(allocator, .HARDWARE_HERON, 133);
+    }
+
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
@@ -206,8 +236,8 @@ pub fn fetchIBMQuantumCalibration(
 
     const uri = std.Uri.parse(url) catch return null;
 
-    const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key});
-    defer allocator.free(auth_header);
+    var auth_header_buf: [QuantumConfig.HEADER_BUFFER_SIZE]u8 = undefined;
+    const auth_header = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{api_key}) catch return null;
 
     var header_buf: [QuantumConfig.HEADER_BUFFER_SIZE]u8 = undefined;
     var req = client.open(.GET, uri, .{
@@ -369,16 +399,19 @@ pub fn generateDocumentedCalibration(
     const readout_err = try allocator.alloc(f64, num_qubits);
     errdefer allocator.free(readout_err);
 
+    var prng = std.Random.DefaultPrng.init(@as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))));
+    const random = prng.random();
+
     var qubit_idx: usize = 0;
     while (qubit_idx < num_qubits) : (qubit_idx += 1) {
-        const qubit_variation = @as(f64, @floatFromInt(
-            qubit_idx % QuantumConfig.QUBIT_VARIATION_MODULO,
-        )) / QuantumConfig.QUBIT_VARIATION_DIVISOR - QuantumConfig.QUBIT_VARIATION_OFFSET;
-        t1[qubit_idx] = @max(1000.0, specs.t1_mean_ns + qubit_variation * specs.t1_stddev_ns);
-        t2[qubit_idx] = @max(1000.0, specs.t2_mean_ns + qubit_variation * specs.t2_stddev_ns);
+        const t1_variation = @as(f64, @floatFromInt(random.intRangeAtMost(usize, 0, 1000))) / 1000.0 - 0.5;
+        const t2_variation = @as(f64, @floatFromInt(random.intRangeAtMost(usize, 0, 1000))) / 1000.0 - 0.5;
+        const readout_variation = @as(f64, @floatFromInt(random.intRangeAtMost(usize, 0, 1000))) / 1000.0 - 0.5;
+        t1[qubit_idx] = @max(1000.0, specs.t1_mean_ns + t1_variation * specs.t1_stddev_ns);
+        t2[qubit_idx] = @max(1000.0, specs.t2_mean_ns + t2_variation * specs.t2_stddev_ns);
         readout_err[qubit_idx] = @max(
             QuantumConfig.MIN_READOUT_ERROR,
-            specs.readout_error_mean + qubit_variation * specs.readout_error_stddev,
+            specs.readout_error_mean + readout_variation * specs.readout_error_stddev,
         );
     }
 
@@ -408,9 +441,7 @@ pub fn generateDocumentedCalibration(
     errdefer allocator.free(gate_err);
     var gate_idx: usize = 0;
     while (gate_idx < edge_count) : (gate_idx += 1) {
-        const edge_variation = @as(f64, @floatFromInt(
-            gate_idx % QuantumConfig.QUBIT_VARIATION_MODULO,
-        )) / QuantumConfig.QUBIT_VARIATION_DIVISOR - QuantumConfig.QUBIT_VARIATION_OFFSET;
+        const edge_variation = @as(f64, @floatFromInt(random.intRangeAtMost(usize, 0, 1000))) / 1000.0 - 0.5;
         gate_err[gate_idx] = @max(
             QuantumConfig.MIN_GATE_ERROR,
             specs.ecr_gate_error_mean + edge_variation * specs.ecr_gate_error_stddev,
@@ -762,10 +793,33 @@ pub const QuantumBackend = struct {
 
         return gate_fidelity * readout_fidelity * depth_factor;
     }
+
+    pub fn inferBackendStatus(self: *const Self) BackendStatus {
+        if (self.is_simulator) return .ONLINE;
+        const avg_readout = self.getAverageReadoutError();
+        const avg_gate = self.getAverageGateError();
+        if (avg_readout > 0.1 or avg_gate > 0.05) return .DEGRADED;
+        if (avg_readout > 0.05 or avg_gate > 0.02) return .PAUSED;
+        return .ONLINE;
+    }
+
+    pub fn integrateWithInference(self: *Self, circuit: *QuantumCircuit) !f64 {
+        self.status = self.inferBackendStatus();
+        if (self.status == .OFFLINE or self.status == .MAINTENANCE) return error.BackendUnavailable;
+        var two_qubit_count: u32 = 0;
+        for (circuit.instructions.items) |inst| {
+            if (inst.isTwoQubitGate()) two_qubit_count += 1;
+        }
+        return self.estimateFidelity(@intCast(circuit.instructions.items.len), two_qubit_count);
+    }
 };
 
 pub const BackendStatus = enum {
     ONLINE,
+    OFFLINE,
+    MAINTENANCE,
+    DEGRADED,
+    PAUSED,
 };
 
 pub const QuantumGateOp = enum {
@@ -2691,3 +2745,5 @@ test "quantum client statistics" {
     try std.testing.expect(stats.backends_available >= 3);
     try std.testing.expectEqual(@as(u32, 0), stats.active_jobs);
 }
+
+================

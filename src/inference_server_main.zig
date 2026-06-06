@@ -55,6 +55,12 @@ pub fn main() !void {
         }
     }
 
+    if (std.posix.getenv("JAIDE_MODEL_PATH")) |model_path| {
+        if (config.model_path == null) {
+            config.model_path = model_path;
+        }
+    }
+
     var server = InferenceServer.init(allocator, config) catch |err| {
         std.debug.print("Failed to initialize server: {}\n", .{err});
         return err;
@@ -63,8 +69,16 @@ pub fn main() !void {
 
     std.debug.print("Starting JAIDE Inference Server on {s}:{d}\n", .{ config.host, config.port });
 
+    if (config.model_path) |path| {
+        server.loadModel(path) catch |err| {
+            std.debug.print("Failed to load model from {s}: {}\n", .{ path, err });
+        };
+    }
+
     server.start() catch |err| {
         std.debug.print("Server error: {}\n", .{err});
         return err;
     };
 }
+
+================

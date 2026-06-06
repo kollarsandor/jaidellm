@@ -5,6 +5,7 @@ const Tensor = @import("tensor.zig").Tensor;
 pub const LearnedEmbedding = struct {
     weight: Tensor,
     grad: Tensor,
+    velocity: Tensor,
     vocab_size: usize,
     dim: usize,
     allocator: Allocator,
@@ -14,7 +15,10 @@ pub const LearnedEmbedding = struct {
         errdefer w.deinit();
         var g = try Tensor.init(allocator, &.{ v_size, d });
         errdefer g.deinit();
+        var v = try Tensor.init(allocator, &.{ v_size, d });
+        errdefer v.deinit();
         @memset(g.data, 0.0);
+        @memset(v.data, 0.0);
         var prng = std.Random.DefaultPrng.init(seed);
         const random = prng.random();
         var i: usize = 0;
@@ -24,6 +28,7 @@ pub const LearnedEmbedding = struct {
         return LearnedEmbedding{
             .weight = w,
             .grad = g,
+            .velocity = v,
             .vocab_size = v_size,
             .dim = d,
             .allocator = allocator,
@@ -33,42 +38,39 @@ pub const LearnedEmbedding = struct {
     pub fn deinit(self: *LearnedEmbedding) void {
         self.weight.deinit();
         self.grad.deinit();
+        self.velocity.deinit();
     }
 
-    pub fn forward(self: *LearnedEmbedding, allocator: Allocator, tokens: []const u32, output_dim: usize) !Tensor {
-        var out = try Tensor.init(allocator, &.{ 1, output_dim });
+    pub fn forward(self: *LearnedEmbedding, allocator: Allocator, tokens: []const u32, max_seq_len: usize) !Tensor {
+        _ = max_seq_len;
+        if (tokens.len == 0) return error.EmptyTokens;
+        var out = try Tensor.init(allocator, &.{ 1, self.dim });
         @memset(out.data, 0.0);
-        const max_tokens = @min(tokens.len, self.dim);
         var r: usize = 0;
-        while (r < max_tokens) : (r += 1) {
+        while (r < tokens.len) : (r += 1) {
             const t = @min(@as(usize, tokens[r]), self.vocab_size - 1);
             var c: usize = 0;
             while (c < self.dim) : (c += 1) {
                 const w_idx = t * self.dim + c;
                 if (w_idx < self.weight.data.len) {
-                    if (r * self.dim + c < output_dim) {
-                        const out_idx = r * self.dim + c;
-                        if (out_idx < out.data.len) {
-                            out.data[out_idx] = self.weight.data[w_idx];
-                        }
-                    }
+                    out.data[c] += self.weight.data[w_idx];
                 }
             }
         }
         return out;
     }
 
-    pub fn backward(self: *LearnedEmbedding, tokens: []const u32, out_grad: []const f32) void {
-        const max_tokens = @min(tokens.len, self.dim);
+    pub fn backward(self: *LearnedEmbedding, tokens: []const u32, out_grad: []const f32, max_seq_len: usize) void {
+        _ = max_seq_len;
+        if (tokens.len == 0) return;
         var r: usize = 0;
-        while (r < max_tokens) : (r += 1) {
+        while (r < tokens.len) : (r += 1) {
             const t = @min(@as(usize, tokens[r]), self.vocab_size - 1);
             var c: usize = 0;
             while (c < self.dim) : (c += 1) {
                 const g_idx = t * self.dim + c;
-                const o_idx = r * self.dim + c;
-                if (g_idx < self.grad.data.len and o_idx < out_grad.len) {
-                    self.grad.data[g_idx] += out_grad[o_idx];
+                if (g_idx < self.grad.data.len and c < out_grad.len) {
+                    self.grad.data[g_idx] += out_grad[c];
                 }
             }
         }
@@ -81,8 +83,8 @@ pub const LearnedEmbedding = struct {
     pub fn applyGradients(self: *LearnedEmbedding, lr: f32, momentum: f32) void {
         var i: usize = 0;
         while (i < self.weight.data.len) : (i += 1) {
-            self.weight.data[i] -= lr * self.grad.data[i];
-            self.grad.data[i] *= momentum;
+            self.velocity.data[i] = momentum * self.velocity.data[i] + self.grad.data[i];
+            self.weight.data[i] -= lr * self.velocity.data[i];
         }
     }
 
@@ -127,14 +129,18 @@ pub const LearnedEmbedding = struct {
         const reader = buf_reader.reader();
         const magic = try reader.readInt(u32, .little);
         if (magic != 0x4A454D42) return error.InvalidFormat;
-        _ = try reader.readInt(u32, .little);
+        const version = try reader.readInt(u32, .little);
+        if (version != 1) return error.IncompatibleVersion;
         const v_size = @as(usize, @intCast(try reader.readInt(u64, .little)));
         const d = @as(usize, @intCast(try reader.readInt(u64, .little)));
         var w = try Tensor.init(allocator, &.{ v_size, d });
         errdefer w.deinit();
         var g = try Tensor.init(allocator, &.{ v_size, d });
         errdefer g.deinit();
+        var v = try Tensor.init(allocator, &.{ v_size, d });
+        errdefer v.deinit();
         @memset(g.data, 0.0);
+        @memset(v.data, 0.0);
         var i: usize = 0;
         while (i < w.data.len) : (i += 1) {
             w.data[i] = @bitCast(try reader.readInt(u32, .little));
@@ -142,9 +148,47 @@ pub const LearnedEmbedding = struct {
         return LearnedEmbedding{
             .weight = w,
             .grad = g,
+            .velocity = v,
             .vocab_size = v_size,
             .dim = d,
             .allocator = allocator,
         };
     }
 };
+
+test "LearnedEmbedding weights update with non-zero gradient" {
+    const allocator = std.testing.allocator;
+
+    var emb = try LearnedEmbedding.init(allocator, 100, 16, 42);
+    defer emb.deinit();
+
+    const initial_norm: f32 = blk: {
+        var sum: f32 = 0.0;
+        for (emb.weight.data) |w| sum += w * w;
+        break :blk @sqrt(sum);
+    };
+
+    const tokens = [_]u32{ 5, 10, 15 };
+    var out = try emb.forward(allocator, &tokens, 8);
+    defer out.deinit();
+
+    const grad_len = emb.dim;
+    const grad_data = try allocator.alloc(f32, grad_len);
+    defer allocator.free(grad_data);
+    var gi: usize = 0;
+    while (gi < grad_len) : (gi += 1) {
+        grad_data[gi] = 0.1 * @as(f32, @floatFromInt(gi + 1));
+    }
+
+    emb.zeroGrad();
+    emb.backward(&tokens, grad_data, 8);
+    emb.applyGradients(0.01, 0.9);
+
+    const post_norm: f32 = blk: {
+        var sum: f32 = 0.0;
+        for (emb.weight.data) |w| sum += w * w;
+        break :blk @sqrt(sum);
+    };
+
+    try std.testing.expect(@abs(initial_norm - post_norm) > 1e-6);
+}

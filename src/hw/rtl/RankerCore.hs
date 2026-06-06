@@ -103,3 +103,5 @@ simulateRanker (Just req) =
     let bias = computePositionBias (segmentPos req)
         final = computeFinalScore (baseScore req) bias
     in (1, final)
+
+================

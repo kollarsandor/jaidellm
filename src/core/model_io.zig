@@ -9,6 +9,7 @@ const Tensor = @import("tensor.zig").Tensor;
 const sfd = @import("../optimizer/sfd.zig");
 const ssi = @import("../index/ssi.zig");
 const nsir = @import("../core_relational/nsir_core.zig");
+const LearnedEmbedding = @import("learned_embedding.zig").LearnedEmbedding;
 
 pub const ModelError = error{
     InvalidMagicHeader,
@@ -137,6 +138,7 @@ pub const ModelFormat = struct {
     rsf: ?*RSF = null,
     ranker: ?*Ranker = null,
     mgt: ?*MGT = null,
+    embedding: ?LearnedEmbedding = null,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, name: []const u8, description: []const u8) !ModelFormat {
@@ -144,6 +146,7 @@ pub const ModelFormat = struct {
         const name_duped = try allocator.dupe(u8, name);
         errdefer allocator.free(name_duped);
         const desc_duped = try allocator.dupe(u8, description);
+        errdefer allocator.free(desc_duped);
 
         return ModelFormat{
             .metadata = ModelMetadata{
@@ -165,14 +168,20 @@ pub const ModelFormat = struct {
         if (self.rsf) |rsf| {
             rsf.deinit();
             self.allocator.destroy(rsf);
+            self.rsf = null;
         }
         if (self.ranker) |ranker| {
             ranker.deinit();
             self.allocator.destroy(ranker);
+            self.ranker = null;
         }
         if (self.mgt) |mgt| {
             mgt.deinit();
             self.allocator.destroy(mgt);
+            self.mgt = null;
+        }
+        if (self.embedding) |*emb| {
+            emb.deinit();
         }
         self.metadata.deinit(self.allocator);
     }
@@ -375,11 +384,53 @@ pub fn exportModel(model: *ModelFormat, path: []const u8) !void {
     try writer.writeAll(&checksum);
 
     try buffered_writer.flush();
+
+    if (model.embedding) |*emb| {
+        var emb_path_buf: [4096]u8 = undefined;
+        const emb_path = std.fmt.bufPrint(&emb_path_buf, "{s}.embedding", .{path}) catch null;
+        if (emb_path) |ep| {
+            emb.save(ep) catch {};
+        }
+    }
+}
+
+fn ComponentReader(comptime ReaderType: type) type {
+    return struct {
+        inner: ReaderType,
+        hasher: *std.crypto.hash.sha2.Sha256,
+        bytes_read: usize,
+
+        const Self = @This();
+
+        pub fn readByte(self: *Self) !u8 {
+            const byte = try self.inner.readByte();
+            self.hasher.update(&.{byte});
+            self.bytes_read += 1;
+            return byte;
+        }
+
+        pub fn readInt(self: *Self, comptime T: type, endian: std.builtin.Endian) !T {
+            var bytes: [@sizeOf(T)]u8 = undefined;
+            try self.inner.readNoEof(&bytes);
+            self.hasher.update(&bytes);
+            self.bytes_read += @sizeOf(T);
+            return mem.readInt(T, &bytes, endian);
+        }
+
+        pub fn readNoEof(self: *Self, buf: []u8) !void {
+            try self.inner.readNoEof(buf);
+            self.hasher.update(buf);
+            self.bytes_read += buf.len;
+        }
+    };
 }
 
 pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
     const file = try fs.cwd().openFile(path, .{});
     defer file.close();
+
+    const stat = try file.stat();
+    if (stat.size < MAGIC_HEADER.len + @sizeOf(u32) + @sizeOf(u32) + 32) return ModelError.InvalidMagicHeader;
 
     var buffered_reader = std.io.bufferedReader(file.reader());
     const reader = buffered_reader.reader();
@@ -426,14 +477,14 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
         hashIntLittleEndian(u32, &hasher, rsf_len);
 
         if (rsf_len > MAX_COMPONENT_SIZE) return ModelError.CorruptedData;
+        if (rsf_len < 16) return ModelError.CorruptedData;
 
-        const rsf_data = try allocator.alloc(u8, rsf_len);
-        defer allocator.free(rsf_data);
-        try reader.readNoEof(rsf_data);
-        hasher.update(rsf_data);
-
-        var rsf_stream = std.io.fixedBufferStream(rsf_data);
-        var rsf_reader = rsf_stream.reader();
+        var rsf_comp_reader = ComponentReader(@TypeOf(reader)){
+            .inner = reader,
+            .hasher = &hasher,
+            .bytes_read = 0,
+        };
+        var rsf_reader = &rsf_comp_reader;
 
         const num_layers_u64 = try rsf_reader.readInt(u64, .little);
         const dim_u64 = try rsf_reader.readInt(u64, .little);
@@ -462,7 +513,7 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
             lrc.layers[l].t_bias = try Tensor.load(allocator, rsf_reader);
         }
 
-        if ((rsf_stream.getPos() catch return ModelError.CorruptedData) != rsf_data.len) return ModelError.CorruptedData;
+        if (rsf_comp_reader.bytes_read != rsf_len) return ModelError.CorruptedData;
 
         model.rsf = rsf;
         model.metadata.rsf_layers = num_layers;
@@ -479,14 +530,14 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
         hashIntLittleEndian(u32, &hasher, ranker_len);
 
         if (ranker_len > MAX_COMPONENT_SIZE) return ModelError.CorruptedData;
+        if (ranker_len < 1) return ModelError.CorruptedData;
 
-        const ranker_data = try allocator.alloc(u8, ranker_len);
-        defer allocator.free(ranker_data);
-        try reader.readNoEof(ranker_data);
-        hasher.update(ranker_data);
-
-        var ranker_stream = std.io.fixedBufferStream(ranker_data);
-        var ranker_reader = ranker_stream.reader();
+        var ranker_comp_reader = ComponentReader(@TypeOf(reader)){
+            .inner = reader,
+            .hasher = &hasher,
+            .bytes_read = 0,
+        };
+        var ranker_reader = &ranker_comp_reader;
 
         const ranker_version = try ranker_reader.readByte();
         if (ranker_version != 1) return ModelError.UnsupportedVersion;
@@ -530,9 +581,9 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
             .allocator = allocator,
         };
 
-        if ((ranker_stream.getPos() catch return ModelError.CorruptedData) != ranker_data.len) {
-            allocator.free(ngram_weights_alloc);
-            allocator.free(lsh_hash_params);
+        if (ranker_comp_reader.bytes_read != ranker_len) {
+            ranker.deinit();
+            allocator.destroy(ranker);
             return ModelError.CorruptedData;
         }
 
@@ -551,14 +602,14 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
         hashIntLittleEndian(u32, &hasher, mgt_len);
 
         if (mgt_len > MAX_COMPONENT_SIZE) return ModelError.CorruptedData;
+        if (mgt_len < 4) return ModelError.CorruptedData;
 
-        const mgt_data = try allocator.alloc(u8, mgt_len);
-        defer allocator.free(mgt_data);
-        try reader.readNoEof(mgt_data);
-        hasher.update(mgt_data);
-
-        var mgt_stream = std.io.fixedBufferStream(mgt_data);
-        var mgt_reader = mgt_stream.reader();
+        var mgt_comp_reader = ComponentReader(@TypeOf(reader)){
+            .inner = reader,
+            .hasher = &hasher,
+            .bytes_read = 0,
+        };
+        var mgt_reader = &mgt_comp_reader;
 
         const vocab_size = try mgt_reader.readInt(u32, .little);
         if (vocab_size > 10000000) return ModelError.CorruptedData;
@@ -596,7 +647,7 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
         words_list.deinit();
         allocator.free(words_const);
 
-        if ((mgt_stream.getPos() catch return ModelError.CorruptedData) != mgt_data.len) {
+        if (mgt_comp_reader.bytes_read != mgt_len) {
             mgt.deinit();
             return ModelError.CorruptedData;
         }
@@ -618,7 +669,14 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
     }
 
     const end_byte = reader.readByte() catch |err| {
-        if (err == error.EndOfStream) return model;
+        if (err == error.EndOfStream) {
+            var emb_path_buf: [4096]u8 = undefined;
+            const emb_path = std.fmt.bufPrint(&emb_path_buf, "{s}.embedding", .{path}) catch null;
+            if (emb_path) |ep| {
+                model.embedding = LearnedEmbedding.load(allocator, ep) catch null;
+            }
+            return model;
+        }
         return err;
     };
     _ = end_byte;
@@ -626,11 +684,14 @@ pub fn importModel(path: []const u8, allocator: Allocator) !ModelFormat {
 }
 
 fn constantTimeCompare(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
+    const max_len = @max(a.len, b.len);
     var diff: u8 = 0;
+    if (a.len != b.len) diff = 0xFF;
     var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        diff |= a[i] ^ b[i];
+    while (i < max_len) : (i += 1) {
+        const a_byte: u8 = if (i < a.len) a[i] else 0;
+        const b_byte: u8 = if (i < b.len) b[i] else 0;
+        diff |= a_byte ^ b_byte;
     }
     return diff == 0;
 }
@@ -706,7 +767,7 @@ pub fn loadNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8, 
     while (i < node_count) : (i += 1) {
         const id_len = try reader.readInt(u32, .little);
         const id = try allocator.alloc(u8, id_len);
-        defer allocator.free(id);
+        errdefer allocator.free(id);
         try reader.readNoEof(id);
 
         var a_re: f64 = undefined;
@@ -733,12 +794,10 @@ pub fn loadNSIRGraph(graph: *nsir.SelfSimilarRelationalGraph, path: []const u8, 
     while (j < edge_key_count) : (j += 1) {
         const src_len = try reader.readInt(u32, .little);
         const source = try allocator.alloc(u8, src_len);
-        defer allocator.free(source);
         try reader.readNoEof(source);
 
         const tgt_len = try reader.readInt(u32, .little);
         const target = try allocator.alloc(u8, tgt_len);
-        defer allocator.free(target);
         try reader.readNoEof(target);
 
         const count = try reader.readInt(u32, .little);
@@ -806,3 +865,5 @@ test "Metadata JSON serialization" {
     try testing.expectEqual(metadata.created_timestamp, parsed_metadata.created_timestamp);
     try testing.expectEqual(metadata.rsf_layers, parsed_metadata.rsf_layers);
 }
+
+================

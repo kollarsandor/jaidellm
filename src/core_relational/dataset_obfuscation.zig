@@ -22,13 +22,8 @@ pub const PaillierKeyPair = struct {
     mu: u256,
 
     pub fn generate() PaillierKeyPair {
-        var p_bytes: [16]u8 = undefined;
-        crypto.random.bytes(&p_bytes);
-        var q_bytes: [16]u8 = undefined;
-        crypto.random.bytes(&q_bytes);
-
-        const p = bytesToU128(&p_bytes) | 1;
-        const q = bytesToU128(&q_bytes) | 1;
+        const p = generatePrime128();
+        const q = generatePrime128();
 
         const n: u256 = @as(u256, p) * @as(u256, q);
         const n_squared: u512 = @as(u512, n) * @as(u512, n);
@@ -50,6 +45,82 @@ pub const PaillierKeyPair = struct {
         };
     }
 };
+
+fn generatePrime128() u128 {
+    while (true) {
+        var buf: [16]u8 = undefined;
+        crypto.random.bytes(&buf);
+        var candidate = bytesToU128(&buf);
+        candidate |= @as(u128, 1) << 126;
+        candidate |= @as(u128, 1);
+        if (isProbablePrime128(candidate)) {
+            return candidate;
+        }
+        candidate += 2;
+        var attempts: usize = 0;
+        while (attempts < 1000) : (attempts += 1) {
+            if (isProbablePrime128(candidate)) {
+                return candidate;
+            }
+            candidate += 2;
+        }
+    }
+}
+
+fn isProbablePrime128(n: u128) bool {
+    if (n < 2) return false;
+    if (n == 2 or n == 3) return true;
+    if (n % 2 == 0) return false;
+    const small_primes = [_]u128{ 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97 };
+    for (small_primes) |p| {
+        if (n == p) return true;
+        if (n % p == 0) return false;
+    }
+    var d = n - 1;
+    var r: u32 = 0;
+    while (d % 2 == 0) {
+        d /= 2;
+        r += 1;
+    }
+    const witnesses = [_]u128{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
+    for (witnesses) |a| {
+        if (a >= n) continue;
+        var x = modPow128(a, d, n);
+        if (x == 1 or x == n - 1) continue;
+        var j: u32 = 0;
+        var found = false;
+        while (j < r - 1) : (j += 1) {
+            x = modMul128(x, x, n);
+            if (x == n - 1) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn modPow128(base: u128, exp: u128, modulus: u128) u128 {
+    if (modulus == 0) return 0;
+    if (modulus == 1) return 0;
+    var result: u256 = 1;
+    var b: u256 = @as(u256, base) % @as(u256, modulus);
+    var e = exp;
+    while (e > 0) {
+        if (e & 1 == 1) {
+            result = (result * b) % @as(u256, modulus);
+        }
+        e = e >> 1;
+        b = (b * b) % @as(u256, modulus);
+    }
+    return @truncate(result);
+}
+
+fn modMul128(a: u128, b: u128, modulus: u128) u128 {
+    const product = @as(u256, a) * @as(u256, b);
+    return @truncate(product % @as(u256, modulus));
+}
 
 fn bytesToU256(bytes: *const [32]u8) u256 {
     var result: u256 = 0;
@@ -150,6 +221,32 @@ fn modPow256(base: u256, exp: u256, modulus: u256) u256 {
     return @truncate(result);
 }
 
+fn modInverse512(a: u512, m: u512) u512 {
+    if (m == 0) return 0;
+    if (a == 0) return 0;
+
+    var t: i1024 = 0;
+    var new_t: i1024 = 1;
+    var r: i1024 = @intCast(m);
+    var new_r: i1024 = @intCast(a % m);
+
+    while (new_r != 0) {
+        const quotient = @divFloor(r, new_r);
+        const temp_t = t - quotient * new_t;
+        t = new_t;
+        new_t = temp_t;
+
+        const temp_r = r - quotient * new_r;
+        r = new_r;
+        new_r = temp_r;
+    }
+
+    if (r > 1) return 0;
+    if (t < 0) t = t + @as(i1024, @intCast(m));
+
+    return @truncate(@as(u1024, @intCast(t)) % @as(u1024, m));
+}
+
 fn modPow512(base: u512, exp: u512, modulus: u512) u512 {
     if (modulus == 0) return 0;
     if (modulus == 1) return 0;
@@ -245,8 +342,14 @@ pub const HomomorphicEncryption = struct {
 
     pub fn multiplyScalar(self: *Self, c: u512, scalar: i64) u512 {
         self.operation_count += 1;
+        if (scalar == 0) return 1;
+        if (scalar == 1) return c;
         const abs_scalar: u64 = if (scalar < 0) @intCast(-scalar) else @intCast(scalar);
-        return modPow512(c, @as(u512, abs_scalar), self.keys.n_squared);
+        const result = modPow512(c, @as(u512, abs_scalar), self.keys.n_squared);
+        if (scalar < 0) {
+            return modInverse512(result, self.keys.n_squared);
+        }
+        return result;
     }
 
     pub fn multiply(self: *Self, c1: u512, scalar: i64) u512 {
@@ -330,6 +433,9 @@ pub const DatasetFingerprint = struct {
             .similarity_threshold = 0.9,
         };
 
+        if (self.fingerprints.fetchRemove(sample_hash)) |removed| {
+            removed.value.encrypted_features.deinit();
+        }
         try self.fingerprints.put(sample_hash, fingerprint);
 
         try self.indexToLSH(sample_hash, features);
@@ -410,7 +516,7 @@ pub const SecureDataSampler = struct {
 
     const EncryptedSample = struct {
         id_hash: [32]u8,
-        encrypted_data: ArrayList(u256),
+        encrypted_data: ArrayList(u512),
         noise_signature: [32]u8,
         sensitivity: f64,
     };
@@ -449,7 +555,7 @@ pub const SecureDataSampler = struct {
         var id_hash: [32]u8 = undefined;
         hasher.final(&id_hash);
 
-        var encrypted_data = ArrayList(u256).init(self.allocator);
+        var encrypted_data = ArrayList(u512).init(self.allocator);
         for (data) |val| {
             const encrypted = try he.encrypt(val);
             try encrypted_data.append(encrypted);
@@ -532,6 +638,7 @@ pub const ProofOfCorrectness = struct {
     };
 
     pub const OperationType = enum {
+        ScalarMultiply,
         MatrixMultiply,
         AffineCoupling,
         ScatterPermute,
@@ -678,7 +785,7 @@ pub const DatasetIsolation = struct {
         encrypted_metadata: ArrayList(u8),
         access_log: ArrayList(AccessRecord),
         creation_time: i64,
-        expiry_time: ?i64,
+        expiry_time: ?i128,
     };
 
     const AccessPolicy = struct {
@@ -724,7 +831,7 @@ pub const DatasetIsolation = struct {
         crypto.random.bytes(&access_key);
 
         const current_time = std.time.nanoTimestamp();
-        const expiry = if (expiry_seconds) |secs| current_time + secs * 1000 else null;
+        const expiry = if (expiry_seconds) |secs| current_time + @as(i128, secs) * std.time.ns_per_s else null;
 
         const barrier = IsolationBarrier{
             .dataset_id = dataset_id,
@@ -806,3 +913,5 @@ pub const DatasetIsolation = struct {
         return std.mem.eql(u8, &barrier.access_key, &access_key);
     }
 };
+
+================

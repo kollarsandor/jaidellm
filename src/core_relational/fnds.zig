@@ -659,13 +659,50 @@ pub const FractalLevel = struct {
     fn estimateBoxCount(self: *Self, box_size: usize) usize {
         if (box_size == 0) return 0;
         if (self.node_count == 0) return 0;
-        const box_size_f = @as(f64, @floatFromInt(box_size));
-        const n_f = @as(f64, @floatFromInt(self.node_count));
-        const result = @ceil(n_f / box_size_f);
-        if (!isFiniteF64(result) or result < 1.0) return 1;
-        const max_f = @as(f64, @floatFromInt(std.math.maxInt(usize)));
-        if (result > max_f) return std.math.maxInt(usize);
-        return @as(usize, @intFromFloat(result));
+        var node_positions = ArrayList(usize).init(self.allocator);
+        defer node_positions.deinit();
+        var edge_positions = ArrayList(usize).init(self.allocator);
+        defer edge_positions.deinit();
+        var node_iter = self.nodes.iterator();
+        while (node_iter.next()) |entry| {
+            const node = entry.value_ptr;
+            const weight_bits = canonicalF64Bytes(node.weight);
+            var h1 = std.hash.Wyhash.init(0);
+            h1.update(node.id);
+            h1.update(&weight_bits);
+            const h1_val = h1.final();
+            var h2 = std.hash.Wyhash.init(h1_val);
+            h2.update(node.data);
+            const position = h2.final();
+            try node_positions.append(@as(usize, @truncate(position)));
+        }
+        var edge_iter = self.edges.iterator();
+        while (edge_iter.next()) |entry| {
+            for (entry.value_ptr.items) |edge| {
+                const src_bits = canonicalF64Bytes(edge.weight);
+                var h1 = std.hash.Wyhash.init(0);
+                h1.update(edge.source_id);
+                h1.update(edge.target_id);
+                h1.update(&src_bits);
+                const h1_val = h1.final();
+                var h2 = std.hash.Wyhash.init(h1_val);
+                h2.update(&canonicalF64Bytes(edge.fractal_correlation));
+                const position = h2.final();
+                try edge_positions.append(@as(usize, @truncate(position)));
+            }
+        }
+        var occupied = std.AutoHashMap(usize, void).init(self.allocator);
+        defer occupied.deinit();
+        const scale = @as(f64, @floatFromInt(box_size));
+        for (node_positions.items) |pos| {
+            const scaled = @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(pos)) / scale)));
+            occupied.put(scaled, {}) catch return self.node_count;
+        }
+        for (edge_positions.items) |pos| {
+            const scaled = @as(usize, @intFromFloat(@floor(@as(f64, @floatFromInt(pos)) / scale)));
+            occupied.put(scaled, {}) catch {};
+        }
+        return occupied.count();
     }
 
     pub fn getDepth(self: *const Self) usize {
@@ -763,12 +800,11 @@ pub const FractalTree = struct {
         if (target_level > self.max_depth) return false;
         if (node_id.len == 0) return FNDSError.InvalidArgument;
 
-        if (self.searchInternal(self.root, node_id) != null) {
-            const existing = self.searchInternal(self.root, node_id).?;
+        if (self.searchLevelForNode(self.root, node_id)) |found| {
             const new_data = try self.allocator.dupe(u8, data);
-            self.allocator.free(@constCast(existing.data));
-            existing.data = new_data;
-            existing.refreshSignature();
+            self.allocator.free(@constCast(found.data));
+            found.data = new_data;
+            found.refreshSignature();
             self.last_modified = @as(u64, @intCast(std.time.nanoTimestamp()));
             return true;
         }
@@ -821,21 +857,26 @@ pub const FractalTree = struct {
         if (level.getNode(node_id)) |node| return node;
         var visited = std.AutoHashMap(*FractalLevel, void).init(self.allocator);
         defer visited.deinit();
-        var stack = std.ArrayList(*FractalLevel).init(self.allocator);
-        defer stack.deinit();
+        var fifo = std.fifo.LinearFifo(*FractalLevel, .Dynamic).init(self.allocator);
+        defer fifo.deinit();
         visited.put(level, {}) catch return null;
         for (level.child_levels.items) |child| {
-            stack.append(child) catch return null;
+            fifo.writeItem(child) catch return null;
         }
-        while (stack.pop()) |curr| {
+        while (fifo.readItem()) |curr| {
             if (visited.contains(curr)) continue;
             visited.put(curr, {}) catch return null;
             if (curr.getNode(node_id)) |node| return node;
             for (curr.child_levels.items) |child| {
-                stack.append(child) catch return null;
+                fifo.writeItem(child) catch return null;
             }
         }
         return null;
+    }
+
+    fn searchLevelForNode(self: *Self, level: *FractalLevel, node_id: []const u8) ?*FractalNodeData {
+        _ = self;
+        return level.getNode(node_id);
     }
 
     pub fn searchConst(self: *const Self, node_id: []const u8) ?*const FractalNodeData {
@@ -964,15 +1005,25 @@ pub const FractalTree = struct {
     }
 
     pub fn balance(self: *Self) !void {
-        if (self.is_balanced) return;
-
         var all_nodes = ArrayList(FractalNodeData).init(self.allocator);
-        defer {
+        errdefer {
             for (all_nodes.items) |*n| n.deinit();
             all_nodes.deinit();
         }
 
         try self.collectAllNodes(self.root, &all_nodes);
+
+        var sorted_ids = try self.allocator.alloc([]const u8, all_nodes.items.len);
+        defer self.allocator.free(sorted_ids);
+        var idx: usize = 0;
+        while (idx < all_nodes.items.len) : (idx += 1) {
+            sorted_ids[idx] = all_nodes.items[idx].id;
+        }
+        std.mem.sort([]const u8, sorted_ids, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
 
         const new_root = try self.allocator.create(FractalLevel);
         errdefer self.allocator.destroy(new_root);
@@ -992,8 +1043,11 @@ pub const FractalTree = struct {
             self.total_nodes = old_total;
         };
 
-        for (all_nodes.items) |*node| {
-            const target_level = self.computeOptimalLevel(node.id);
+        var max_depth = self.computeOptimalDepth();
+        if (max_depth == 0) max_depth = 1;
+
+        for (all_nodes.items, 0..) |*node, node_idx| {
+            const target_level = (node_idx * max_depth) / all_nodes.items.len;
             var current_level = self.root;
             var depth: usize = 0;
             while (depth < target_level) : (depth += 1) {
@@ -1005,16 +1059,16 @@ pub const FractalTree = struct {
                     errdefer new_child.deinit();
                     try current_level.addChildLevel(new_child);
                 }
-                const child_index = self.computeChildIndex(node.id, depth, current_level.child_levels.items.len);
+                const child_index = (node_idx + depth) % current_level.child_levels.items.len;
                 current_level = current_level.child_levels.items[child_index];
             }
             const cloned = try node.clone(self.allocator);
-            var cloned_mut = cloned;
-            errdefer cloned_mut.deinit();
-            try current_level.addNode(cloned_mut);
+            try current_level.addNode(cloned);
+            node.deinit();
             self.total_nodes = satAddUsize(self.total_nodes, 1);
         }
 
+        all_nodes.clearRetainingCapacity();
         rebuilt = true;
         old_root.deinit();
         self.allocator.destroy(old_root);
@@ -2312,3 +2366,5 @@ test "FNDSManager full workflow" {
     try std.testing.expect(stats.total_indices == 1);
     try std.testing.expect(stats.cache_hits == 1);
 }
+
+================

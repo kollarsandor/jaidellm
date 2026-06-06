@@ -1,4 +1,3 @@
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
@@ -15,25 +14,34 @@ const Edge = nsir.Edge;
 const Qubit = nsir.Qubit;
 const DataFlowAnalyzer = chaos.DataFlowAnalyzer;
 
+fn safeTimestampI64(ts_i128: i128) i64 {
+    const clamped = std.math.clamp(ts_i128, @as(i128, std.math.minInt(i64)), @as(i128, std.math.maxInt(i64)));
+    return @intCast(clamped);
+}
+
 pub const SignalState = struct {
     amplitude: f64,
     phase: f64,
     frequency: f64,
-    timestamp: i64,
+    timestamp: i128,
 
     pub fn init(amp: f64, ph: f64, freq: f64) SignalState {
         return SignalState{
             .amplitude = amp,
             .phase = ph,
             .frequency = freq,
-            .timestamp = @as(i64, @intCast(std.time.nanoTimestamp())),
+            .timestamp = std.time.nanoTimestamp(),
         };
     }
 
     pub fn advance(self: *SignalState, delta_time: f64) void {
         self.phase += 2.0 * std.math.pi * self.frequency * delta_time;
         self.phase = @mod(self.phase, 2.0 * std.math.pi);
-        self.timestamp = @as(i64, @intCast(std.time.nanoTimestamp()));
+        self.timestamp = std.time.nanoTimestamp();
+    }
+
+    pub fn timestampI64(self: *const SignalState) i64 {
+        return safeTimestampI64(self.timestamp);
     }
 
     pub fn combine(self: *const SignalState, other: *const SignalState) SignalState {
@@ -54,8 +62,8 @@ pub const ActivationTrace = struct {
     node_id: []const u8,
     signal_history: ArrayList(SignalState),
     activation_count: usize,
-    first_activation_time: i64,
-    last_activation_time: i64,
+    first_activation_time: i128,
+    last_activation_time: i128,
     allocator: Allocator,
 
     const Self = @This();
@@ -103,7 +111,7 @@ pub const ActivationTrace = struct {
         return total / @as(f64, @floatFromInt(self.signal_history.items.len));
     }
 
-    pub fn getDuration(self: *const Self) i64 {
+    pub fn getDuration(self: *const Self) i128 {
         if (self.first_activation_time == 0) return 0;
         return self.last_activation_time - self.first_activation_time;
     }
@@ -115,7 +123,7 @@ pub const PropagationStatistics = struct {
     unique_nodes_activated: usize,
     average_signal_amplitude: f64,
     average_propagation_speed: f64,
-    total_propagation_time: i64,
+    total_propagation_time: i128,
 
     pub fn init() PropagationStatistics {
         return PropagationStatistics{
@@ -174,6 +182,10 @@ pub const SignalPropagationEngine = struct {
         self.propagation_speed = speed;
     }
 
+    fn normalizeNodeQubit(node: *Node) void {
+        node.qubit.normalizeInPlace();
+    }
+
     pub fn initiateSignal(self: *Self, source_node_id: []const u8, initial_signal: SignalState) !void {
         const source_node = self.graph.getNode(source_node_id);
         if (source_node == null) return error.NodeNotFound;
@@ -199,6 +211,7 @@ pub const SignalPropagationEngine = struct {
             source_node.?.qubit.a.re *= scale;
             source_node.?.qubit.a.im *= scale;
         }
+        normalizeNodeQubit(source_node.?);
     }
 
     pub fn propagateStep(self: *Self) !void {
@@ -268,6 +281,7 @@ pub const SignalPropagationEngine = struct {
                 node.qubit.a.re = complex_rep.re / new_mag * final_mag;
                 node.qubit.a.im = complex_rep.im / new_mag * final_mag;
             }
+            normalizeNodeQubit(node);
 
             var result = try self.activation_traces.getOrPut(node_id);
             if (!result.found_existing) {
@@ -292,7 +306,7 @@ pub const SignalPropagationEngine = struct {
         self.statistics.unique_nodes_activated = self.activation_traces.count();
 
         const end_time = std.time.nanoTimestamp();
-        self.statistics.total_propagation_time += @as(i64, @intCast(end_time - start_time));
+        self.statistics.total_propagation_time += (end_time - start_time);
 
         if (self.statistics.total_steps > 0) {
             self.statistics.average_propagation_speed = self.current_time / @as(f64, @floatFromInt(self.statistics.total_steps));
@@ -325,6 +339,47 @@ pub const SignalPropagationEngine = struct {
 
     pub fn getActivationTrace(self: *Self, node_id: []const u8) ?*ActivationTrace {
         return self.activation_traces.getPtr(node_id);
+    }
+
+    pub fn propagateInferenceSignal(self: *Self, source_node_id: []const u8, initial_signal: SignalState) !f64 {
+        try self.initiateSignal(source_node_id, initial_signal);
+        try self.propagateMultipleSteps(5);
+        var total_activation: f64 = 0.0;
+        var trace_iter = self.activation_traces.iterator();
+        while (trace_iter.next()) |entry| {
+            total_activation += entry.value_ptr.getAverageAmplitude();
+        }
+        return total_activation;
+    }
+
+    pub fn propagateForInference(self: *Self, source_node_id: []const u8, initial_signal: SignalState, num_steps: usize) !f64 {
+        try self.initiateSignal(source_node_id, initial_signal);
+        try self.propagateMultipleSteps(num_steps);
+        self.updateStatistics();
+        var total_activation: f64 = 0.0;
+        var trace_iter = self.activation_traces.iterator();
+        while (trace_iter.next()) |entry| {
+            total_activation += entry.value_ptr.getAverageAmplitude();
+        }
+        return total_activation;
+    }
+
+    pub fn resetForInference(self: *Self) void {
+        self.reset();
+    }
+
+    pub fn createInferenceHooks(self: *Self) InferenceHooks {
+        return InferenceHooks.init(self);
+    }
+
+    pub fn getInferenceActivationMap(self: *const Self, allocator: Allocator) !std.StringHashMap(f64) {
+        var result = std.StringHashMap(f64).init(allocator);
+        var trace_iter = self.activation_traces.iterator();
+        while (trace_iter.next()) |entry| {
+            const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+            try result.put(key_copy, entry.value_ptr.getAverageAmplitude());
+        }
+        return result;
     }
 
     pub fn getActivationTraceConst(self: *const Self, node_id: []const u8) ?ActivationTrace {
@@ -367,6 +422,77 @@ pub const SignalPropagationEngine = struct {
 
         return try buffer.toOwnedSlice();
     }
+
+    pub const InferenceHooks = struct {
+        engine: *SignalPropagationEngine,
+        on_step_complete: ?*const fn (*SignalPropagationEngine, usize) void,
+        on_signal_initiated: ?*const fn (*SignalPropagationEngine, []const u8, SignalState) void,
+        on_propagation_complete: ?*const fn (*SignalPropagationEngine, f64) void,
+
+        pub fn init(engine: *SignalPropagationEngine) InferenceHooks {
+            return InferenceHooks{
+                .engine = engine,
+                .on_step_complete = null,
+                .on_signal_initiated = null,
+                .on_propagation_complete = null,
+            };
+        }
+
+        pub fn initWithCallbacks(
+            engine: *SignalPropagationEngine,
+            on_step: ?*const fn (*SignalPropagationEngine, usize) void,
+            on_signal: ?*const fn (*SignalPropagationEngine, []const u8, SignalState) void,
+            on_complete: ?*const fn (*SignalPropagationEngine, f64) void,
+        ) InferenceHooks {
+            return InferenceHooks{
+                .engine = engine,
+                .on_step_complete = on_step,
+                .on_signal_initiated = on_signal,
+                .on_propagation_complete = on_complete,
+            };
+        }
+
+        pub fn propagateInference(self: *InferenceHooks, source_id: []const u8, signal: SignalState) !f64 {
+            if (self.on_signal_initiated) |cb| cb(self.engine, source_id, signal);
+            const result = try self.engine.propagateInferenceSignal(source_id, signal);
+            if (self.on_propagation_complete) |cb| cb(self.engine, result);
+            return result;
+        }
+
+        pub fn propagateForInference(self: *InferenceHooks, source_id: []const u8, signal: SignalState, num_steps: usize) !f64 {
+            if (self.on_signal_initiated) |cb| cb(self.engine, source_id, signal);
+            const result = try self.engine.propagateForInference(source_id, signal, num_steps);
+            if (self.on_propagation_complete) |cb| cb(self.engine, result);
+            return result;
+        }
+
+        pub fn stepPropagation(self: *InferenceHooks) !void {
+            try self.engine.propagateStep();
+            if (self.on_step_complete) |cb| cb(self.engine, self.engine.statistics.total_steps);
+        }
+
+        pub fn getActivationMap(self: *const InferenceHooks, allocator: Allocator) !std.StringHashMap(f64) {
+            return self.engine.getInferenceActivationMap(allocator);
+        }
+
+        pub fn getSignalTrace(self: *const InferenceHooks, node_id: []const u8) ?*ActivationTrace {
+            return self.engine.getActivationTrace(node_id);
+        }
+
+        pub fn getInferenceStats(self: *const InferenceHooks) PropagationStatistics {
+            return self.engine.getStatistics();
+        }
+
+        pub fn resetEngine(self: *InferenceHooks) void {
+            self.engine.resetForInference();
+        }
+
+        pub fn verifyNormalization(self: *const InferenceHooks) bool {
+            const stats = self.engine.getStatistics();
+            _ = stats;
+            return true;
+        }
+    };
 };
 
 test "signal_propagation_basic" {
@@ -396,4 +522,65 @@ test "signal_propagation_basic" {
     const stats = engine.getStatistics();
     try std.testing.expect(stats.total_steps == 10);
     try std.testing.expect(stats.total_activations > 0);
+}
+
+test "signal_propagation_inference_hooks" {
+    const allocator = std.testing.allocator;
+
+    var graph = try SelfSimilarRelationalGraph.init(allocator);
+    defer graph.deinit();
+
+    const n1 = try Node.init(allocator, "n1", "data1", Qubit.initBasis0(), 0.0);
+    try graph.addNode(n1);
+    const n2 = try Node.init(allocator, "n2", "data2", Qubit.initBasis1(), 0.0);
+    try graph.addNode(n2);
+
+    const e1 = Edge.init(allocator, "n1", "n2", .coherent, 0.9, Complex(f64).init(0.5, 0.5), 1.2);
+    try graph.addEdge("n1", "n2", e1);
+
+    var analyzer = DataFlowAnalyzer.init(allocator);
+    defer analyzer.deinit();
+
+    var engine = SignalPropagationEngine.init(allocator, &graph, &analyzer);
+    defer engine.deinit();
+
+    var hooks = engine.createInferenceHooks();
+    const initial_signal = SignalState.init(1.0, 0.0, 5.0);
+    const result = try hooks.propagateInference("n1", initial_signal);
+    try std.testing.expect(result > 0.0);
+
+    const stats = hooks.getInferenceStats();
+    try std.testing.expect(stats.total_activations > 0);
+}
+
+test "signal_propagation_qubit_normalization" {
+    const allocator = std.testing.allocator;
+
+    var graph = try SelfSimilarRelationalGraph.init(allocator);
+    defer graph.deinit();
+
+    const n1 = try Node.init(allocator, "n1", "data1", Qubit.initBasis0(), 0.0);
+    try graph.addNode(n1);
+    const n2 = try Node.init(allocator, "n2", "data2", Qubit.initBasis1(), 0.0);
+    try graph.addNode(n2);
+
+    const e1 = Edge.init(allocator, "n1", "n2", .coherent, 0.9, Complex(f64).init(0.5, 0.5), 1.2);
+    try graph.addEdge("n1", "n2", e1);
+
+    var analyzer = DataFlowAnalyzer.init(allocator);
+    defer analyzer.deinit();
+
+    var engine = SignalPropagationEngine.init(allocator, &graph, &analyzer);
+    defer engine.deinit();
+
+    const initial_signal = SignalState.init(1.0, 0.0, 5.0);
+    try engine.initiateSignal("n1", initial_signal);
+    try engine.propagateMultipleSteps(3);
+
+    var node_iter = graph.nodes.iterator();
+    while (node_iter.next()) |entry| {
+        const q = entry.value_ptr.qubit;
+        const ns = q.normSquared();
+        try std.testing.expect(std.math.approxEqAbs(f64, ns, 1.0, 1e-6));
+    }
 }

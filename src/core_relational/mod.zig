@@ -382,3 +382,5 @@ test "core_relational module integration" {
 
     try std.testing.expect(kernel.cycle_count == 0);
 }
+
+================

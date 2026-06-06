@@ -130,3 +130,5 @@ pub const cudaMemcpyKind = struct {
     pub const cudaMemcpyDeviceToHost: c_int = 2;
     pub const cudaMemcpyDeviceToDevice: c_int = 3;
 };
+
+================

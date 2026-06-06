@@ -115,18 +115,12 @@ entry batch_gradients [batch_size][seq_len][half] (inputs: [batch_size][seq_len]
   let gtb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) gtb_list
   in (copy gs_total, copy gt_total, copy gsb_total, copy gtb_total)
 
--- Single-sample RSF backward that ALSO computes grad_input (for chaining multi-layer backprop).
--- Returns: (grad_ws, grad_wt, grad_sb, grad_tb, grad_input)
--- grad_ws, grad_wt: [half][half] -- summed over the `n` (=seq_len) dimension
--- grad_sb, grad_tb: [half] -- summed over the `n` dimension
--- grad_input: [n][half*2] -- per-timestep input gradient for next-layer-up backward
 entry rsf_backward_full [n][half] (input: [n][half*2]f16) (grad_output: [n][half*2]f16)
   (weights_s: [half][half]f16) (weights_t: [half][half]f16)
   (s_bias: [half]f16) (t_bias: [half]f16)
   (clip_min: f16) (clip_max: f16)
   : ([half][half]f16, [half][half]f16, [half]f16, [half]f16, [n][half*2]f16) =
   let d = half * 2
-  -- Per-token computation: per-token weight/bias gradient + per-token input gradient
   let per_token = map2 (\row g_row ->
     let x1 = row[0:half] :> [half]f16
     let x2 = row[half:d] :> [half]f16
@@ -142,20 +136,15 @@ entry rsf_backward_full [n][half] (input: [n][half*2]f16) (grad_output: [n][half
     let dy2 = g_row[half:d] :> [half]f16
     let grad_wt_tok = map (\j -> map (\k -> dy2[j] f16.* y1[k]) (iota half)) (iota half)
     let grad_tb_tok = dy2
-    -- dy1_total[j] = dy1[j] + sum_k(W_t[k][j] * dy2[k])
     let dy1_total = map2 (\dy1_j j ->
       dy1_j f16.+ f16.sum (map (\k -> weights_t[k][j] f16.* dy2[k]) (iota half))
     ) dy1 (iota half)
-    -- ds = d_pre_scale = dy1_total * y1   (in-range gated)
     let ds = map2 (\j ps ->
       let in_range = ps f16.>= clip_min && ps f16.<= clip_max
       in if in_range then dy1_total[j] f16.* y1[j] else (f16.i32 0)
     ) (iota half) pre_scale
     let grad_ws_tok = map (\j -> map (\k -> ds[j] f16.* x2[k]) (iota half)) (iota half)
     let grad_sb_tok = ds
-    -- Input gradients flowing to previous layer:
-    -- dx1[k] = dy1_total[k] * scale[k]   (from y1 = x1 * scale; dy1_total is accumulated grad at y1)
-    -- dx2[k] = dy2[k] + sum_j(ds[j] * W_s[j][k])
     let dx1 = map2 (\g s -> g f16.* s) dy1_total scale
     let dx2_from_ds = map (\k ->
       f16.sum (map (\j -> ds[j] f16.* weights_s[j][k]) (iota half))
@@ -171,9 +160,6 @@ entry rsf_backward_full [n][half] (input: [n][half*2]f16) (grad_output: [n][half
   let gtb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) g_tb_list
   in (gs_total, gt_total, gsb_total, gtb_total, g_in_rows)
 
--- Batched version of rsf_backward_full.
--- Sums weight/bias gradients across all batch_size*seq_len tokens, but preserves
--- per-token grad_input (shape [batch_size][seq_len][half*2]) for further backprop.
 entry batch_gradients_full [batch_size][seq_len][half]
   (inputs: [batch_size][seq_len][half*2]f16)
   (grad_outputs: [batch_size][seq_len][half*2]f16)
@@ -191,7 +177,6 @@ entry batch_gradients_full [batch_size][seq_len][half]
   let gtb_total = reduce (map2 (f16.+)) (replicate half (f16.i32 0)) gtb_list
   in (copy gs_total, copy gt_total, copy gsb_total, copy gtb_total, copy gin_list)
 
--- 2 * (output - target) per element. Used as the initial dL/dY at the top of the stack.
 entry compute_initial_grad_l2 [batch_size][seq_len][d]
   (outputs: [batch_size][seq_len][d]f16) (targets: [batch_size][seq_len][d]f16)
   : *[batch_size][seq_len][d]f16 =
@@ -243,3 +228,54 @@ entry training_step [batch_size][seq_len][half]
   let (new_t_bias, new_velocity_tb) = sfd_update_bias t_bias grad_tb_c learning_rate momentum velocity_tb
 
   in (new_weights_s, new_weights_t, new_s_bias, new_t_bias, new_velocity_s, new_velocity_t, new_velocity_sb, new_velocity_tb, loss)
+
+let oftb_scale : f16 = f16.f32 0.7071067811865476
+
+entry oftb_forward_single [n][half] (input: [n][half*2]f16) : *[n][half*2]f16 =
+  let d = half * 2
+  in map (\row ->
+    let x1 = row[0:half] :> [half]f16
+    let x2 = row[half:d] :> [half]f16
+    let new_x1 = map2 (\a b -> (a f16.- b) f16.* oftb_scale) x1 x2
+    let new_x2 = map2 (\a b -> (a f16.+ b) f16.* oftb_scale) x1 x2
+    in new_x1 ++ new_x2 :> [half*2]f16
+  ) input
+
+entry oftb_backward_single [n][half] (grad_output: [n][half*2]f16) : *[n][half*2]f16 =
+  let d = half * 2
+  in map (\row ->
+    let g1 = row[0:half] :> [half]f16
+    let g2 = row[half:d] :> [half]f16
+    let new_g1 = map2 (\a b -> (a f16.+ b) f16.* oftb_scale) g1 g2
+    let new_g2 = map2 (\a b -> (b f16.- a) f16.* oftb_scale) g1 g2
+    in new_g1 ++ new_g2 :> [half*2]f16
+  ) grad_output
+
+entry oftb_forward [batch_size][seq_len][half] (inputs: [batch_size][seq_len][half*2]f16) : *[batch_size][seq_len][half*2]f16 =
+  map (\sample -> oftb_forward_single sample) inputs
+
+entry oftb_backward [batch_size][seq_len][half] (grad_outputs: [batch_size][seq_len][half*2]f16) : *[batch_size][seq_len][half*2]f16 =
+  map (\sample -> oftb_backward_single sample) grad_outputs
+
+entry batch_oftb_forward [batch_size][seq_len][half] (inputs: [batch_size][seq_len][half*2]f16) : *[batch_size][seq_len][half*2]f16 =
+  oftb_forward inputs
+
+entry batch_oftb_backward [batch_size][seq_len][half] (grad_outputs: [batch_size][seq_len][half*2]f16) : *[batch_size][seq_len][half*2]f16 =
+  oftb_backward grad_outputs
+
+entry embedding_forward [n][vocab_size][dim] (tokens: [n]i64) (weight: [vocab_size][dim]f16) : *[n][dim]f16 =
+  map (\tok ->
+    let t = if tok >= 0 && tok < i64.i32 vocab_size then tok else 0
+    in weight[i32.i64 t]
+  ) tokens
+
+entry embedding_backward [n][vocab_size][dim] (tokens: [n]i64) (grad_output: [n][dim]f16) (grad_weight: [vocab_size][dim]f16) : *[vocab_size][dim]f16 =
+  loop (gw = grad_weight) for i < n do
+    let t = if tokens[i] >= 0 && tokens[i] < i64.i32 vocab_size then i32.i64 tokens[i] else 0
+    let row_update = map2 (\g acc -> acc f16.+ g) grad_output[i] gw[t]
+    in map (\j ->
+      if j == t then row_update else gw[j]
+    ) (iota vocab_size)
+
+entry embedding_update [vocab_size][dim] (weight: *[vocab_size][dim]f16) (grad_weight: [vocab_size][dim]f16) (lr: f16) : *[vocab_size][dim]f16 =
+  map2 (map2 (\w g -> w f16.- lr f16.* g)) weight grad_weight

@@ -11,10 +11,22 @@ const SSI = @import("../index/ssi.zig").SSI;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const ModelFormat = @import("../core/model_io.zig").ModelFormat;
 const importModel = @import("../core/model_io.zig").importModel;
-const core_memory = @import("../core/memory.zig");
-const nsir = @import("../core_relational/nsir_core.zig");
-const sfd = @import("../optimizer/sfd.zig");
-const accel = @import("../hw/accel/accel_interface.zig");
+const LearnedEmbedding = @import("../core/learned_embedding.zig").LearnedEmbedding;
+const OFTB = @import("../processor/oftb.zig").OFTB;
+const core_relational = @import("../core_relational/mod.zig");
+const ChaosCoreKernel = core_relational.ChaosCoreKernel;
+const CREVPipeline = core_relational.CREVPipeline;
+const EntangledStochasticSymmetryOptimizer = core_relational.EntangledStochasticSymmetryOptimizer;
+const ReasoningOrchestrator = core_relational.ReasoningOrchestrator;
+const SurpriseMemoryManager = core_relational.SurpriseMemoryManager;
+const TemporalGraph = core_relational.TemporalGraph;
+const VerifiedInferenceEngine = core_relational.VerifiedInferenceEngine;
+const SignalPropagationEngine = core_relational.SignalPropagationEngine;
+const ZRuntime = core_relational.ZRuntime;
+const SelfSimilarRelationalGraph = core_relational.SelfSimilarRelationalGraph;
+const QuantumState = core_relational.QuantumState;
+const FractalLPU = @import("../hw/accel/fractal_lpu.zig").FractalLPU;
+const RelationalGraphProcessingUnit = core_relational.RelationalGraphProcessingUnit;
 
 pub const ServerConfig = struct {
     port: u16 = 8080,
@@ -24,11 +36,10 @@ pub const ServerConfig = struct {
     batch_size: usize = 32,
     model_path: ?[]const u8 = null,
     rate_limit_per_minute: u32 = 10,
-    max_request_size_bytes: usize = 1024 * 1024,
+    max_request_size_bytes: usize = 16 * 1024 * 1024,
     require_api_key: bool = true,
-    dataset_path: ?[]const u8 = null,
-    sample_limit: ?usize = null,
-    num_validation_samples: usize = 100,
+    num_worker_threads: u32 = 4,
+    keep_alive_timeout_ms: u64 = 5000,
 };
 
 const RateLimiter = struct {
@@ -159,6 +170,8 @@ pub const InferenceRequest = struct {
 
 pub const InferenceResponse = struct {
     tokens: []u32,
+    text: ?[]const u8 = null,
+    input_tokens: ?[]u32 = null,
     embeddings: ?[]f32 = null,
     processing_time_ms: f64,
 
@@ -174,6 +187,39 @@ pub const InferenceResponse = struct {
             try writer.print("{d}", .{self.tokens[i]});
         }
         try writer.writeAll("]");
+
+        if (self.text) |t| {
+            try writer.writeAll(",\"text\":\"");
+            var ci: usize = 0;
+            while (ci < t.len) : (ci += 1) {
+                const c = t[ci];
+                switch (c) {
+                    '"' => try writer.writeAll("\\\""),
+                    '\\' => try writer.writeAll("\\\\"),
+                    '\n' => try writer.writeAll("\\n"),
+                    '\r' => try writer.writeAll("\\r"),
+                    '\t' => try writer.writeAll("\\t"),
+                    else => {
+                        if (c >= 0x20 and c < 0x7f) {
+                            try writer.writeByte(c);
+                        } else {
+                            try writer.print("\\u{d:0>4}", .{@as(u16, @intCast(c))});
+                        }
+                    },
+                }
+            }
+            try writer.writeAll("\"");
+        }
+
+        if (self.input_tokens) |it| {
+            try writer.writeAll(",\"input_tokens\":[");
+            var j: usize = 0;
+            while (j < it.len) : (j += 1) {
+                if (j > 0) try writer.writeAll(",");
+                try writer.print("{d}", .{it[j]});
+            }
+            try writer.writeAll("]");
+        }
 
         if (self.embeddings) |emb| {
             try writer.writeAll(",\"embeddings\":[");
@@ -193,6 +239,12 @@ pub const InferenceResponse = struct {
 
     pub fn deinit(self: *InferenceResponse, allocator: Allocator) void {
         allocator.free(self.tokens);
+        if (self.text) |t| {
+            allocator.free(t);
+        }
+        if (self.input_tokens) |it| {
+            allocator.free(it);
+        }
         if (self.embeddings) |emb| {
             allocator.free(emb);
         }
@@ -221,20 +273,27 @@ pub const HealthResponse = struct {
     }
 };
 
-fn nsirModulateForInference(data: []f32) void {
+fn boostAboveMean(data: []f32) void {
     if (data.len == 0) return;
-    var mean: f32 = 0.0;
+    var mean: f64 = 0.0;
     for (data) |v| {
-        mean += v;
+        mean += @as(f64, v);
     }
-    mean /= @as(f32, @floatFromInt(data.len));
+    mean /= @as(f64, @floatFromInt(data.len));
+    const mean_f32: f32 = @floatCast(mean);
     var i: usize = 0;
     while (i < data.len) : (i += 1) {
-        if (data[i] > mean) {
+        if (data[i] > mean_f32) {
             data[i] *= 1.05;
         }
     }
 }
+
+const ConnectionContext = struct {
+    server: *InferenceServer,
+    stream: net.Stream,
+    client_addr: net.Address,
+};
 
 pub const InferenceServer = struct {
     allocator: Allocator,
@@ -242,31 +301,70 @@ pub const InferenceServer = struct {
     model: ?ModelFormat = null,
     ssi: ?SSI = null,
     ranker: ?Ranker = null,
-    request_count: u64,
+    request_count: std.atomic.Value(u64),
     inference_mutex: Thread.Mutex,
     start_time: i64,
     running: std.atomic.Value(bool),
+    embedding: ?LearnedEmbedding,
+    nsir_graph: ?SelfSimilarRelationalGraph,
+    chaos_kernel: ?ChaosCoreKernel,
+    esso: ?EntangledStochasticSymmetryOptimizer,
+    surprise_memory: ?SurpriseMemoryManager,
+    temporal_graph: ?TemporalGraph,
+    verifier: ?*VerifiedInferenceEngine,
+    signal_engine: ?SignalPropagationEngine,
+    z_runtime: ?*ZRuntime,
     rate_limiter: RateLimiter,
     api_key: ?[]const u8,
+    fractal_lpu: ?FractalLPU,
+    r_gpu: ?RelationalGraphProcessingUnit,
+    active_connections: std.atomic.Value(u32),
+    thread_pool: ?*Thread.Pool,
 
     pub fn init(allocator: Allocator, config: ServerConfig) !InferenceServer {
         var api_key: ?[]const u8 = null;
         if (config.require_api_key) {
             if (std.posix.getenv("JAIDE_API_KEY")) |env_key| {
                 api_key = try allocator.dupe(u8, env_key);
-                std.debug.print("API key loaded from environment\n", .{});
+            } else {
+                return error.ApiKeyRequired;
             }
+        }
+
+        var model_path_owned: ?[]const u8 = null;
+        if (config.model_path) |mp| {
+            model_path_owned = try allocator.dupe(u8, mp);
+        } else if (std.posix.getenv("JAIDE_MODEL_PATH")) |env_path| {
+            model_path_owned = try allocator.dupe(u8, env_path);
+        }
+
+        var effective_config = config;
+        if (model_path_owned) |mp| {
+            effective_config.model_path = mp;
         }
 
         return InferenceServer{
             .allocator = allocator,
-            .config = config,
-            .request_count = 0,
+            .config = effective_config,
+            .embedding = null,
+            .nsir_graph = null,
+            .chaos_kernel = null,
+            .esso = null,
+            .surprise_memory = null,
+            .temporal_graph = null,
+            .verifier = null,
+            .signal_engine = null,
+            .z_runtime = null,
+            .request_count = std.atomic.Value(u64).init(0),
             .inference_mutex = Thread.Mutex{},
-            .start_time = std.time.timestamp(),
+            .start_time = std.time.milliTimestamp(),
             .running = std.atomic.Value(bool).init(false),
             .rate_limiter = RateLimiter.init(allocator, config.rate_limit_per_minute),
             .api_key = api_key,
+            .fractal_lpu = null,
+            .r_gpu = null,
+            .active_connections = std.atomic.Value(u32).init(0),
+            .thread_pool = null,
         };
     }
 
@@ -280,8 +378,48 @@ pub const InferenceServer = struct {
         if (self.ranker) |*r| {
             r.deinit();
         }
+        if (self.embedding) |*emb| {
+            emb.deinit();
+        }
+        if (self.nsir_graph) |*graph| {
+            graph.deinit();
+        }
+        if (self.chaos_kernel) |*kernel| {
+            kernel.deinit();
+        }
+        if (self.esso) |*esso_opt| {
+            esso_opt.deinit();
+        }
+        if (self.surprise_memory) |*sm| {
+            sm.deinit();
+        }
+        if (self.temporal_graph) |*tg| {
+            tg.deinit();
+        }
+        if (self.verifier) |v| {
+            v.deinit();
+        }
+        if (self.signal_engine) |*se| {
+            se.deinit();
+        }
+        if (self.z_runtime) |zr| {
+            zr.deinit();
+        }
         if (self.api_key) |key| {
             self.allocator.free(key);
+        }
+        if (self.config.model_path) |mp| {
+            self.allocator.free(mp);
+        }
+        if (self.fractal_lpu) |*fl| {
+            fl.deinit();
+        }
+        if (self.r_gpu) |*rg| {
+            rg.deinit();
+        }
+        if (self.thread_pool) |pool| {
+            pool.deinit();
+            self.allocator.destroy(pool);
         }
         self.rate_limiter.deinit();
     }
@@ -290,6 +428,39 @@ pub const InferenceServer = struct {
         self.model = try importModel(path, self.allocator);
         self.ssi = SSI.init(self.allocator);
         self.ranker = try Ranker.init(self.allocator, 3, 8, 42);
+
+        const dim = if (self.model.?.rsf) |rsf| (rsf.ctrl orelse return).dim else 256;
+
+        self.embedding = try LearnedEmbedding.init(self.allocator, 50000, dim, 42);
+
+        self.nsir_graph = try SelfSimilarRelationalGraph.init(self.allocator);
+        self.chaos_kernel = ChaosCoreKernel.init(self.allocator);
+        self.esso = EntangledStochasticSymmetryOptimizer.init(self.allocator, 100.0, 0.95, 10000);
+        self.surprise_memory = SurpriseMemoryManager.init(self.allocator, &self.chaos_kernel.?.storage, &self.chaos_kernel.?.flow_analyzer);
+        self.temporal_graph = TemporalGraph.init(self.allocator);
+        self.signal_engine = SignalPropagationEngine.init(self.allocator, &self.nsir_graph.?, &self.chaos_kernel.?.flow_analyzer);
+
+        if (std.posix.getenv("JAIDE_VERIFY")) |v| {
+            if (std.mem.eql(u8, v, "1")) {
+                self.verifier = try VerifiedInferenceEngine.init(self.allocator);
+            }
+        }
+
+        self.z_runtime = try ZRuntime.init(self.allocator);
+
+        self.fractal_lpu = FractalLPU.init(self.allocator, 65536, 1.5) catch null;
+        self.r_gpu = RelationalGraphProcessingUnit.init(self.allocator, 4, 4) catch null;
+    }
+
+    fn isModelLoaded(self: *const InferenceServer) bool {
+        if (self.model == null) return false;
+        if (self.model.?.mgt == null) return false;
+        if (self.model.?.rsf == null) return false;
+        if (self.model.?.rsf.?.ctrl == null) return false;
+        if (self.embedding == null) return false;
+        if (self.ssi == null) return false;
+        if (self.ranker == null) return false;
+        return true;
     }
 
     pub fn start(self: *InferenceServer) !void {
@@ -302,12 +473,20 @@ pub const InferenceServer = struct {
         };
         defer server.deinit();
 
+        const pool = try self.allocator.create(Thread.Pool);
+        errdefer self.allocator.destroy(pool);
+        try pool.init(.{
+            .allocator = self.allocator,
+            .n_jobs = @intCast(self.config.num_worker_threads),
+        });
+        self.thread_pool = pool;
         self.running.store(true, .seq_cst);
 
         std.debug.print("Security configuration:\n", .{});
         std.debug.print("   - API key auth: {s}\n", .{if (self.api_key != null) "ENABLED" else "DISABLED"});
         std.debug.print("   - Rate limiting: {d} requests/min per IP\n", .{self.config.rate_limit_per_minute});
         std.debug.print("   - Max request size: {d} bytes\n", .{self.config.max_request_size_bytes});
+        std.debug.print("   - Worker threads: {d}\n", .{self.config.num_worker_threads});
         std.debug.print("\n", .{});
         std.debug.print("Inference server listening on {s}:{d}\n", .{self.config.host, self.config.port});
 
@@ -317,14 +496,56 @@ pub const InferenceServer = struct {
                 continue;
             };
 
-            self.handleStreamConnection(connection.stream, connection.address) catch |err| {
-                std.debug.print("Error handling connection: {}\n", .{err});
+            const active = self.active_connections.load(.monotonic);
+            if (active >= self.config.max_connections) {
+                var err_buf: [256]u8 = undefined;
+                const err_resp = std.fmt.bufPrint(&err_buf, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 39\r\n\r\n{{\"error\":\"Too many connections\"}}", .{}) catch unreachable;
+                _ = connection.stream.writeAll(err_resp) catch {};
+                connection.stream.close();
+                continue;
+            }
+
+            const ctx = self.allocator.create(ConnectionContext) catch {
+                connection.stream.close();
+                continue;
+            };
+            ctx.* = .{
+                .server = self,
+                .stream = connection.stream,
+                .client_addr = connection.address,
+            };
+
+            self.active_connections.fetchAdd(1, .monotonic);
+
+            self.thread_pool.?.spawn(handleConnectionWork, .{ctx}) catch {
+                self.allocator.destroy(ctx);
+                connection.stream.close();
+                self.active_connections.fetchSub(1, .monotonic);
+                continue;
             };
         }
     }
 
+    fn handleConnectionWork(ctx: *ConnectionContext) void {
+        const server = ctx.server;
+        defer {
+            server.allocator.destroy(ctx);
+            server.active_connections.fetchSub(1, .monotonic);
+        }
+
+        server.handleStreamConnection(ctx.stream, ctx.client_addr) catch {};
+    }
+
     pub fn stop(self: *InferenceServer) void {
         self.running.store(false, .seq_cst);
+    }
+
+    fn setSocketTimeout(stream: net.Stream, timeout_ms: u64) void {
+        const sec: i64 = @intCast(timeout_ms / 1000);
+        const usec: i64 = @intCast((timeout_ms % 1000) * 1000);
+        var tv = std.posix.timeval{ .tv_sec = sec, .tv_usec = usec };
+        const optval = std.mem.asBytes(&tv);
+        _ = std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, optval) catch {};
     }
 
     fn handleStreamConnection(self: *InferenceServer, stream: net.Stream, client_addr: net.Address) !void {
@@ -334,66 +555,160 @@ pub const InferenceServer = struct {
         defer arena.deinit();
         const temp_allocator = arena.allocator();
 
-        var ip_buf: [64]u8 = undefined;
+        var ip_buf: [128]u8 = undefined;
         const ip_len = std.fmt.bufPrint(&ip_buf, "{}", .{client_addr}) catch return;
         const ip_str = try temp_allocator.dupe(u8, ip_len);
 
-        var total_read: usize = 0;
-        var buf: [65536]u8 = undefined;
-        const max_read = @min(buf.len, self.config.max_request_size_bytes);
+        var request_buf = std.ArrayList(u8).init(self.allocator);
+        defer request_buf.deinit();
 
-        while (total_read < max_read) {
-            const bytes_read = stream.read(buf[total_read..max_read]) catch break;
-            if (bytes_read == 0) break;
-            total_read += bytes_read;
+        var tmp_buf = try self.allocator.alloc(u8, 8192);
+        defer self.allocator.free(tmp_buf);
 
-            if (mem.indexOf(u8, buf[0..total_read], "\r\n\r\n")) |_| {
-                break;
+        var is_first_request = true;
+
+        while (true) {
+            request_buf.clearRetainingCapacity();
+
+            if (is_first_request) {
+                setSocketTimeout(stream, self.config.request_timeout_ms);
+            } else {
+                setSocketTimeout(stream, self.config.keep_alive_timeout_ms);
             }
-        }
+            is_first_request = false;
 
-        if (total_read == 0) return;
+            var headers_found = false;
+            var total_read: usize = 0;
+            while (total_read < self.config.max_request_size_bytes) {
+                const bytes_read = stream.read(tmp_buf) catch break;
+                if (bytes_read == 0) return;
+                try request_buf.appendSlice(tmp_buf[0..bytes_read]);
+                total_read += bytes_read;
 
-        if (total_read >= self.config.max_request_size_bytes) {
-            try self.sendError(stream, "Request too large", 413);
-            return;
-        }
-
-        const request_data = buf[0..total_read];
-
-        const method_end = mem.indexOf(u8, request_data, " ") orelse return error.InvalidRequest;
-        const method = request_data[0..method_end];
-
-        const path_start = method_end + 1;
-        const path_end = mem.indexOfPos(u8, request_data, path_start, " ") orelse return error.InvalidRequest;
-        const path = request_data[path_start..path_end];
-
-        const headers_end = mem.indexOf(u8, request_data, "\r\n\r\n") orelse return error.InvalidRequest;
-        const headers = request_data[0..headers_end];
-        const body = if (headers_end + 4 < request_data.len) request_data[headers_end + 4 ..] else "";
-
-        if (mem.eql(u8, method, "GET") and mem.eql(u8, path, "/v1/health")) {
-            try self.handleHealth(stream, temp_allocator);
-        } else if (mem.eql(u8, method, "POST") and mem.eql(u8, path, "/v1/inference")) {
-            const rate_allowed = self.rate_limiter.checkAndRecord(ip_str) catch false;
-            if (!rate_allowed) {
-                try self.sendError(stream, "Rate limit exceeded", 429);
-                std.debug.print("Rate limit exceeded for IP: {s}\n", .{ip_str});
-                return;
-            }
-
-            if (self.api_key) |expected_key| {
-                const auth_valid = self.checkAuthorization(headers, expected_key);
-                if (!auth_valid) {
-                    try self.sendError(stream, "Unauthorized - Invalid or missing API key", 401);
-                    std.debug.print("Unauthorized access attempt from IP: {s}\n", .{ip_str});
-                    return;
+                if (mem.indexOf(u8, request_buf.items, "\r\n\r\n")) |_| {
+                    headers_found = true;
+                    break;
                 }
             }
 
-            try self.handleInference(stream, body, temp_allocator);
-        } else {
-            try self.sendNotFound(stream);
+            if (!headers_found or request_buf.items.len == 0) return;
+
+            if (request_buf.items.len >= self.config.max_request_size_bytes) {
+                try self.sendError(stream, "Request too large", 413);
+                return;
+            }
+
+            const request_data = request_buf.items;
+
+            const method_end = mem.indexOf(u8, request_data, " ") orelse return error.InvalidRequest;
+            const method = request_data[0..method_end];
+
+            const path_start = method_end + 1;
+            const path_end = mem.indexOfPos(u8, request_data, path_start, " ") orelse return error.InvalidRequest;
+            const path = request_data[path_start..path_end];
+
+            const headers_end = mem.indexOf(u8, request_data, "\r\n\r\n") orelse return error.InvalidRequest;
+            const headers = request_data[0..headers_end];
+
+            var content_length: usize = 0;
+            var header_lines = mem.splitSequence(u8, headers, "\r\n");
+            while (header_lines.next()) |line| {
+                if (line.len >= 16) {
+                    var lower_buf: [64]u8 = undefined;
+                    const prefix = line[0..@min(line.len, 15)];
+                    var pi: usize = 0;
+                    while (pi < prefix.len) : (pi += 1) {
+                        lower_buf[pi] = std.ascii.toLower(prefix[pi]);
+                    }
+                    if (mem.eql(u8, lower_buf[0..15], "content-length:")) {
+                        const colon_idx = mem.indexOf(u8, line, ":") orelse continue;
+                        const val = mem.trim(u8, line[colon_idx + 1 ..], " \t");
+                        content_length = std.fmt.parseInt(usize, val, 10) catch 0;
+                    }
+                }
+            }
+
+            var body_start = headers_end + 4;
+            var body = if (body_start < request_data.len) request_data[body_start..] else "";
+
+            if (body.len < content_length and content_length <= self.config.max_request_size_bytes) {
+                var total_body_read: usize = body.len;
+                while (total_body_read < content_length) {
+                    const remaining = content_length - total_body_read;
+                    const to_read = @min(remaining, tmp_buf.len);
+                    const bytes_read = stream.read(tmp_buf[0..to_read]) catch break;
+                    if (bytes_read == 0) break;
+                    try request_buf.appendSlice(tmp_buf[0..bytes_read]);
+                    total_body_read += bytes_read;
+                    body = request_buf.items[body_start..];
+                }
+            }
+
+            var connection_keep_alive = false;
+            var conn_header_lines = mem.splitSequence(u8, headers, "\r\n");
+            while (conn_header_lines.next()) |line| {
+                if (line.len >= 12) {
+                    var lower_buf2: [64]u8 = undefined;
+                    const prefix2 = line[0..@min(line.len, 11)];
+                    var pi2: usize = 0;
+                    while (pi2 < prefix2.len) : (pi2 += 1) {
+                        lower_buf2[pi2] = std.ascii.toLower(prefix2[pi2]);
+                    }
+                    if (mem.eql(u8, lower_buf2[0..11], "connection:")) {
+                        const colon_idx2 = mem.indexOf(u8, line, ":") orelse continue;
+                        const val2 = mem.trim(u8, line[colon_idx2 + 1 ..], " \t");
+                        var lower_val: [32]u8 = undefined;
+                        var vi: usize = 0;
+                        while (vi < @min(val2.len, 31)) : (vi += 1) {
+                            lower_val[vi] = std.ascii.toLower(val2[vi]);
+                        }
+                        if (mem.indexOf(u8, lower_val[0..vi], "keep-alive") != null) {
+                            connection_keep_alive = true;
+                        }
+                    }
+                }
+            }
+
+            if (mem.eql(u8, method, "GET") and mem.eql(u8, path, "/v1/health")) {
+                try self.handleHealth(stream, temp_allocator, connection_keep_alive);
+            } else if (mem.eql(u8, method, "POST") and mem.eql(u8, path, "/v1/inference")) {
+                const rate_allowed = self.rate_limiter.checkAndRecord(ip_str) catch false;
+                if (!rate_allowed) {
+                    try self.sendError(stream, "Rate limit exceeded", 429);
+                    return;
+                }
+
+                if (self.api_key) |expected_key| {
+                    const auth_valid = self.checkAuthorization(headers, expected_key);
+                    if (!auth_valid) {
+                        try self.sendError(stream, "Unauthorized - Invalid or missing API key", 401);
+                        return;
+                    }
+                }
+
+                try self.handleInference(stream, body, temp_allocator, connection_keep_alive);
+            } else if (mem.eql(u8, method, "POST") and mem.eql(u8, path, "/v1/batch_inference")) {
+                const rate_allowed = self.rate_limiter.checkAndRecord(ip_str) catch false;
+                if (!rate_allowed) {
+                    try self.sendError(stream, "Rate limit exceeded", 429);
+                    return;
+                }
+
+                if (self.api_key) |expected_key| {
+                    const auth_valid = self.checkAuthorization(headers, expected_key);
+                    if (!auth_valid) {
+                        try self.sendError(stream, "Unauthorized - Invalid or missing API key", 401);
+                        return;
+                    }
+                }
+
+                try self.handleBatchInference(stream, body, temp_allocator, connection_keep_alive);
+            } else {
+                try self.sendNotFound(stream);
+                return;
+            }
+
+            if (!connection_keep_alive) return;
         }
     }
 
@@ -402,18 +717,26 @@ pub const InferenceServer = struct {
 
         var lines = mem.splitSequence(u8, headers, "\r\n");
         while (lines.next()) |line| {
-            const lower_check = if (line.len >= 14)
-                mem.startsWith(u8, line, "Authorization:") or mem.startsWith(u8, line, "authorization:")
-            else
-                false;
+            if (line.len < 14) continue;
 
-            if (lower_check) {
+            var lower_buf: [64]u8 = undefined;
+            const prefix = line[0..@min(line.len, 13)];
+            var pi: usize = 0;
+            while (pi < prefix.len) : (pi += 1) {
+                lower_buf[pi] = std.ascii.toLower(prefix[pi]);
+            }
+
+            if (mem.eql(u8, lower_buf[0..13], "authorization:")) {
                 const value_start = mem.indexOf(u8, line, ":") orelse continue;
                 const value = mem.trim(u8, line[value_start + 1 ..], " \t");
 
                 if (value.len > 7) {
-                    const prefix_check = mem.startsWith(u8, value, "Bearer ") or mem.startsWith(u8, value, "bearer ");
-                    if (prefix_check) {
+                    var prefix_lower: [6]u8 = undefined;
+                    var bi: usize = 0;
+                    while (bi < 6) : (bi += 1) {
+                        prefix_lower[bi] = std.ascii.toLower(value[bi]);
+                    }
+                    if (mem.eql(u8, prefix_lower[0..6], "bearer") and (value[6] == ' ' or value[6] == '\t')) {
                         const token = mem.trim(u8, value[7..], " \t");
                         return mem.eql(u8, token, expected_key);
                     }
@@ -424,12 +747,15 @@ pub const InferenceServer = struct {
         return false;
     }
 
-    fn handleHealth(self: *InferenceServer, stream: net.Stream, allocator: Allocator) !void {
-        const uptime = @as(u64, @intCast(std.time.timestamp() - self.start_time));
+    fn handleHealth(self: *InferenceServer, stream: net.Stream, allocator: Allocator, keep_alive: bool) !void {
+        const start_ms = self.start_time;
+        const now_ms = std.time.milliTimestamp();
+        const uptime_ms = now_ms - start_ms;
+        const uptime_seconds: u64 = if (uptime_ms >= 0) @intCast(@divTrunc(uptime_ms, 1000)) else 0;
 
         const response = HealthResponse{
-            .uptime_seconds = uptime,
-            .model_loaded = self.model != null,
+            .uptime_seconds = uptime_seconds,
+            .model_loaded = self.isModelLoaded(),
         };
 
         const json = try response.toJson(allocator);
@@ -443,15 +769,20 @@ pub const InferenceServer = struct {
         try writer.writeAll("Content-Type: application/json\r\n");
         try writer.writeAll("Cache-Control: no-cache\r\n");
         try writer.writeAll("Access-Control-Allow-Origin: *\r\n");
+        if (keep_alive) {
+            try writer.writeAll("Connection: keep-alive\r\n");
+        } else {
+            try writer.writeAll("Connection: close\r\n");
+        }
         try writer.print("Content-Length: {d}\r\n", .{json.len});
         try writer.writeAll("\r\n");
         try writer.writeAll(json);
 
-        _ = stream.write(response_buf.items) catch {};
+        _ = stream.writeAll(response_buf.items) catch {};
     }
 
-    fn handleInference(self: *InferenceServer, stream: net.Stream, body: []const u8, allocator: Allocator) !void {
-        if (self.model == null or self.model.?.mgt == null) {
+    fn handleInference(self: *InferenceServer, stream: net.Stream, body: []const u8, allocator: Allocator, keep_alive: bool) !void {
+        if (!self.isModelLoaded()) {
             try self.sendError(stream, "Model not loaded", 503);
             return;
         }
@@ -466,7 +797,6 @@ pub const InferenceServer = struct {
 
         var tokens = std.ArrayList(u32).init(allocator);
         defer tokens.deinit();
-
         self.model.?.mgt.?.encode(request.text, &tokens) catch {
             try self.sendError(stream, "Encoding failed", 500);
             return;
@@ -479,33 +809,132 @@ pub const InferenceServer = struct {
             tokens.items;
 
         var embeddings: ?[]f32 = null;
-        if (request.return_embeddings and self.model.?.rsf != null) {
+        errdefer if (embeddings) |emb| allocator.free(emb);
+
+        self.inference_mutex.lock();
+        defer self.inference_mutex.unlock();
+
+        if (self.model.?.rsf != null) {
             const dim = (self.model.?.rsf.?.ctrl orelse {
                 try self.sendError(stream, "RSF not initialized", 500);
                 return;
             }).dim;
-            const batch_size = 1;
 
-            var input_tensor = Tensor.init(allocator, &.{batch_size, dim * 2}) catch {
-                try self.sendError(stream, "Failed to create embeddings", 500);
-                return;
+            var emb_tensor = if (self.embedding) |*emb|
+                emb.forward(allocator, final_tokens, final_tokens.len) catch null
+            else
+                null;
+            defer if (emb_tensor) |*t| t.deinit();
+
+            var input_tensor = if (emb_tensor) |et| blk: {
+                var t = try Tensor.init(allocator, &.{ 1, dim * 2 });
+                const copy_len = @min(et.data.len, t.data.len);
+                @memcpy(t.data[0..copy_len], et.data[0..copy_len]);
+                if (copy_len < t.data.len) @memset(t.data[copy_len..], 0.0);
+                break :blk t;
+            } else blk: {
+                var t = try Tensor.init(allocator, &.{ 1, dim * 2 });
+                var k: usize = 0;
+                while (k < t.data.len) : (k += 1) {
+                    t.data[k] = if (k < final_tokens.len)
+                        @as(f32, @floatFromInt(final_tokens[k])) / 1000.0
+                    else
+                        0.0;
+                }
+                break :blk t;
             };
             defer input_tensor.deinit();
 
-            var k: usize = 0;
-            while (k < input_tensor.data.len) : (k += 1) {
-                input_tensor.data[k] = if (k < final_tokens.len)
-                    @as(f32, @floatFromInt(final_tokens[k])) / 1000.0
-                else
-                    0.0;
-            }
-
             self.model.?.rsf.?.forward(&input_tensor) catch {
-                try self.sendError(stream, "Embedding generation failed", 500);
+                try self.sendError(stream, "Forward pass failed", 500);
                 return;
             };
 
-            nsirModulateForInference(input_tensor.data);
+            if (self.nsir_graph) |*graph| {
+                const tensor_bytes = std.mem.sliceAsBytes(input_tensor.data);
+                _ = graph.encodeInformation(tensor_bytes) catch {};
+            }
+
+            if (self.fractal_lpu) |*fl| {
+                if (self.nsir_graph) |*graph| {
+                    var node_iter = graph.nodes.iterator();
+                    while (node_iter.next()) |entry| {
+                        const node = entry.value_ptr;
+                        var hasher = std.hash.Wyhash.init(0);
+                        hasher.update(node.id);
+                        const node_hash = hasher.final();
+                        fl.mapNode(node_hash, 1.0) catch {};
+                    }
+                    fl.balanceAllTiles();
+                }
+            }
+
+            if (self.r_gpu) |*rg| {
+                if (self.nsir_graph) |*graph| {
+                    rg.distributeGraph(graph) catch {};
+                }
+            }
+
+            if (self.esso) |*esso_opt| {
+                if (self.nsir_graph) |*graph| {
+                    if (self.chaos_kernel) |*kernel| {
+                        var orchestrator = ReasoningOrchestrator.init(self.allocator, graph, esso_opt, kernel);
+                        defer orchestrator.deinit();
+                        var reasoning_cycles: usize = 50;
+                        if (std.posix.getenv("JAIDE_REASONING_CYCLES")) |cycles_str| {
+                            reasoning_cycles = std.fmt.parseInt(usize, cycles_str, 10) catch 50;
+                        }
+                        _ = orchestrator.runHierarchicalReasoning(reasoning_cycles) catch {};
+                    }
+                }
+            }
+
+            if (self.surprise_memory) |*sm| {
+                const tensor_bytes = std.mem.sliceAsBytes(input_tensor.data);
+                _ = sm.storeWithSurprise(tensor_bytes, null) catch {};
+            }
+
+            if (self.temporal_graph) |*tg| {
+                const now_ns = std.time.nanoTimestamp();
+                if (self.nsir_graph) |*graph| {
+                    var node_iter = graph.nodes.iterator();
+                    while (node_iter.next()) |entry| {
+                        const node = entry.value_ptr;
+                        const qs = QuantumState.init(
+                            node.qubit.a.re,
+                            node.qubit.a.im,
+                            node.qubit.b.re,
+                            node.qubit.b.im,
+                            node.phase,
+                            0.0,
+                        );
+                        tg.addNodeAtTime(node.id, qs, now_ns) catch {};
+                    }
+                }
+                const after_ns = std.time.nanoTimestamp();
+                tg.advanceTime(after_ns - now_ns);
+            }
+
+            if (self.verifier) |v| {
+                var output_buf = allocator.alloc(f32, input_tensor.data.len) catch null;
+                if (output_buf) |obuf| {
+                    defer allocator.free(obuf);
+                    v.performVerifiedInference(input_tensor.data, obuf) catch {};
+                }
+            }
+
+            if (self.signal_engine) |*se| {
+                se.propagateStep() catch {};
+            }
+
+            if (self.z_runtime) |zr| {
+                var name_buf: [64]u8 = undefined;
+                const req_count = self.request_count.load(.monotonic);
+                const var_name = std.fmt.bufPrint(&name_buf, "inf_{}", .{req_count}) catch "inf";
+                _ = zr.createVariable(var_name, null) catch {};
+            }
+
+            boostAboveMean(input_tensor.data);
 
             embeddings = try allocator.alloc(f32, @min(dim, 128));
             var m: usize = 0;
@@ -514,37 +943,151 @@ pub const InferenceServer = struct {
             }
         }
 
-        self.inference_mutex.lock();
-        defer self.inference_mutex.unlock();
-
         if (self.ssi) |*ssi_idx| {
-            const is_anchor = (self.request_count % 10 == 0);
-            ssi_idx.addSequence(final_tokens, self.request_count, is_anchor) catch {};
+            const is_anchor = (self.request_count.load(.monotonic) % 10 == 0);
+            ssi_idx.addSequence(final_tokens, self.request_count.load(.monotonic), is_anchor) catch {};
+        }
+        self.request_count.fetchAdd(1, .monotonic);
 
-            if (self.ranker) |*rnk| {
-                const candidates = ssi_idx.retrieveTopK(final_tokens, 3, allocator) catch null;
-                if (candidates) |cands| {
-                    defer allocator.free(cands);
-                    rnk.rankCandidatesWithQuery(cands, final_tokens, ssi_idx, allocator) catch {};
+        var owned_embeddings: ?[]f32 = embeddings;
+        var owned_input_tokens: ?[]u32 = null;
+        var owned_generated_text: ?[]const u8 = null;
+        var owned_generated_tokens: ?[]u32 = null;
+        errdefer {
+            if (owned_embeddings) |emb| allocator.free(emb);
+            if (owned_input_tokens) |it| allocator.free(it);
+            if (owned_generated_text) |gt| allocator.free(gt);
+            if (owned_generated_tokens) |tk| allocator.free(tk);
+        }
+
+        const input_tokens_copy = try allocator.dupe(u32, final_tokens);
+        owned_input_tokens = input_tokens_copy;
+
+        var generated = std.ArrayList(u32).init(allocator);
+        defer generated.deinit();
+        try generated.appendSlice(final_tokens);
+
+        const max_new_tokens = request.max_tokens orelse 32;
+        var gen_step: usize = 0;
+        while (gen_step < max_new_tokens) : (gen_step += 1) {
+            var next_token: u32 = 0;
+
+            if (self.model.?.rsf != null) {
+                const dim = (self.model.?.rsf.?.ctrl orelse break).dim;
+
+                var step_emb = if (self.embedding) |*emb|
+                    emb.forward(allocator, generated.items, generated.items.len) catch null
+                else
+                    null;
+                defer if (step_emb) |*t| t.deinit();
+
+                if (step_emb) |et| {
+                    var step_tensor = blk: {
+                        var t = Tensor.init(allocator, &.{ 1, dim * 2 }) catch break;
+                        const copy_len = @min(et.data.len, t.data.len);
+                        @memcpy(t.data[0..copy_len], et.data[0..copy_len]);
+                        if (copy_len < t.data.len) @memset(t.data[copy_len..], 0.0);
+                        break :blk t;
+                    };
+                    defer step_tensor.deinit();
+
+                    self.model.?.rsf.?.forward(&step_tensor) catch {};
+
+                    if (self.nsir_graph) |*graph| {
+                        const tensor_bytes = std.mem.sliceAsBytes(step_tensor.data);
+                        _ = graph.encodeInformation(tensor_bytes) catch {};
+                    }
                 }
             }
+
+            if (self.ssi) |*ssi_idx| {
+                if (self.ranker) |*rnk| {
+                    const top_candidates = rnk.topKHeap(ssi_idx, generated.items, 5, allocator) catch null;
+                    if (top_candidates) |cands| {
+                        defer {
+                            for (cands) |*c| {
+                                c.deinit(allocator);
+                            }
+                            allocator.free(cands);
+                        }
+                        if (cands.len > 0 and cands[0].tokens.len > 0) {
+                            rnk.rankCandidatesWithQuery(cands, generated.items, ssi_idx, allocator) catch {};
+                            next_token = cands[0].tokens[0];
+                        }
+                    }
+                }
+            }
+
+            if (next_token == 0) {
+                if (self.ssi) |*ssi_idx| {
+                    if (generated.items.len > 0) {
+                        const start_idx = if (generated.items.len > 4) generated.items.len - 4 else 0;
+                        const recent = generated.items[start_idx..];
+                        const candidates = ssi_idx.retrieveTopK(recent, 5, allocator) catch null;
+                        if (candidates) |cands| {
+                            defer {
+                                for (cands) |*c| {
+                                    c.deinit(allocator);
+                                }
+                                allocator.free(cands);
+                            }
+                            if (cands.len > 0) {
+                                var best_score: f64 = -std.math.inf(f64);
+                                var best_token: u32 = 0;
+                                for (cands) |cand| {
+                                    if (cand.tokens.len > 0 and cand.score > best_score) {
+                                        best_score = cand.score;
+                                        best_token = cand.tokens[0];
+                                    }
+                                }
+                                if (best_token != 0) {
+                                    next_token = best_token;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (next_token == 0) break;
+
+            try generated.append(next_token);
+
+            if (self.ssi) |*ssi_idx| {
+                ssi_idx.addSequence(&[_]u32{next_token}, self.request_count.load(.monotonic), false) catch {};
+            }
         }
-        self.request_count += 1;
+
+        var generated_text: ?[]const u8 = null;
+        if (generated.items.len > final_tokens.len) {
+            const new_tokens = generated.items[final_tokens.len..];
+            var text_buf = std.ArrayList(u8).init(allocator);
+            self.model.?.mgt.?.decode(new_tokens, &text_buf) catch {};
+            generated_text = try text_buf.toOwnedSlice();
+        }
+        owned_generated_text = generated_text;
+
+        const generated_tokens_slice = if (generated.items.len > final_tokens.len)
+            try allocator.dupe(u32, generated.items[final_tokens.len..])
+        else
+            try allocator.alloc(u32, 0);
+        owned_generated_tokens = generated_tokens_slice;
 
         const end_time = std.time.milliTimestamp();
         const processing_time = @as(f64, @floatFromInt(end_time - start_time));
 
-        const tokens_copy = try allocator.dupe(u32, final_tokens);
-
         var response = InferenceResponse{
-            .tokens = tokens_copy,
+            .tokens = generated_tokens_slice,
+            .text = generated_text,
+            .input_tokens = input_tokens_copy,
             .embeddings = embeddings,
             .processing_time_ms = processing_time,
         };
-        defer {
-            allocator.free(response.tokens);
-            if (response.embeddings) |emb| allocator.free(emb);
-        }
+        owned_embeddings = null;
+        owned_input_tokens = null;
+        owned_generated_text = null;
+        owned_generated_tokens = null;
+        defer response.deinit(allocator);
 
         const json = try response.toJson(allocator);
         defer allocator.free(json);
@@ -557,17 +1100,275 @@ pub const InferenceServer = struct {
         try writer.writeAll("Content-Type: application/json\r\n");
         try writer.writeAll("Cache-Control: no-cache\r\n");
         try writer.writeAll("Access-Control-Allow-Origin: *\r\n");
+        if (keep_alive) {
+            try writer.writeAll("Connection: keep-alive\r\n");
+        } else {
+            try writer.writeAll("Connection: close\r\n");
+        }
         try writer.print("Content-Length: {d}\r\n", .{json.len});
         try writer.writeAll("\r\n");
         try writer.writeAll(json);
 
-        _ = stream.write(response_buf.items) catch {};
+        _ = stream.writeAll(response_buf.items) catch {};
+    }
+
+    fn handleBatchInference(self: *InferenceServer, stream: net.Stream, body: []const u8, allocator: Allocator, keep_alive: bool) !void {
+        if (!self.isModelLoaded()) {
+            try self.sendError(stream, "Model not loaded", 503);
+            return;
+        }
+
+        var batch_req = BatchInferenceRequest.fromJson(allocator, body) catch {
+            try self.sendError(stream, "Invalid JSON request", 400);
+            return;
+        };
+        defer batch_req.deinit(allocator);
+
+        var results = std.ArrayList([]u8).init(allocator);
+        defer {
+            for (results.items) |r| {
+                allocator.free(r);
+            }
+            results.deinit();
+        }
+
+        var list = std.ArrayList(u8).init(allocator);
+        errdefer list.deinit();
+        var writer = list.writer();
+
+        try writer.writeAll("{\"results\":[");
+
+        var ti: usize = 0;
+        while (ti < batch_req.texts.len) : (ti += 1) {
+            if (ti > 0) try writer.writeAll(",");
+
+            const batch_start_time = std.time.milliTimestamp();
+
+            var tokens = std.ArrayList(u32).init(allocator);
+            defer tokens.deinit();
+            self.model.?.mgt.?.encode(batch_req.texts[ti], &tokens) catch {
+                try writer.writeAll("{\"error\":\"Encoding failed\"}");
+                continue;
+            };
+
+            const max_gen_tokens = batch_req.max_tokens orelse 32;
+
+            self.inference_mutex.lock();
+
+            if (self.model.?.rsf != null) {
+                const dim = (self.model.?.rsf.?.ctrl orelse {
+                    self.inference_mutex.unlock();
+                    try writer.writeAll("{\"error\":\"RSF not initialized\"}");
+                    continue;
+                }).dim;
+
+                var emb_tensor = if (self.embedding) |*emb|
+                    emb.forward(allocator, tokens.items, tokens.items.len) catch null
+                else
+                    null;
+                defer if (emb_tensor) |*t| t.deinit();
+
+                if (emb_tensor) |et| {
+                    var input_tensor = blk: {
+                        var t = Tensor.init(allocator, &.{ 1, dim * 2 }) catch break;
+                        const copy_len = @min(et.data.len, t.data.len);
+                        @memcpy(t.data[0..copy_len], et.data[0..copy_len]);
+                        if (copy_len < t.data.len) @memset(t.data[copy_len..], 0.0);
+                        break :blk t;
+                    };
+                    defer input_tensor.deinit();
+
+                    self.model.?.rsf.?.forward(&input_tensor) catch {};
+
+                    if (self.nsir_graph) |*graph| {
+                        const tensor_bytes = std.mem.sliceAsBytes(input_tensor.data);
+                        _ = graph.encodeInformation(tensor_bytes) catch {};
+                    }
+                }
+            }
+
+            var generated = std.ArrayList(u32).init(allocator);
+            defer generated.deinit();
+            try generated.appendSlice(tokens.items);
+
+            var gen_step: usize = 0;
+            while (gen_step < max_gen_tokens) : (gen_step += 1) {
+                var next_token: u32 = 0;
+
+                if (self.model.?.rsf != null) {
+                    const dim = (self.model.?.rsf.?.ctrl orelse break).dim;
+
+                    var step_emb = if (self.embedding) |*emb|
+                        emb.forward(allocator, generated.items, generated.items.len) catch null
+                    else
+                        null;
+                    defer if (step_emb) |*t| t.deinit();
+
+                    if (step_emb) |et| {
+                        var step_tensor = blk: {
+                            var t = Tensor.init(allocator, &.{ 1, dim * 2 }) catch break;
+                            const copy_len = @min(et.data.len, t.data.len);
+                            @memcpy(t.data[0..copy_len], et.data[0..copy_len]);
+                            if (copy_len < t.data.len) @memset(t.data[copy_len..], 0.0);
+                            break :blk t;
+                        };
+                        defer step_tensor.deinit();
+
+                        self.model.?.rsf.?.forward(&step_tensor) catch {};
+
+                        if (self.nsir_graph) |*graph| {
+                            const tensor_bytes = std.mem.sliceAsBytes(step_tensor.data);
+                            _ = graph.encodeInformation(tensor_bytes) catch {};
+                        }
+                    }
+                }
+
+                if (self.ssi) |*ssi_idx| {
+                    if (self.ranker) |*rnk| {
+                        const top_candidates = rnk.topKHeap(ssi_idx, generated.items, 5, allocator) catch null;
+                        if (top_candidates) |cands| {
+                            defer {
+                                for (cands) |*c| {
+                                    c.deinit(allocator);
+                                }
+                                allocator.free(cands);
+                            }
+                            if (cands.len > 0 and cands[0].tokens.len > 0) {
+                                rnk.rankCandidatesWithQuery(cands, generated.items, ssi_idx, allocator) catch {};
+                                next_token = cands[0].tokens[0];
+                            }
+                        }
+                    }
+                }
+
+                if (next_token == 0) {
+                    if (self.ssi) |*ssi_idx| {
+                        if (generated.items.len > 0) {
+                            const start_idx = if (generated.items.len > 4) generated.items.len - 4 else 0;
+                            const recent = generated.items[start_idx..];
+                            const candidates = ssi_idx.retrieveTopK(recent, 5, allocator) catch null;
+                            if (candidates) |cands| {
+                                defer {
+                                    for (cands) |*c| {
+                                        c.deinit(allocator);
+                                    }
+                                    allocator.free(cands);
+                                }
+                                if (cands.len > 0) {
+                                    var best_score: f64 = -std.math.inf(f64);
+                                    var best_token: u32 = 0;
+                                    for (cands) |cand| {
+                                        if (cand.tokens.len > 0 and cand.score > best_score) {
+                                            best_score = cand.score;
+                                            best_token = cand.tokens[0];
+                                        }
+                                    }
+                                    if (best_token != 0) {
+                                        next_token = best_token;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (next_token == 0) break;
+                try generated.append(next_token);
+
+                if (self.ssi) |*ssi_idx| {
+                    ssi_idx.addSequence(&[_]u32{next_token}, self.request_count.load(.monotonic), false) catch {};
+                }
+            }
+
+            self.inference_mutex.unlock();
+
+            self.request_count.fetchAdd(1, .monotonic);
+
+            var generated_text: ?[]const u8 = null;
+            if (generated.items.len > tokens.items.len) {
+                const new_tokens = generated.items[tokens.items.len..];
+                var text_buf = std.ArrayList(u8).init(allocator);
+                self.model.?.mgt.?.decode(new_tokens, &text_buf) catch {};
+                generated_text = try text_buf.toOwnedSlice();
+            }
+            defer if (generated_text) |gt| allocator.free(gt);
+
+            const batch_end_time = std.time.milliTimestamp();
+            const processing_time = @as(f64, @floatFromInt(batch_end_time - batch_start_time));
+
+            try writer.writeAll("{\"tokens\":[");
+            var gi: usize = 0;
+            while (gi < generated.items.len) : (gi += 1) {
+                if (gi > 0) try writer.writeAll(",");
+                try writer.print("{d}", .{generated.items[gi]});
+            }
+            try writer.writeAll("]");
+            if (generated_text) |gt| {
+                try writer.writeAll(",\"text\":\"");
+                var ci: usize = 0;
+                while (ci < gt.len) : (ci += 1) {
+                    const c = gt[ci];
+                    switch (c) {
+                        '"' => try writer.writeAll("\\\""),
+                        '\\' => try writer.writeAll("\\\\"),
+                        '\n' => try writer.writeAll("\\n"),
+                        '\r' => try writer.writeAll("\\r"),
+                        '\t' => try writer.writeAll("\\t"),
+                        else => {
+                            if (c >= 0x20 and c < 0x7f) {
+                                try writer.writeByte(c);
+                            }
+                        },
+                    }
+                }
+                try writer.writeAll("\"");
+            }
+            try writer.print(",\"processing_time_ms\":{d:.2}}", .{processing_time});
+        }
+
+        try writer.writeAll("]}");
+
+        const json = try list.toOwnedSlice();
+        defer allocator.free(json);
+
+        var response_buf = std.ArrayList(u8).init(allocator);
+        defer response_buf.deinit();
+        var rwriter = response_buf.writer();
+
+        try rwriter.writeAll("HTTP/1.1 200 OK\r\n");
+        try rwriter.writeAll("Content-Type: application/json\r\n");
+        try rwriter.writeAll("Cache-Control: no-cache\r\n");
+        try rwriter.writeAll("Access-Control-Allow-Origin: *\r\n");
+        if (keep_alive) {
+            try rwriter.writeAll("Connection: keep-alive\r\n");
+        } else {
+            try rwriter.writeAll("Connection: close\r\n");
+        }
+        try rwriter.print("Content-Length: {d}\r\n", .{json.len});
+        try rwriter.writeAll("\r\n");
+        try rwriter.writeAll(json);
+
+        _ = stream.writeAll(response_buf.items) catch {};
     }
 
     fn sendError(self: *InferenceServer, stream: net.Stream, message: []const u8, status_code: u16) !void {
-        _ = self;
-        var buf: [1024]u8 = undefined;
-        const json = std.fmt.bufPrint(&buf, "{{\"error\":\"{s}\"}}", .{message}) catch return;
+        var json_list = std.ArrayList(u8).init(self.allocator);
+        defer json_list.deinit();
+        var jwriter = json_list.writer();
+
+        try jwriter.writeAll("{\"error\":\"");
+        var mi: usize = 0;
+        while (mi < message.len) : (mi += 1) {
+            const c = message[mi];
+            switch (c) {
+                '"' => try jwriter.writeAll("\\\""),
+                '\\' => try jwriter.writeAll("\\\\"),
+                else => try jwriter.writeByte(c),
+            }
+        }
+        try jwriter.writeAll("\"}");
+
+        const json = json_list.items;
 
         const status_text = switch (status_code) {
             400 => "Bad Request",
@@ -580,20 +1381,21 @@ pub const InferenceServer = struct {
             else => "Error",
         };
 
-        var response_buf: [2048]u8 = undefined;
-        const response = std.fmt.bufPrint(
-            &response_buf,
-            "HTTP/1.1 {d} {s}\r\n" ++
-                "Content-Type: application/json\r\n" ++
-                "Cache-Control: no-cache\r\n" ++
-                "Access-Control-Allow-Origin: *\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "\r\n" ++
-                "{s}",
-            .{status_code, status_text, json.len, json},
-        ) catch return;
+        var resp_list = std.ArrayList(u8).init(self.allocator);
+        defer resp_list.deinit();
+        var rwriter = resp_list.writer();
 
-        _ = stream.write(response) catch {};
+        try rwriter.writeAll("HTTP/1.1 ");
+        try rwriter.print("{d} {s}\r\n", .{ status_code, status_text });
+        try rwriter.writeAll("Content-Type: application/json\r\n");
+        try rwriter.writeAll("Cache-Control: no-cache\r\n");
+        try rwriter.writeAll("Access-Control-Allow-Origin: *\r\n");
+        try rwriter.writeAll("Connection: close\r\n");
+        try rwriter.print("Content-Length: {d}\r\n", .{json.len});
+        try rwriter.writeAll("\r\n");
+        try rwriter.writeAll(json);
+
+        _ = stream.writeAll(resp_list.items) catch {};
     }
 
     fn sendNotFound(self: *InferenceServer, stream: net.Stream) !void {
@@ -618,13 +1420,15 @@ pub const BatchInferenceRequest = struct {
 
         var texts = try allocator.alloc([]const u8, texts_array.array.items.len);
         var n: usize = 0;
+        errdefer {
+            var ci: usize = 0;
+            while (ci < n) : (ci += 1) {
+                allocator.free(texts[ci]);
+            }
+            allocator.free(texts);
+        }
         while (n < texts_array.array.items.len) : (n += 1) {
             if (texts_array.array.items[n] != .string) {
-                var cleanup_idx: usize = 0;
-                while (cleanup_idx < n) : (cleanup_idx += 1) {
-                    allocator.free(texts[cleanup_idx]);
-                }
-                allocator.free(texts);
                 return error.InvalidTextsField;
             }
             texts[n] = try allocator.dupe(u8, texts_array.array.items[n].string);
@@ -660,30 +1464,3 @@ pub const BatchInferenceRequest = struct {
         allocator.free(self.texts);
     }
 };
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var config = ServerConfig{};
-
-    if (std.posix.getenv("JAIDE_PORT")) |port_str| {
-        config.port = std.fmt.parseInt(u16, port_str, 10) catch 8080;
-    }
-
-    if (std.posix.getenv("JAIDE_HOST")) |host| {
-        config.host = host;
-    }
-
-    var server = try InferenceServer.init(allocator, config);
-    defer server.deinit();
-
-    if (config.model_path) |path| {
-        server.loadModel(path) catch |err| {
-            std.debug.print("Failed to load model: {}\n", .{err});
-        };
-    }
-
-    try server.start();
-}

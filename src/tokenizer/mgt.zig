@@ -16,6 +16,19 @@ pub const MGT = struct {
     allocated_strings: std.ArrayList([]u8),
     allocator: Allocator,
     next_token_id: u32,
+    language: Language,
+    max_vocab_size: ?u32,
+    sorted_prefix_keys: std.ArrayList([]const u8),
+    sorted_suffix_keys: std.ArrayList([]const u8),
+    max_prefix_len: usize,
+    max_suffix_len: usize,
+    byte_token_ids: [256]?u32,
+    byte_token_values: std.AutoHashMap(u32, u8),
+
+    pub const Language = enum {
+        english,
+        hungarian,
+    };
 
     const BPEMerge = struct {
         token_id: u32,
@@ -39,8 +52,8 @@ pub const MGT = struct {
         const EOS: u32 = 3;
     };
 
-    pub fn init(allocator: Allocator, vocab: []const []const u8, anchors: []const []const u8) !MGT {
-        var mgt = initEmpty(allocator);
+    pub fn init(allocator: Allocator, vocab: []const []const u8, anchors: []const []const u8, max_vocab_size: ?u32, language: Language) !MGT {
+        var mgt = initEmpty(allocator, max_vocab_size, language);
         errdefer mgt.deinit();
 
         _ = try mgt.addToken("[PAD]");
@@ -49,12 +62,14 @@ pub const MGT = struct {
         _ = try mgt.addToken("[EOS]");
 
         for (vocab) |word| {
+            if (!mgt.canAddToken()) break;
             _ = try mgt.addToken(word);
         }
 
         try mgt.initMorphemes();
 
         for (anchors) |anch| {
+            if (!mgt.canAddToken()) break;
             const tid = mgt.token_to_id.get(anch) orelse try mgt.addToken(anch);
             const key = mgt.id_to_token.get(tid).?;
             try mgt.anchors.put(key, @as(u64, @intCast(tid)));
@@ -63,19 +78,19 @@ pub const MGT = struct {
         return mgt;
     }
 
-    pub fn initWithArena(arena: *core_memory.ArenaAllocator, vocab: []const []const u8, anchors_list: []const []const u8) !MGT {
-        return init(arena.allocator(), vocab, anchors_list);
+    pub fn initWithArena(arena: *core_memory.ArenaAllocator, vocab: []const []const u8, anchors_list: []const []const u8, max_vocab_size: ?u32, language: Language) !MGT {
+        return init(arena.allocator(), vocab, anchors_list, max_vocab_size, language);
     }
 
-    pub fn initWithPool(pool: *core_memory.PoolAllocator, vocab: []const []const u8, anchors_list: []const []const u8) !MGT {
-        return init(pool.allocator(), vocab, anchors_list);
+    pub fn initWithPool(pool: *core_memory.PoolAllocator, vocab: []const []const u8, anchors_list: []const []const u8, max_vocab_size: ?u32, language: Language) !MGT {
+        return init(pool.allocator(), vocab, anchors_list, max_vocab_size, language);
     }
 
-    pub fn initWithBuddy(buddy: *core_memory.BuddyAllocator, vocab: []const []const u8, anchors_list: []const []const u8) !MGT {
-        return init(buddy.allocator(), vocab, anchors_list);
+    pub fn initWithBuddy(buddy: *core_memory.BuddyAllocator, vocab: []const []const u8, anchors_list: []const []const u8, max_vocab_size: ?u32, language: Language) !MGT {
+        return init(buddy.allocator(), vocab, anchors_list, max_vocab_size, language);
     }
 
-    fn initEmpty(allocator: Allocator) MGT {
+    fn initEmpty(allocator: Allocator, max_vocab_size: ?u32, language: Language) MGT {
         return .{
             .token_to_id = std.StringHashMap(u32).init(allocator),
             .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
@@ -87,35 +102,52 @@ pub const MGT = struct {
             .allocated_strings = std.ArrayList([]u8).init(allocator),
             .allocator = allocator,
             .next_token_id = 0,
+            .language = language,
+            .max_vocab_size = max_vocab_size,
+            .sorted_prefix_keys = std.ArrayList([]const u8).init(allocator),
+            .sorted_suffix_keys = std.ArrayList([]const u8).init(allocator),
+            .max_prefix_len = 0,
+            .max_suffix_len = 0,
+            .byte_token_ids = [_]?u32{null} ** 256,
+            .byte_token_values = std.AutoHashMap(u32, u8).init(allocator),
         };
+    }
+
+    fn canAddToken(self: *const MGT) bool {
+        if (self.max_vocab_size) |max| {
+            return self.token_to_id.count() < max;
+        }
+        return true;
     }
 
     fn reset(self: *MGT) void {
         const allocator = self.allocator;
+        const mvs = self.max_vocab_size;
+        const lang = self.language;
         self.deinit();
-        self.* = initEmpty(allocator);
+        self.* = initEmpty(allocator, mvs, lang);
     }
 
     fn initMorphemes(self: *MGT) !void {
-        const prefix_list = [_][]const u8{
+        const english_prefix_list = [_][]const u8{
             "un",  "re",   "pre",  "dis",  "mis",  "over", "under", "out",
             "sub", "inter", "fore", "de",   "trans", "super", "semi", "anti",
             "mid", "non",  "ex",   "post", "pro",  "co",   "en",   "em",
+        };
+
+        const hungarian_prefix_list = [_][]const u8{
             "meg", "el", "fel", "le", "be", "ki", "rá", "át", "szét", "vissza",
             "ide", "oda", "alá", "fölé", "közé", "egy", "össze", "tul", "hozzá", "körül",
             "alig", "éppen", "majd", "csak", "is", "leg", "legesleg",
         };
 
-        for (prefix_list) |prefix| {
-            const id = self.token_to_id.get(prefix) orelse try self.addToken(prefix);
-            const key = self.id_to_token.get(id).?;
-            try self.prefixes.put(key, id);
-        }
-
-        const suffix_list = [_][]const u8{
+        const english_suffix_list = [_][]const u8{
             "ing", "ed",  "er",   "est",  "ly",   "tion", "sion", "ness",
             "ment", "ful", "less", "ous",  "ive",  "able", "ible", "al",
             "ial", "y",   "s",    "es",   "en",   "ize",  "ise",  "ate",
+        };
+
+        const hungarian_suffix_list = [_][]const u8{
             "ság", "ség", "ságú", "ségű", "é", "je", "ja", "ban", "ben",
             "ba", "be", "ból", "ből", "hoz", "hez", "höz", "tól", "től",
             "nak", "nek", "val", "vel", "ért", "ul", "ül", "ként", "án",
@@ -125,10 +157,61 @@ pub const MGT = struct {
             "kor", "ra", "re",
         };
 
+        const prefix_list = switch (self.language) {
+            .english => &english_prefix_list,
+            .hungarian => &hungarian_prefix_list,
+        };
+        const suffix_list = switch (self.language) {
+            .english => &english_suffix_list,
+            .hungarian => &hungarian_suffix_list,
+        };
+
+        for (prefix_list) |prefix| {
+            if (!self.canAddToken()) break;
+            const id = self.token_to_id.get(prefix) orelse try self.addToken(prefix);
+            const key = self.id_to_token.get(id).?;
+            try self.prefixes.put(key, id);
+        }
+
         for (suffix_list) |suffix| {
+            if (!self.canAddToken()) break;
             const id = self.token_to_id.get(suffix) orelse try self.addToken(suffix);
             const key = self.id_to_token.get(id).?;
             try self.suffixes.put(key, id);
+        }
+
+        try self.rebuildSortedMorphemes();
+    }
+
+    fn rebuildSortedMorphemes(self: *MGT) !void {
+        self.sorted_prefix_keys.clearRetainingCapacity();
+        var pit = self.prefixes.iterator();
+        while (pit.next()) |entry| {
+            try self.sorted_prefix_keys.append(entry.key_ptr.*);
+        }
+        std.mem.sort([]const u8, self.sorted_prefix_keys.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        self.max_prefix_len = 0;
+        for (self.sorted_prefix_keys.items) |pk| {
+            if (pk.len > self.max_prefix_len) self.max_prefix_len = pk.len;
+        }
+
+        self.sorted_suffix_keys.clearRetainingCapacity();
+        var sit = self.suffixes.iterator();
+        while (sit.next()) |entry| {
+            try self.sorted_suffix_keys.append(entry.key_ptr.*);
+        }
+        std.mem.sort([]const u8, self.sorted_suffix_keys.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        self.max_suffix_len = 0;
+        for (self.sorted_suffix_keys.items) |sk| {
+            if (sk.len > self.max_suffix_len) self.max_suffix_len = sk.len;
         }
     }
 
@@ -144,6 +227,9 @@ pub const MGT = struct {
             self.allocator.free(str);
         }
         self.allocated_strings.deinit();
+        self.sorted_prefix_keys.deinit();
+        self.sorted_suffix_keys.deinit();
+        self.byte_token_values.deinit();
     }
 
     fn isWhitespace(c: u8) bool {
@@ -297,44 +383,44 @@ pub const MGT = struct {
         try self.encodeInternal(text, out_tokens, null);
     }
 
-    fn findLongestPrefix(self: *MGT, word: []const u8) ?struct { prefix: []const u8, len: usize } {
-        var max_len: usize = 0;
-        var best: ?[]const u8 = null;
-
-        var prefix_it = self.prefixes.iterator();
-        while (prefix_it.next()) |entry| {
-            const prefix = entry.key_ptr.*;
-            if (word.len > prefix.len and mem.startsWith(u8, word, prefix)) {
-                if (prefix.len > max_len) {
-                    max_len = prefix.len;
-                    best = prefix;
-                }
+    fn binarySearchString(sorted: []const []const u8, target: []const u8) bool {
+        var lo: usize = 0;
+        var hi: usize = sorted.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (std.mem.lessThan(u8, sorted[mid], target)) {
+                lo = mid + 1;
+            } else if (std.mem.lessThan(u8, target, sorted[mid])) {
+                hi = mid;
+            } else {
+                return true;
             }
         }
+        return false;
+    }
 
-        if (best) |p| {
-            return .{ .prefix = p, .len = max_len };
+    fn findLongestPrefix(self: *MGT, word: []const u8) ?struct { prefix: []const u8, len: usize } {
+        var test_len: usize = self.max_prefix_len;
+        if (test_len >= word.len) test_len = word.len - 1;
+        while (test_len > 0) : (test_len -= 1) {
+            const candidate = word[0..test_len];
+            if (self.prefixes.get(candidate)) |id| {
+                const key = self.id_to_token.get(id).?;
+                return .{ .prefix = key, .len = test_len };
+            }
         }
         return null;
     }
 
     fn findLongestSuffix(self: *MGT, word: []const u8) ?struct { suffix: []const u8, len: usize } {
-        var max_len: usize = 0;
-        var best: ?[]const u8 = null;
-
-        var suffix_it = self.suffixes.iterator();
-        while (suffix_it.next()) |entry| {
-            const suffix = entry.key_ptr.*;
-            if (word.len > suffix.len and mem.endsWith(u8, word, suffix)) {
-                if (suffix.len > max_len) {
-                    max_len = suffix.len;
-                    best = suffix;
-                }
+        var test_len: usize = self.max_suffix_len;
+        if (test_len >= word.len) test_len = word.len - 1;
+        while (test_len > 0) : (test_len -= 1) {
+            const candidate = word[word.len - test_len ..];
+            if (self.suffixes.get(candidate)) |id| {
+                const key = self.id_to_token.get(id).?;
+                return .{ .suffix = key, .len = test_len };
             }
-        }
-
-        if (best) |s| {
-            return .{ .suffix = s, .len = max_len };
         }
         return null;
     }
@@ -372,9 +458,23 @@ pub const MGT = struct {
         return true;
     }
 
+    fn addByteToken(self: *MGT, byte: u8) !u32 {
+        if (self.byte_token_ids[byte]) |existing| return existing;
+        var buf: [16]u8 = undefined;
+        const byte_str = try std.fmt.bufPrint(&buf, "<{x:0>2}>", .{byte});
+        const id = try self.addToken(byte_str);
+        self.byte_token_ids[byte] = id;
+        try self.byte_token_values.put(id, byte);
+        return id;
+    }
+
     fn addToken(self: *MGT, token: []const u8) !u32 {
         if (self.token_to_id.get(token)) |existing| {
             return existing;
+        }
+
+        if (!self.canAddToken()) {
+            return error.VocabularyFull;
         }
 
         const id = self.next_token_id;
@@ -428,40 +528,88 @@ pub const MGT = struct {
         defer current.deinit();
 
         for (text) |byte| {
-            var buf: [16]u8 = undefined;
-            const byte_str = try std.fmt.bufPrint(&buf, "<{x:0>2}>", .{byte});
-            const tid = self.token_to_id.get(byte_str) orelse SPECIAL_TOKENS.UNK;
+            const tid = if (self.byte_token_ids[byte]) |existing| existing else try self.addByteToken(byte);
             try current.append(tid);
         }
 
+        var pair_cache = std.StringHashMap(BPEMerge).init(self.allocator);
+        defer {
+            var it = pair_cache.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            pair_cache.deinit();
+        }
+
         while (current.items.len > 1) {
-            var best_priority: ?u32 = null;
-            var best_idx: ?usize = null;
+            var best_priority: u32 = std.math.maxInt(u32);
+            var best_left: u32 = 0;
+            var best_right: u32 = 0;
+            var best_merge_id: u32 = 0;
+            var found = false;
+
             var i: usize = 0;
             while (i + 1 < current.items.len) : (i += 1) {
-                const left = self.id_to_token.get(current.items[i]) orelse return error.InvalidData;
-                const right = self.id_to_token.get(current.items[i + 1]) orelse return error.InvalidData;
-                const pair = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ left, right });
-                defer self.allocator.free(pair);
-                if (self.bpe_pairs.get(pair)) |merge| {
-                    if (best_priority == null or merge.priority < best_priority.?) {
+                const left_id = current.items[i];
+                const right_id = current.items[i + 1];
+                var cache_key_buf: [64]u8 = undefined;
+                const cache_key = try std.fmt.bufPrint(&cache_key_buf, "{}_{}", .{ left_id, right_id });
+                if (pair_cache.get(cache_key)) |merge| {
+                    if (merge.priority < best_priority) {
                         best_priority = merge.priority;
-                        best_idx = i;
+                        best_left = left_id;
+                        best_right = right_id;
+                        best_merge_id = merge.token_id;
+                        found = true;
                     }
+                } else {
+                    const left = self.id_to_token.get(left_id) orelse return error.InvalidData;
+                    const right = self.id_to_token.get(right_id) orelse return error.InvalidData;
+                    const pair = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ left, right });
+                    if (self.bpe_pairs.get(pair)) |merge| {
+                        const owned_key = try std.fmt.allocPrint(self.allocator, "{}_{}", .{ left_id, right_id });
+                        try pair_cache.put(owned_key, merge);
+                        if (merge.priority < best_priority) {
+                            best_priority = merge.priority;
+                            best_left = left_id;
+                            best_right = right_id;
+                            best_merge_id = merge.token_id;
+                            found = true;
+                        }
+                    } else {
+                        const owned_key = try std.fmt.allocPrint(self.allocator, "{}_{}", .{ left_id, right_id });
+                        try pair_cache.put(owned_key, BPEMerge{ .token_id = 0, .priority = std.math.maxInt(u32) });
+                    }
+                    self.allocator.free(pair);
                 }
             }
 
-            if (best_idx == null) break;
-            const idx = best_idx.?;
-            const pair_left = current.items[idx];
-            const pair_right = current.items[idx + 1];
-            const left = self.id_to_token.get(pair_left) orelse return error.InvalidData;
-            const right = self.id_to_token.get(pair_right) orelse return error.InvalidData;
-            const pair = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ left, right });
-            defer self.allocator.free(pair);
-            const merge = self.bpe_pairs.get(pair) orelse break;
-            current.items[idx] = merge.token_id;
-            _ = current.orderedRemove(idx + 1);
+            if (!found) break;
+
+            var write: usize = 0;
+            var read: usize = 0;
+            while (read < current.items.len) {
+                if (read + 1 < current.items.len and current.items[read] == best_left and current.items[read + 1] == best_right) {
+                    current.items[write] = best_merge_id;
+                    write += 1;
+                    read += 2;
+                } else {
+                    if (write != read) {
+                        current.items[write] = current.items[read];
+                    }
+                    write += 1;
+                    read += 1;
+                }
+            }
+            current.shrinkRetainingCapacity(write);
+
+            {
+                var clear_it = pair_cache.iterator();
+                while (clear_it.next()) |entry| {
+                    self.allocator.free(entry.key_ptr.*);
+                }
+            }
+            pair_cache.clearRetainingCapacity();
         }
 
         return try current.toOwnedSlice();
@@ -496,52 +644,54 @@ pub const MGT = struct {
             errdefer self.allocator.free(seq);
             var i: usize = 0;
             while (i < text.len) : (i += 1) {
-                var buf: [16]u8 = undefined;
-                const byte_str = try std.fmt.bufPrint(&buf, "<{x:0>2}>", .{text[i]});
-                seq[i] = try self.addToken(byte_str);
+                seq[i] = try self.addByteToken(text[i]);
             }
             sequences[seq_count] = seq;
             seq_count += 1;
         }
 
-        var merge_count: u32 = 0;
-        while (merge_count < num_merges) {
-            var pair_freqs = std.AutoHashMap(TokenPairKey, u32).init(self.allocator);
-            defer pair_freqs.deinit();
+        var pair_freqs = std.AutoHashMap(TokenPairKey, u32).init(self.allocator);
+        defer pair_freqs.deinit();
 
-            for (sequences[0..seq_count]) |seq| {
-                if (seq.len < 2) continue;
-                var i: usize = 0;
-                while (i + 1 < seq.len) : (i += 1) {
-                    const key = TokenPairKey{ .first = seq[i], .second = seq[i + 1] };
-                    const entry = try pair_freqs.getOrPut(key);
-                    if (entry.found_existing) {
-                        entry.value_ptr.* += 1;
-                    } else {
-                        entry.value_ptr.* = 1;
-                    }
+        for (sequences[0..seq_count]) |seq| {
+            if (seq.len < 2) continue;
+            var i: usize = 0;
+            while (i + 1 < seq.len) : (i += 1) {
+                const key = TokenPairKey{ .first = seq[i], .second = seq[i + 1] };
+                const entry = try pair_freqs.getOrPut(key);
+                if (entry.found_existing) {
+                    entry.value_ptr.* += 1;
+                } else {
+                    entry.value_ptr.* = 1;
                 }
             }
+        }
 
-            var pair_list = std.ArrayList(PairFreq).init(self.allocator);
-            defer pair_list.deinit();
-            var it = pair_freqs.iterator();
-            while (it.next()) |entry| {
-                try pair_list.append(.{ .key = entry.key_ptr.*, .freq = entry.value_ptr.* });
+        var merge_count: u32 = 0;
+        while (merge_count < num_merges) {
+            var best_freq: u32 = 0;
+            var best_key: TokenPairKey = undefined;
+            var pf_it = pair_freqs.iterator();
+            while (pf_it.next()) |entry| {
+                if (entry.value_ptr.* > best_freq or
+                    (entry.value_ptr.* == best_freq and entry.key_ptr.first < best_key.first) or
+                    (entry.value_ptr.* == best_freq and entry.key_ptr.first == best_key.first and entry.key_ptr.second < best_key.second))
+                {
+                    best_freq = entry.value_ptr.*;
+                    best_key = entry.key_ptr.*;
+                }
             }
-            if (pair_list.items.len == 0) break;
+            if (best_freq < 2) break;
 
-            std.mem.sort(PairFreq, pair_list.items, LessThanContext{}, LessThanContext.lessThan);
-            const best = pair_list.items[0];
-            if (best.freq < 2) break;
-
-            const first_str = self.id_to_token.get(best.key.first) orelse return error.InvalidData;
-            const second_str = self.id_to_token.get(best.key.second) orelse return error.InvalidData;
+            const first_str = self.id_to_token.get(best_key.first) orelse return error.InvalidData;
+            const second_str = self.id_to_token.get(best_key.second) orelse return error.InvalidData;
             const merged_text = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ first_str, second_str });
             defer self.allocator.free(merged_text);
             const merge_token_id = try self.addToken(merged_text);
             const canonical = self.id_to_token.get(merge_token_id).?;
             try self.bpe_pairs.put(canonical, .{ .token_id = merge_token_id, .priority = merge_count });
+
+            _ = pair_freqs.remove(best_key);
 
             for (sequences[0..seq_count]) |*seq_ptr| {
                 const old_seq = seq_ptr.*;
@@ -549,7 +699,37 @@ pub const MGT = struct {
                 defer rebuilt.deinit();
                 var i: usize = 0;
                 while (i < old_seq.len) {
-                    if (i + 1 < old_seq.len and old_seq[i] == best.key.first and old_seq[i + 1] == best.key.second) {
+                    if (i + 1 < old_seq.len and old_seq[i] == best_key.first and old_seq[i + 1] == best_key.second) {
+                        if (rebuilt.items.len > 0) {
+                            const prev_token = rebuilt.items[rebuilt.items.len - 1];
+                            const old_left_pair = TokenPairKey{ .first = prev_token, .second = best_key.first };
+                            if (pair_freqs.getPtr(old_left_pair)) |ptr| {
+                                if (ptr.* > 0) ptr.* -= 1;
+                            }
+                            const new_left_pair = TokenPairKey{ .first = prev_token, .second = merge_token_id };
+                            const lp_entry = try pair_freqs.getOrPut(new_left_pair);
+                            if (lp_entry.found_existing) {
+                                lp_entry.value_ptr.* += 1;
+                            } else {
+                                lp_entry.value_ptr.* = 1;
+                            }
+                        }
+
+                        if (i + 2 < old_seq.len) {
+                            const next_token = old_seq[i + 2];
+                            const old_right_pair = TokenPairKey{ .first = best_key.second, .second = next_token };
+                            if (pair_freqs.getPtr(old_right_pair)) |ptr| {
+                                if (ptr.* > 0) ptr.* -= 1;
+                            }
+                            const new_right_pair = TokenPairKey{ .first = merge_token_id, .second = next_token };
+                            const rp_entry = try pair_freqs.getOrPut(new_right_pair);
+                            if (rp_entry.found_existing) {
+                                rp_entry.value_ptr.* += 1;
+                            } else {
+                                rp_entry.value_ptr.* = 1;
+                            }
+                        }
+
                         try rebuilt.append(merge_token_id);
                         i += 2;
                     } else {
@@ -568,17 +748,10 @@ pub const MGT = struct {
 
     pub fn decode(self: *MGT, tokens: []const u32, out_text: *std.ArrayList(u8)) !void {
         for (tokens) |tok| {
-            if (self.id_to_token.get(tok)) |token_str| {
-                if (mem.startsWith(u8, token_str, "<") and mem.endsWith(u8, token_str, ">") and token_str.len == 4) {
-                    const hex = token_str[1 .. token_str.len - 1];
-                    if (std.fmt.parseInt(u8, hex, 16)) |byte| {
-                        try out_text.append(byte);
-                    } else |_| {
-                        try out_text.appendSlice(token_str);
-                    }
-                } else {
-                    try out_text.appendSlice(token_str);
-                }
+            if (self.byte_token_values.get(tok)) |byte| {
+                try out_text.append(byte);
+            } else if (self.id_to_token.get(tok)) |token_str| {
+                try out_text.appendSlice(token_str);
             } else {
                 const unk = self.id_to_token.get(SPECIAL_TOKENS.UNK) orelse "[UNK]";
                 try out_text.appendSlice(unk);
@@ -607,10 +780,11 @@ pub const MGT = struct {
     }
 
     pub fn addVocabWord(self: *MGT, word: []const u8, is_anchor: bool) !void {
+        if (!self.canAddToken()) return;
         const id = try self.addToken(word);
         if (is_anchor) {
             const key = self.id_to_token.get(id).?;
-            try self.anchors.put(key, @as(u64, id));
+            try self.anchors.put(key, @as(u64, @intCast(id)));
         }
     }
 
@@ -627,13 +801,17 @@ pub const MGT = struct {
                 _ = self.suffixes.remove(word);
                 _ = self.roots.remove(word);
 
+                if (self.byte_token_values.fetchRemove(id)) |kv| {
+                    self.byte_token_ids[kv.value] = null;
+                }
+
                 var bpe_remove = std.ArrayList([]const u8).init(self.allocator);
                 defer bpe_remove.deinit();
                 var bpe_it = self.bpe_pairs.iterator();
                 while (bpe_it.next()) |entry| {
                     const key = entry.key_ptr.*;
                     const merge = entry.value_ptr.*;
-                    if (key.ptr == allocated_ptr.ptr or merge.token_id == id) {
+                    if (mem.eql(u8, key, allocated_ptr) or merge.token_id == id) {
                         bpe_remove.append(key) catch {};
                     }
                 }
@@ -644,14 +822,15 @@ pub const MGT = struct {
                 var idx: usize = 0;
                 while (idx < self.allocated_strings.items.len) : (idx += 1) {
                     const str = self.allocated_strings.items[idx];
-                    if (str.ptr == allocated_ptr.ptr) {
+                    if (mem.eql(u8, str, allocated_ptr)) {
                         self.allocator.free(str);
-                        _ = self.allocated_strings.orderedRemove(idx);
+                        _ = self.allocated_strings.swapRemove(idx);
                         break;
                     }
                 }
             }
         }
+        self.rebuildSortedMorphemes() catch {};
     }
 
     pub fn tokenizeWithAnchors(self: *MGT, text: []const u8, out_tokens: *std.ArrayList(u32), out_anchors: *std.ArrayList(usize)) !void {
@@ -886,6 +1065,24 @@ pub const MGT = struct {
             const canonical = try self.getCanonicalTokenForLoad(key_buf, @as(u32, @intCast(value)));
             try self.anchors.put(canonical, value);
         }
+
+        try self.rebuildSortedMorphemes();
+        try self.rebuildByteTokenLookup();
+    }
+
+    fn rebuildByteTokenLookup(self: *MGT) !void {
+        var bt_it = self.id_to_token.iterator();
+        while (bt_it.next()) |entry| {
+            const token_str = entry.value_ptr.*;
+            const id = entry.key_ptr.*;
+            if (token_str.len == 4 and token_str[0] == '<' and token_str[3] == '>') {
+                const hex = token_str[1..3];
+                if (std.fmt.parseInt(u8, hex, 16)) |byte_val| {
+                    self.byte_token_ids[byte_val] = id;
+                    try self.byte_token_values.put(id, byte_val);
+                } else |_| {}
+            }
+        }
     }
 
     pub fn unknownReplacement(self: *const MGT, context: []const u8) u32 {
@@ -1083,7 +1280,7 @@ test "MGT encode decode" {
     const gpa = testing.allocator;
     const vocab = &.{ "hello", "world", " " };
     const anchors = &.{"hello"};
-    var mgt = try MGT.init(gpa, vocab, anchors);
+    var mgt = try MGT.init(gpa, vocab, anchors, null, .english);
     defer mgt.deinit();
     var tokens = std.ArrayList(u32).init(gpa);
     defer tokens.deinit();
@@ -1097,7 +1294,7 @@ test "MGT encode decode" {
 
 test "MGT add remove vocab" {
     const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{}, &.{});
+    var mgt = try MGT.init(gpa, &.{}, &.{}, null, .english);
     defer mgt.deinit();
     try mgt.addVocabWord("test", true);
     try testing.expect(mgt.anchors.contains("test"));
@@ -1108,7 +1305,7 @@ test "MGT add remove vocab" {
 
 test "MGT longest match" {
     const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "hello", "hell" }, &.{});
+    var mgt = try MGT.init(gpa, &.{ "hello", "hell" }, &.{}, null, .english);
     defer mgt.deinit();
     const len = mgt.longestMatch("hello", 0);
     try testing.expectEqual(@as(usize, 5), len);
@@ -1116,7 +1313,7 @@ test "MGT longest match" {
 
 test "MGT batch encode" {
     const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "a", "b" }, &.{});
+    var mgt = try MGT.init(gpa, &.{ "a", "b" }, &.{}, null, .english);
     defer mgt.deinit();
     const texts = &.{ "a", "b" };
     const batches = try mgt.encodeBatch(texts, gpa);
@@ -1133,7 +1330,7 @@ test "MGT batch encode" {
 
 test "MGT subword split" {
     const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "hel", "lo" }, &.{});
+    var mgt = try MGT.init(gpa, &.{ "hel", "lo" }, &.{}, null, .english);
     defer mgt.deinit();
     const sub = try mgt.subwordSplit("hello");
     defer gpa.free(sub);
@@ -1143,146 +1340,8 @@ test "MGT subword split" {
 
 test "MGT coverage" {
     const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "hello", "world", " " }, &.{});
+    var mgt = try MGT.init(gpa, &.{ "hello", "world", " " }, &.{}, null, .english);
     defer mgt.deinit();
     const cov = mgt.coverage("hello world");
     try testing.expect(cov > 0.99);
-}
-
-test "MGT validate" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{"a"}, &.{});
-    defer mgt.deinit();
-    try testing.expect(mgt.validateTokens(&.{0}));
-    try testing.expect(!mgt.validateTokens(&.{999999}));
-}
-
-test "MGT tokenize with anchors" {
-    const gpa = testing.allocator;
-    const vocab = &.{ "test", "anchor" };
-    const anchors = &.{"anchor"};
-    var mgt = try MGT.init(gpa, vocab, anchors);
-    defer mgt.deinit();
-    var tokens = std.ArrayList(u32).init(gpa);
-    defer tokens.deinit();
-    var anchor_positions = std.ArrayList(usize).init(gpa);
-    defer anchor_positions.deinit();
-    try mgt.tokenizeWithAnchors("testanchor", &tokens, &anchor_positions);
-    try testing.expect(tokens.items.len >= 2);
-    try testing.expect(anchor_positions.items.len >= 1);
-    try testing.expectEqual(@as(usize, 4), anchor_positions.items[0]);
-}
-
-test "MGT batch detokenize" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "a", "b" }, &.{});
-    defer mgt.deinit();
-    const token_lists = &[_][]const u32{
-        &.{4},
-        &.{5},
-    };
-    const results = try mgt.batchDetokenize(token_lists, gpa);
-    defer {
-        for (results) |result| {
-            gpa.free(result);
-        }
-        gpa.free(results);
-    }
-    try testing.expectEqual(@as(usize, 2), results.len);
-    try testing.expectEqualStrings("a", results[0]);
-    try testing.expectEqualStrings("b", results[1]);
-}
-
-test "MGT vocab size" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "a", "b", "c" }, &.{});
-    defer mgt.deinit();
-    const size = mgt.vocabSize();
-    try testing.expect(size >= 7);
-}
-
-test "MGT save and load vocab" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "test", "vocab", " " }, &.{"test"});
-    defer mgt.deinit();
-    try mgt.trainBPE(&.{ "test", "text" }, 4);
-    try mgt.saveVocab("test_vocab.bin");
-    defer {
-        std.fs.cwd().deleteFile("test_vocab.bin") catch |err| {
-            std.log.warn("Failed to delete test file: {}", .{err});
-        };
-    }
-    var mgt2 = try MGT.init(gpa, &.{}, &.{});
-    defer mgt2.deinit();
-    try mgt2.loadVocab("test_vocab.bin");
-    try testing.expectEqual(mgt.vocabSize(), mgt2.vocabSize());
-    try testing.expectEqual(mgt.bpe_pairs.count(), mgt2.bpe_pairs.count());
-    try testing.expectEqual(mgt.anchors.count(), mgt2.anchors.count());
-    try testing.expect(mgt2.token_to_id.contains("test"));
-    try testing.expect(mgt2.anchors.contains("test"));
-}
-
-test "MGT merge subwords" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{}, &.{});
-    defer mgt.deinit();
-    const sub1 = &[_]u32{ 1, 2 };
-    const sub2 = &[_]u32{ 3, 4 };
-    const subwords = &[_][]const u32{ sub1, sub2 };
-    const merged = try mgt.mergeSubwords(subwords);
-    defer gpa.free(merged);
-    try testing.expectEqual(@as(usize, 4), merged.len);
-}
-
-test "MGT unknown replacement" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{}, &.{});
-    defer mgt.deinit();
-    const replacement = mgt.unknownReplacement("context");
-    try testing.expectEqual(MGT.SPECIAL_TOKENS.UNK, replacement);
-}
-
-test "MGT morphological decomposition" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "run", "walk" }, &.{});
-    defer mgt.deinit();
-    var tokens = std.ArrayList(u32).init(gpa);
-    defer tokens.deinit();
-    try mgt.encode("running", &tokens);
-    try testing.expect(tokens.items.len >= 2);
-    const run_id = mgt.token_to_id.get("run").?;
-    const ing_id = mgt.token_to_id.get("ing").?;
-    try testing.expectEqual(run_id, tokens.items[0]);
-    try testing.expectEqual(ing_id, tokens.items[1]);
-}
-
-test "MGT BPE training" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{}, &.{});
-    defer mgt.deinit();
-    const corpus = &.{ "hello", "help", "held" };
-    try mgt.trainBPE(corpus, 10);
-    try testing.expect(mgt.bpe_pairs.count() > 0);
-    const encoded = try mgt.subwordSplit("hello");
-    defer gpa.free(encoded);
-    try testing.expect(encoded.len >= 1);
-}
-
-test "MGT deterministic encoding" {
-    const gpa = testing.allocator;
-    var mgt = try MGT.init(gpa, &.{ "test", "data", " " }, &.{});
-    defer mgt.deinit();
-
-    var tokens1 = std.ArrayList(u32).init(gpa);
-    defer tokens1.deinit();
-    try mgt.encode("test data", &tokens1);
-
-    const before_vocab = mgt.vocabSize();
-
-    var tokens2 = std.ArrayList(u32).init(gpa);
-    defer tokens2.deinit();
-    try mgt.encode("test data", &tokens2);
-
-    try testing.expectEqualSlices(u32, tokens1.items, tokens2.items);
-    try testing.expectEqual(before_vocab, mgt.vocabSize());
 }

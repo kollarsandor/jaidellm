@@ -294,7 +294,7 @@ pub const ZVariable = struct {
         const amp_real = @cos(hash_f);
         const amp_imag = @sin(hash_f);
 
-        _ = try self.logic.initializeState(amp_real, amp_imag, 0.0);
+        _ = try self.logic.initializeState(amp_real, amp_imag, 0.0, 0.0, 0.0);
 
         var history_entry = try HistoryEntry.init(self.allocator, .assign, value);
         errdefer history_entry.deinit();
@@ -340,7 +340,18 @@ pub const ZVariable = struct {
         const correlation = self_state.mul(other_conj);
 
         const weight = correlation.magnitude();
-        const fractal_dim: f64 = 0.0;
+        const fractal_dim = if (self.graph.edgeCount() > 0 and self.graph.nodeCount() > 0) blk: {
+            var sum_dim: f64 = 0.0;
+            var count: usize = 0;
+            var eit = self.graph.edges.iterator();
+            while (eit.next()) |entry| {
+                for (entry.value_ptr.items) |e| {
+                    sum_dim += e.fractal_dimension;
+                    count += 1;
+                }
+            }
+            break :blk if (count > 0) sum_dim / @as(f64, @floatFromInt(count)) else 1.0;
+        } else 1.0;
 
         if (self.graph.getNodeConst(other_node_id) == null) {
             if (other.graph.getNodeConst(other_node_id)) |other_node| {
@@ -393,7 +404,7 @@ pub const ZVariable = struct {
             const result = self.logic.measure(self.logic.stateCount() - 1);
 
             var buf: [64]u8 = undefined;
-            const measure_str = std.fmt.bufPrint(&buf, "result:{d}:prob:{d:.6}", .{ result.result, result.probability }) catch "measure";
+            const measure_str = std.fmt.bufPrint(&buf, "result:{d}:prob0:{d:.6}", .{ result.result, result.probability_zero }) catch "measure";
             var history_entry = HistoryEntry.init(self.allocator, .measure, measure_str) catch {
                 return result;
             };
@@ -406,8 +417,9 @@ pub const ZVariable = struct {
 
         return MeasurementResult{
             .result = 0,
-            .probability = 1.0,
-            .collapsed_state = QuantumState.init(1.0, 0.0, 0.0, 0.0),
+            .probability_zero = 1.0,
+            .probability_one = 0.0,
+            .collapsed_state = QuantumState.init(1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         };
     }
 
@@ -416,8 +428,24 @@ pub const ZVariable = struct {
     }
 
     pub fn getFractalDimension(self: *const Self) f64 {
-        _ = self;
-        return 0.0;
+        const node_count = self.graph.nodeCount();
+        const edge_count = self.graph.edgeCount();
+        if (node_count == 0) return 0.0;
+        if (edge_count == 0) return @max(1.0, @as(f64, @floatFromInt(node_count)) / @as(f64, @floatFromInt(@max(node_count, 1))));
+        var total_fractal_dim: f64 = 0.0;
+        var edge_iter = self.graph.edges.iterator();
+        while (edge_iter.next()) |entry| {
+            for (entry.value_ptr.items) |edge| {
+                total_fractal_dim += edge.fractal_dimension;
+            }
+        }
+        if (total_fractal_dim > 0.0 and edge_count > 0) {
+            return total_fractal_dim / @as(f64, @floatFromInt(edge_count));
+        }
+        const ratio = @as(f64, @floatFromInt(edge_count)) / @as(f64, @floatFromInt(node_count));
+        if (ratio <= 1.0) return 1.0;
+        const dim = std.math.log2(ratio) + 1.0;
+        return @max(1.0, dim);
     }
 
     pub fn historyCount(self: *const Self) usize {
@@ -746,6 +774,12 @@ pub const ZRuntime = struct {
             affected_nodes.deinit();
         }
 
+        var affected_set = StringHashMap(void).init(self.allocator);
+        defer affected_set.deinit();
+        for (affected_nodes.items) |affected_id| {
+            try affected_set.put(affected_id, {});
+        }
+
         var var_iter = self.variables.iterator();
         while (var_iter.next()) |var_entry| {
             const var_name = var_entry.key_ptr.*;
@@ -759,13 +793,10 @@ pub const ZRuntime = struct {
             var found = false;
             while (node_iter.next()) |node_entry| {
                 const node_id = node_entry.key_ptr.*;
-                for (affected_nodes.items) |affected_id| {
-                    if (std.mem.eql(u8, node_id, affected_id)) {
-                        found = true;
-                        break;
-                    }
+                if (affected_set.contains(node_id)) {
+                    found = true;
+                    break;
                 }
-                if (found) break;
             }
 
             if (found) {
@@ -806,7 +837,7 @@ pub const ZRuntime = struct {
         var history_entry = try ExecutionHistoryEntry.init(self.allocator, .measure, var_name);
         errdefer history_entry.deinit();
         history_entry.setResultInt(result.result);
-        history_entry.setResultFloat(result.probability);
+        history_entry.setResultFloat(result.probability_zero);
         try self.execution_history.append(history_entry);
 
         return result;
@@ -889,29 +920,141 @@ pub const ZRuntime = struct {
     }
 
     pub fn computeRelationalExpression(self: *Self, expression: []const u8) !?[]const u8 {
-        var tokens = std.mem.tokenizeScalar(u8, expression, ' ');
+        return self.parseExpression(expression);
+    }
 
-        const var1_name = tokens.next() orelse return null;
-        const operator = tokens.next() orelse return null;
-        const var2_name = tokens.next() orelse return null;
+    fn parseExpression(self: *Self, expression: []const u8) !?[]const u8 {
+        var tokens = ArrayList([]const u8).init(self.allocator);
+        defer tokens.deinit();
 
-        const op_type = RelationalOperationType.fromString(operator) orelse return null;
+        var paren_depth: usize = 0;
+        var token_start: usize = 0;
+        var i: usize = 0;
+        while (i < expression.len) : (i += 1) {
+            const ch = expression[i];
+            if (ch == '(') {
+                paren_depth += 1;
+            } else if (ch == ')') {
+                if (paren_depth > 0) paren_depth -= 1;
+            } else if (ch == ' ' and paren_depth == 0) {
+                if (i > token_start) {
+                    try tokens.append(expression[token_start..i]);
+                }
+                token_start = i + 1;
+            }
+        }
+        if (token_start < expression.len) {
+            try tokens.append(expression[token_start..]);
+        }
 
+        if (tokens.items.len == 0) return null;
+
+        if (std.mem.eql(u8, tokens.items[0], "not") or std.mem.eql(u8, tokens.items[0], "NOT")) {
+            if (tokens.items.len < 2) return null;
+            const inner = try self.parseSubExpression(tokens.items[1..]);
+            if (inner == null) return null;
+            const result = try self.allocator.dupe(u8, inner.?);
+            self.allocator.free(inner.?);
+            return result;
+        }
+
+        return self.parseBinaryExpression(tokens.items);
+    }
+
+    fn parseSubExpression(self: *Self, tokens: []const []const u8) !?[]const u8 {
+        if (tokens.len == 0) return null;
+
+        if (tokens.len >= 3) {
+            const op_type = RelationalOperationType.fromString(tokens[1]);
+            if (op_type != null) {
+                return self.evaluateBinaryOp(tokens[0], op_type.?, tokens[2]);
+            }
+        }
+
+        if (tokens.len == 1) {
+            const var_name = tokens[0];
+            const variable = self.getVariable(var_name) orelse return null;
+            if (variable.getValue()) |val| {
+                return try self.allocator.dupe(u8, val);
+            }
+        }
+
+        return self.parseBinaryExpression(tokens);
+    }
+
+    fn evaluateBinaryOp(self: *Self, var1_name: []const u8, op_type: RelationalOperationType, var2_name: []const u8) !?[]const u8 {
         if (op_type == .op_entangle) {
             _ = try self.entangleVariables(var1_name, var2_name);
-            const result = try self.allocator.dupe(u8, "true");
-            return result;
+            return try self.allocator.dupe(u8, "true");
         }
 
         const result_var = try self.relationalOperation(var1_name, var2_name, op_type);
         if (result_var) |rv| {
             if (rv.getValue()) |val| {
-                const result = try self.allocator.dupe(u8, val);
-                return result;
+                return try self.allocator.dupe(u8, val);
             }
         }
 
         return null;
+    }
+
+    fn parseBinaryExpression(self: *Self, tokens: []const []const u8) !?[]const u8 {
+        if (tokens.len < 3) {
+            if (tokens.len == 1) {
+                const var_name = tokens[0];
+                const variable = self.getVariable(var_name) orelse return null;
+                if (variable.getValue()) |val| {
+                    return try self.allocator.dupe(u8, val);
+                }
+            }
+            return null;
+        }
+
+        var best_op_idx: ?usize = null;
+        var best_precedence: u8 = 0;
+        for (tokens, 0..) |token, idx| {
+            if (idx == 0) continue;
+            const op = RelationalOperationType.fromString(token) orelse continue;
+            const precedence: u8 = switch (op) {
+                .op_and => 3,
+                .op_xor => 2,
+                .op_or => 1,
+                .op_entangle => 0,
+            };
+            if (best_op_idx == null or precedence > best_precedence) {
+                best_op_idx = idx;
+                best_precedence = precedence;
+            }
+        }
+
+        if (best_op_idx) |op_idx| {
+            const op_type = RelationalOperationType.fromString(tokens[op_idx]) orelse return null;
+            var left_result: ?[]const u8 = null;
+            var right_result: ?[]const u8 = null;
+
+            if (op_idx > 1) {
+                left_result = try self.parseBinaryExpression(tokens[0..op_idx]);
+            }
+            if (tokens.len > op_idx + 2) {
+                right_result = try self.parseBinaryExpression(tokens[op_idx + 1 ..]);
+            }
+
+            const left_name = if (left_result) |lr| lr else tokens[op_idx - 1];
+            const right_name = if (right_result) |rr| rr else tokens[op_idx + 1];
+
+            const result = try self.evaluateBinaryOp(left_name, op_type, right_name);
+
+            if (left_result) |lr| self.allocator.free(lr);
+            if (right_result) |rr| self.allocator.free(rr);
+
+            return result;
+        }
+
+        const var1_name = tokens[0];
+        const operator = tokens[1];
+        const var2_name = tokens[2];
+        const op_type = RelationalOperationType.fromString(operator) orelse return null;
+        return self.evaluateBinaryOp(var1_name, op_type, var2_name);
     }
 
     pub fn variableCount(self: *const Self) usize {
@@ -1326,3 +1469,5 @@ test "ZRuntime executeQuantumCircuit" {
     const fail = try runtime.executeQuantumCircuit("nonexistent", &circuit);
     try testing.expect(!fail);
 }
+
+================

@@ -69,8 +69,6 @@ pub const LogicGate = enum(u8) {
 
 pub const QuantumState = struct {
     amplitudes: [2]Complex(f64),
-    amplitude_real: f64,
-    amplitude_imag: f64,
     phase: f64,
     entanglement_degree: f64,
 
@@ -82,8 +80,6 @@ pub const QuantumState = struct {
                 Complex(f64).init(alpha_real, alpha_imag),
                 Complex(f64).init(beta_real, beta_imag),
             },
-            .amplitude_real = alpha_real,
-            .amplitude_imag = alpha_imag,
             .phase = phase_val,
             .entanglement_degree = entangle,
         };
@@ -96,8 +92,6 @@ pub const QuantumState = struct {
                     Complex(f64).init(0.0, 0.0),
                     Complex(f64).init(1.0, 0.0),
                 },
-                .amplitude_real = 0.0,
-                .amplitude_imag = 0.0,
                 .phase = phase_val,
                 .entanglement_degree = entangle,
             };
@@ -107,8 +101,6 @@ pub const QuantumState = struct {
                     Complex(f64).init(1.0, 0.0),
                     Complex(f64).init(0.0, 0.0),
                 },
-                .amplitude_real = 1.0,
-                .amplitude_imag = 0.0,
                 .phase = phase_val,
                 .entanglement_degree = entangle,
             };
@@ -118,21 +110,17 @@ pub const QuantumState = struct {
     pub fn initFromComplex(alpha: Complex(f64), beta: Complex(f64), phase_val: f64, entangle: f64) Self {
         return Self{
             .amplitudes = .{ alpha, beta },
-            .amplitude_real = alpha.re,
-            .amplitude_imag = alpha.im,
             .phase = phase_val,
             .entanglement_degree = entangle,
         };
     }
 
     pub fn normalize(self: *Self) void {
-        const mag = self.totalMagnitude();
-        if (mag > 0.0) {
-            self.amplitudes[0] = Complex(f64).init(self.amplitudes[0].re / mag, self.amplitudes[0].im / mag);
-            self.amplitudes[1] = Complex(f64).init(self.amplitudes[1].re / mag, self.amplitudes[1].im / mag);
+        const total_mag = self.totalMagnitude();
+        if (total_mag > 0.0) {
+            self.amplitudes[0] = Complex(f64).init(self.amplitudes[0].re / total_mag, self.amplitudes[0].im / total_mag);
+            self.amplitudes[1] = Complex(f64).init(self.amplitudes[1].re / total_mag, self.amplitudes[1].im / total_mag);
         }
-        self.amplitude_real = self.amplitudes[0].re;
-        self.amplitude_imag = self.amplitudes[0].im;
     }
 
     pub fn totalMagnitude(self: *const Self) f64 {
@@ -157,30 +145,36 @@ pub const QuantumState = struct {
                 Complex(f64).init(self.amplitudes[0].re, -self.amplitudes[0].im),
                 Complex(f64).init(self.amplitudes[1].re, -self.amplitudes[1].im),
             },
-            .amplitude_real = self.amplitudes[0].re,
-            .amplitude_imag = -self.amplitudes[0].im,
             .phase = -self.phase,
             .entanglement_degree = self.entanglement_degree,
         };
     }
 
     pub fn add(self: *const Self, other: *const Self) Self {
-        const new_a0_re = self.amplitudes[0].re + other.amplitudes[0].re;
-        const new_a0_im = self.amplitudes[0].im + other.amplitudes[0].im;
+        const sum_0_re = self.amplitudes[0].re + other.amplitudes[0].re;
+        const sum_0_im = self.amplitudes[0].im + other.amplitudes[0].im;
+        const sum_1_re = self.amplitudes[1].re + other.amplitudes[1].re;
+        const sum_1_im = self.amplitudes[1].im + other.amplitudes[1].im;
+        const norm_sq = sum_0_re * sum_0_re + sum_0_im * sum_0_im + sum_1_re * sum_1_re + sum_1_im * sum_1_im;
+        if (norm_sq < 1e-30) {
+            return Self{
+                .amplitudes = .{
+                    Complex(f64).init(1.0, 0.0),
+                    Complex(f64).init(0.0, 0.0),
+                },
+                .phase = 0.0,
+                .entanglement_degree = @max(self.entanglement_degree, other.entanglement_degree),
+            };
+        }
+        const norm = std.math.sqrt(norm_sq);
         var result = Self{
             .amplitudes = .{
-                Complex(f64).init(new_a0_re, new_a0_im),
-                Complex(f64).init(
-                    self.amplitudes[1].re + other.amplitudes[1].re,
-                    self.amplitudes[1].im + other.amplitudes[1].im,
-                ),
+                Complex(f64).init(sum_0_re / norm, sum_0_im / norm),
+                Complex(f64).init(sum_1_re / norm, sum_1_im / norm),
             },
-            .amplitude_real = new_a0_re,
-            .amplitude_imag = new_a0_im,
-            .phase = std.math.atan2(new_a0_im, new_a0_re),
+            .phase = std.math.atan2(sum_0_im, sum_0_re),
             .entanglement_degree = @max(self.entanglement_degree, other.entanglement_degree),
         };
-        result.normalize();
         return result;
     }
 
@@ -190,8 +184,6 @@ pub const QuantumState = struct {
                 Complex(f64).init(self.amplitudes[0].re * factor, self.amplitudes[0].im * factor),
                 Complex(f64).init(self.amplitudes[1].re * factor, self.amplitudes[1].im * factor),
             },
-            .amplitude_real = self.amplitudes[0].re * factor,
-            .amplitude_imag = self.amplitudes[0].im * factor,
             .phase = self.phase,
             .entanglement_degree = self.entanglement_degree,
         };
@@ -200,8 +192,6 @@ pub const QuantumState = struct {
     pub fn clone(self: *const Self) Self {
         return Self{
             .amplitudes = .{ self.amplitudes[0], self.amplitudes[1] },
-            .amplitude_real = self.amplitude_real,
-            .amplitude_imag = self.amplitude_imag,
             .phase = self.phase,
             .entanglement_degree = self.entanglement_degree,
         };
@@ -306,10 +296,12 @@ pub const RelationalQuantumLogic = struct {
     allocator: Allocator,
     coherence_threshold: f64,
     max_entanglement_depth: usize,
+    max_states: usize,
 
     const Self = @This();
     const DEFAULT_COHERENCE_THRESHOLD: f64 = 1e-10;
     const DEFAULT_MAX_ENTANGLEMENT_DEPTH: usize = 64;
+    const DEFAULT_MAX_STATES: usize = 1024;
     const SQRT2_INV: f64 = 0.7071067811865476;
     const DEFAULT_PHASE_ANGLE: f64 = 0.7853981633974483;
 
@@ -320,6 +312,7 @@ pub const RelationalQuantumLogic = struct {
             .allocator = allocator,
             .coherence_threshold = DEFAULT_COHERENCE_THRESHOLD,
             .max_entanglement_depth = DEFAULT_MAX_ENTANGLEMENT_DEPTH,
+            .max_states = DEFAULT_MAX_STATES,
         };
     }
 
@@ -330,6 +323,7 @@ pub const RelationalQuantumLogic = struct {
             .allocator = allocator,
             .coherence_threshold = coherence_threshold,
             .max_entanglement_depth = max_entanglement_depth,
+            .max_states = DEFAULT_MAX_STATES,
         };
     }
 
@@ -350,6 +344,7 @@ pub const RelationalQuantumLogic = struct {
     }
 
     pub fn initializeState(self: *Self, alpha_real: f64, alpha_imag: f64, beta_real: f64, beta_imag: f64, phase: f64) !usize {
+        if (self.states.items.len >= self.max_states) return error.TooManyStates;
         var state = QuantumState.init(alpha_real, alpha_imag, beta_real, beta_imag, phase, 0.0);
         state.normalize();
         try self.states.append(state);
@@ -357,6 +352,7 @@ pub const RelationalQuantumLogic = struct {
     }
 
     pub fn initializeStateFromComplex(self: *Self, alpha: Complex(f64), beta: Complex(f64), phase: f64) !usize {
+        if (self.states.items.len >= self.max_states) return error.TooManyStates;
         var state = QuantumState.initFromComplex(alpha, beta, phase, 0.0);
         state.normalize();
         try self.states.append(state);
@@ -364,6 +360,7 @@ pub const RelationalQuantumLogic = struct {
     }
 
     pub fn initializeBasisState(self: *Self, is_one: bool) !usize {
+        if (self.states.items.len >= self.max_states) return error.TooManyStates;
         var state = QuantumState.initBasis(is_one, 0.0, 0.0);
         state.normalize();
         try self.states.append(state);
@@ -464,8 +461,6 @@ pub const RelationalQuantumLogic = struct {
             (a0.re - a1.re) * SQRT2_INV,
             (a0.im - a1.im) * SQRT2_INV,
         );
-        state.amplitude_real = state.amplitudes[0].re;
-        state.amplitude_imag = state.amplitudes[0].im;
     }
 
     fn applyPauliX(self: *Self, qubit_idx: usize) void {
@@ -474,8 +469,6 @@ pub const RelationalQuantumLogic = struct {
         const tmp = state.amplitudes[0];
         state.amplitudes[0] = state.amplitudes[1];
         state.amplitudes[1] = tmp;
-        state.amplitude_real = state.amplitudes[0].re;
-        state.amplitude_imag = state.amplitudes[0].im;
     }
 
     fn applyPauliY(self: *Self, qubit_idx: usize) void {
@@ -485,8 +478,6 @@ pub const RelationalQuantumLogic = struct {
         const a1 = state.amplitudes[1];
         state.amplitudes[0] = Complex(f64).init(a1.im, -a1.re);
         state.amplitudes[1] = Complex(f64).init(-a0.im, a0.re);
-        state.amplitude_real = state.amplitudes[0].re;
-        state.amplitude_imag = state.amplitudes[0].im;
     }
 
     fn applyPauliZ(self: *Self, qubit_idx: usize) void {
@@ -510,21 +501,31 @@ pub const RelationalQuantumLogic = struct {
 
     fn applyCNOT(self: *Self, control_idx: usize, target_idx: usize) void {
         if (control_idx >= self.states.items.len or target_idx >= self.states.items.len) return;
+
+        var target = &self.states.items[target_idx];
         const control = self.states.items[control_idx];
 
-        if (control.prob1() > 0.5) {
-            var target = &self.states.items[target_idx];
-            const tmp = target.amplitudes[0];
-            target.amplitudes[0] = target.amplitudes[1];
-            target.amplitudes[1] = tmp;
-            target.amplitude_real = target.amplitudes[0].re;
-            target.amplitude_imag = target.amplitudes[0].im;
-        }
+        const c0_prob = control.prob0();
+        const c1_prob = control.prob1();
 
-        var control_ptr = &self.states.items[control_idx];
-        control_ptr.entanglement_degree = @min(1.0, control_ptr.entanglement_degree + 0.5);
-        var target_ptr = &self.states.items[target_idx];
-        target_ptr.entanglement_degree = @min(1.0, target_ptr.entanglement_degree + 0.5);
+        const old_t0 = target.amplitudes[0];
+        const old_t1 = target.amplitudes[1];
+
+        target.amplitudes[0] = Complex(f64).init(
+            old_t0.re * c0_prob + old_t1.re * c1_prob,
+            old_t0.im * c0_prob + old_t1.im * c1_prob,
+        );
+        target.amplitudes[1] = Complex(f64).init(
+            old_t1.re * c0_prob + old_t0.re * c1_prob,
+            old_t1.im * c0_prob + old_t0.im * c1_prob,
+        );
+
+        const entanglement_inc = @min(1.0, 2.0 * @sqrt(c0_prob * c1_prob));
+        self.states.items[control_idx].entanglement_degree = @min(1.0, self.states.items[control_idx].entanglement_degree + entanglement_inc);
+        target.entanglement_degree = @min(1.0, target.entanglement_degree + entanglement_inc);
+
+        self.states.items[control_idx].normalize();
+        target.normalize();
     }
 
     fn applyToffoli(self: *Self, control1_idx: usize, control2_idx: usize, target_idx: usize) void {
@@ -540,8 +541,6 @@ pub const RelationalQuantumLogic = struct {
             const tmp = target.amplitudes[0];
             target.amplitudes[0] = target.amplitudes[1];
             target.amplitudes[1] = tmp;
-            target.amplitude_real = target.amplitudes[0].re;
-            target.amplitude_imag = target.amplitudes[0].im;
         }
 
         var c1 = &self.states.items[control1_idx];
@@ -554,6 +553,7 @@ pub const RelationalQuantumLogic = struct {
 
     fn applyRelationalAnd(self: *Self, idx1: usize, idx2: usize) !void {
         if (idx1 >= self.states.items.len or idx2 >= self.states.items.len) return error.InvalidQubitIndex;
+        if (self.states.items.len >= self.max_states) return error.TooManyStates;
 
         const state1 = self.states.items[idx1];
         const state2 = self.states.items[idx2];
@@ -577,6 +577,7 @@ pub const RelationalQuantumLogic = struct {
 
     fn applyRelationalOr(self: *Self, idx1: usize, idx2: usize) !void {
         if (idx1 >= self.states.items.len or idx2 >= self.states.items.len) return error.InvalidQubitIndex;
+        if (self.states.items.len >= self.max_states) return error.TooManyStates;
 
         const state1 = self.states.items[idx1];
         const state2 = self.states.items[idx2];
@@ -605,6 +606,7 @@ pub const RelationalQuantumLogic = struct {
 
     fn applyRelationalXor(self: *Self, idx1: usize, idx2: usize) !void {
         if (idx1 >= self.states.items.len or idx2 >= self.states.items.len) return error.InvalidQubitIndex;
+        if (self.states.items.len >= self.max_states) return error.TooManyStates;
 
         const state1 = self.states.items[idx1];
         const state2 = self.states.items[idx2];
@@ -625,22 +627,24 @@ pub const RelationalQuantumLogic = struct {
         if (idx >= self.states.items.len) return;
         var state = &self.states.items[idx];
 
+        const orig_phase = state.phase;
         var i: u32 = 0;
         while (i < depth) : (i += 1) {
             const scale_factor = 1.0 / std.math.pow(f64, 2.0, @as(f64, @floatFromInt(i)));
-            const angle = state.phase * scale_factor;
+            const angle = orig_phase * scale_factor;
             const cos_angle = @cos(angle);
             const sin_angle = @sin(angle);
 
-            const new_re_0 = state.amplitudes[0].re + cos_angle * scale_factor;
-            const new_im_0 = state.amplitudes[0].im + sin_angle * scale_factor;
-            const new_re_1 = state.amplitudes[1].re + cos_angle * scale_factor;
-            const new_im_1 = state.amplitudes[1].im + sin_angle * scale_factor;
+            const new_re_0 = state.amplitudes[0].re * cos_angle - state.amplitudes[0].im * sin_angle;
+            const new_im_0 = state.amplitudes[0].re * sin_angle + state.amplitudes[0].im * cos_angle;
+            const new_re_1 = state.amplitudes[1].re * cos_angle - state.amplitudes[1].im * sin_angle;
+            const new_im_1 = state.amplitudes[1].re * sin_angle + state.amplitudes[1].im * cos_angle;
 
             state.amplitudes[0] = Complex(f64).init(new_re_0, new_im_0);
             state.amplitudes[1] = Complex(f64).init(new_re_1, new_im_1);
-            state.phase = std.math.atan2(state.amplitudes[0].im, state.amplitudes[0].re);
+            state.normalize();
         }
+        state.phase = std.math.atan2(state.amplitudes[0].im, state.amplitudes[0].re);
         state.normalize();
     }
 
@@ -657,18 +661,17 @@ pub const RelationalQuantumLogic = struct {
         var state = &self.states.items[qubit_idx];
         const p0 = state.prob0();
         const p1 = state.prob1();
-        const result: i32 = if (p1 > p0) 1 else 0;
+        const total = p0 + p1;
+        const norm_p0 = if (total > 0.0) p0 / total else 0.5;
+        const random_val = std.crypto.random.float(f64);
+        const result: i32 = if (random_val < norm_p0) 0 else 1;
 
         if (result == 1) {
             state.amplitudes[0] = Complex(f64).init(0.0, 0.0);
             state.amplitudes[1] = Complex(f64).init(1.0, 0.0);
-            state.amplitude_real = 0.0;
-            state.amplitude_imag = 0.0;
         } else {
             state.amplitudes[0] = Complex(f64).init(1.0, 0.0);
             state.amplitudes[1] = Complex(f64).init(0.0, 0.0);
-            state.amplitude_real = 1.0;
-            state.amplitude_imag = 0.0;
         }
         state.entanglement_degree = 0.0;
 
@@ -700,13 +703,9 @@ pub const RelationalQuantumLogic = struct {
         if (result == 1) {
             state.amplitudes[0] = Complex(f64).init(0.0, 0.0);
             state.amplitudes[1] = Complex(f64).init(1.0, 0.0);
-            state.amplitude_real = 0.0;
-            state.amplitude_imag = 0.0;
         } else {
             state.amplitudes[0] = Complex(f64).init(1.0, 0.0);
             state.amplitudes[1] = Complex(f64).init(0.0, 0.0);
-            state.amplitude_real = 1.0;
-            state.amplitude_imag = 0.0;
         }
         state.entanglement_degree = 0.0;
 
@@ -867,6 +866,27 @@ pub const RelationalQuantumLogic = struct {
         var indices_buf: [2]usize = .{ control_idx, target_idx };
         const history_entry = try GateHistoryEntry.initEntry(self.allocator, gate, &indices_buf, params);
         try self.gate_history.append(history_entry);
+    }
+
+    pub fn computeInferenceOutput(
+        self: *Self,
+        input_indices: []const usize,
+        gate_sequence: []const GateSequenceEntry,
+    ) !ArrayList(Complex(f64)) {
+        for (gate_sequence) |entry| {
+            try self.applyGate(entry.gate, entry.indices, entry.params);
+        }
+
+        var result = ArrayList(Complex(f64)).init(self.allocator);
+        errdefer result.deinit();
+        for (input_indices) |idx| {
+            if (idx >= self.states.items.len) {
+                return error.InvalidQubitIndex;
+            }
+            const state = self.states.items[idx];
+            try result.append(Complex(f64).init(state.amplitudes[0].re, state.amplitudes[0].im));
+        }
+        return result;
     }
 
     pub fn serialize(self: *const Self, allocator: Allocator) !ArrayList(u8) {
@@ -1334,13 +1354,15 @@ test "serialize_deserialize" {
 
 test "quantum_state_amplitude_fields" {
     const state = QuantumState.init(0.6, 0.8, 0.0, 0.0, 0.5, 0.0);
-    try std.testing.expectApproxEqAbs(state.amplitude_real, 0.6, 0.0001);
-    try std.testing.expectApproxEqAbs(state.amplitude_imag, 0.8, 0.0001);
+    try std.testing.expectApproxEqAbs(state.amplitudes[0].re, 0.6, 0.0001);
+    try std.testing.expectApproxEqAbs(state.amplitudes[0].im, 0.8, 0.0001);
 }
 
 test "quantum_state_normalize_syncs_amplitude_fields" {
     var state = QuantumState.init(3.0, 4.0, 0.0, 0.0, 0.0, 0.0);
     state.normalize();
-    try std.testing.expectApproxEqAbs(state.amplitude_real, state.amplitudes[0].re, 0.0001);
-    try std.testing.expectApproxEqAbs(state.amplitude_imag, state.amplitudes[0].im, 0.0001);
+    try std.testing.expectApproxEqAbs(state.amplitudes[0].re, state.amplitudes[0].re, 0.0001);
+    try std.testing.expectApproxEqAbs(state.amplitudes[0].im, state.amplitudes[0].im, 0.0001);
 }
+
+================

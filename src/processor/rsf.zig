@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const Tensor = @import("../core/tensor.zig").Tensor;
 const memory = @import("../core/memory.zig");
 const accel = @import("../hw/accel/accel_interface.zig");
+const OFTB = @import("oftb.zig").OFTB;
 const Thread = std.Thread;
 
 pub const RSFLayerConfig = struct {
@@ -724,6 +725,7 @@ const RSFCore = struct {
     gpu_weight_version: u64,
     cpu_weight_version: u64,
     f16_buf: ?[]f16,
+    oftb: OFTB,
 };
 
 const ModelRegistryEntry = struct {
@@ -826,6 +828,16 @@ fn forwardOnCore(core: *const RSFCore, x: *Tensor) !void {
 
             i = 0;
             while (i < core.dim) : (i += 1) x2_row[i] += trans[i];
+
+            // OFTB butterfly mixing after each coupling layer
+            const oftb_scale = OFTB.FRACTAL_SCALE;
+            i = 0;
+            while (i < core.dim) : (i += 1) {
+                const a = x1_row[i];
+                const b_val = x2_row[i];
+                x1_row[i] = (a - b_val) * oftb_scale;
+                x2_row[i] = (a + b_val) * oftb_scale;
+            }
         }
     }
 }
@@ -856,9 +868,19 @@ fn inverseOnCore(core: *const RSFCore, y: *Tensor) !void {
             const y1_row = row[0..core.dim];
             const y2_row = row[core.dim..dim2];
 
+            // OFTB backward (inverse) before RSF coupling inverse
+            const oftb_scale = OFTB.FRACTAL_SCALE;
+            var i: usize = 0;
+            while (i < core.dim) : (i += 1) {
+                const a = y1_row[i];
+                const b_val = y2_row[i];
+                y1_row[i] = (a + b_val) * oftb_scale;
+                y2_row[i] = (b_val - a) * oftb_scale;
+            }
+
             layer.computeTranslationRow(y1_row, trans);
 
-            var i: usize = 0;
+            i = 0;
             while (i < core.dim) : (i += 1) y2_row[i] -= trans[i];
 
             layer.computeScaleRow(y2_row, scale);
@@ -926,6 +948,27 @@ fn backwardOnCore(core: *RSFCore, grad_output: *const Tensor, input: *const Tens
 
         var idx = layer_count;
         while (idx > 0) : (idx -= 1) {
+            // OFTB backward before RSF coupling backward
+            const oftb_scale = OFTB.FRACTAL_SCALE;
+            {
+                var i: usize = 0;
+                while (i < core.dim) : (i += 1) {
+                    const a = y1_row[i];
+                    const b_val = y2_row[i];
+                    y1_row[i] = (a + b_val) * oftb_scale;
+                    y2_row[i] = (b_val - a) * oftb_scale;
+                }
+            }
+            {
+                var i: usize = 0;
+                while (i < core.dim) : (i += 1) {
+                    const a = dy1_row[i];
+                    const b_val = dy2_row[i];
+                    dy1_row[i] = (a + b_val) * oftb_scale;
+                    dy2_row[i] = (b_val - a) * oftb_scale;
+                }
+            }
+
             try core.layers[idx - 1].backwardFromOutputsRow(
                 y1_row,
                 y2_row,
@@ -1259,6 +1302,7 @@ pub const RSF = struct {
             .gpu_weight_version = 0,
             .cpu_weight_version = 1,
             .f16_buf = null,
+            .oftb = OFTB.init(dim),
         };
         errdefer {
             if (core.gpu_accel) |*ga| {
@@ -1537,6 +1581,7 @@ pub const RSF = struct {
             .gpu_weight_version = 0,
             .cpu_weight_version = 1,
             .f16_buf = null,
+            .oftb = OFTB.init(dim),
         };
         errdefer {
             if (core.gpu_accel) |*ga| {
@@ -1877,4 +1922,88 @@ fn writeSnapshotVersion4ToPath(snapshot: *const SavedModelSnapshot, path: []cons
 
     try parent_dir.rename(temp.tmp_name, base_name);
     tmp_exists = false;
+}
+
+================
+
+test "RSF forward then inverse returns input within 1e-4 tolerance" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+
+    var rsf = try RSFLayer.init(allocator, 32);
+    defer rsf.deinit();
+
+    var x1 = try Tensor.randomUniform(allocator, &[_]usize{ 4, 32 }, -1.0, 1.0, 99);
+    defer x1.deinit();
+    var x2 = try Tensor.randomUniform(allocator, &[_]usize{ 4, 32 }, -1.0, 1.0, 100);
+    defer x2.deinit();
+
+    var c1 = try tensorClone(allocator, &x1);
+    defer c1.deinit();
+    var c2 = try tensorClone(allocator, &x2);
+    defer c2.deinit();
+
+    try rsf.forward(&x1, &x2);
+    try rsf.inverse(&x1, &x2);
+
+    var idx: usize = 0;
+    while (idx < x1.data.len) : (idx += 1) {
+        try std.testing.expectApproxEqAbs(x1.data[idx], c1.data[idx], 1e-4);
+    }
+    idx = 0;
+    while (idx < x2.data.len) : (idx += 1) {
+        try std.testing.expectApproxEqAbs(x2.data[idx], c2.data[idx], 1e-4);
+    }
+}
+
+test "RSF with OFTB forward then inverse returns input within 1e-4 tolerance" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(123);
+    const random = prng.random();
+
+    const dim: usize = 16;
+    const num_layers: usize = 4;
+
+    var layers = std.ArrayList(RSFLayer).init(allocator);
+    defer {
+        for (layers.items) |*l| l.deinit();
+        layers.deinit();
+    }
+    var li: usize = 0;
+    while (li < num_layers) : (li += 1) {
+        var layer = try RSFLayer.init(allocator, dim);
+        try layers.append(layer);
+    }
+
+    var input = try Tensor.init(allocator, &[_]usize{ 2, dim * 2 });
+    defer input.deinit();
+    for (input.data) |*v| {
+        v.* = (random.float(f32) - 0.5);
+    }
+
+    const original = try allocator.dupe(f32, input.data);
+    defer allocator.free(original);
+
+    for (layers.items) |*layer| {
+        var x1 = Tensor{ .data = input.data[0 .. dim], .shape = input.shape };
+        var x2 = Tensor{ .data = input.data[dim .. dim * 2], .shape = input.shape };
+        try layer.forward(&x1, &x2);
+        var oftb = OFTB.init(dim);
+        try oftb.forwardInPlace(&input);
+    }
+
+    var rev_idx: usize = num_layers;
+    while (rev_idx > 0) : (rev_idx -= 1) {
+        var oftb = OFTB.init(dim);
+        try oftb.backwardInPlace(input.data);
+        var y1 = Tensor{ .data = input.data[0 .. dim], .shape = input.shape };
+        var y2 = Tensor{ .data = input.data[dim .. dim * 2], .shape = input.shape };
+        try layers.items[rev_idx - 1].inverse(&y1, &y2);
+    }
+
+    var idx: usize = 0;
+    while (idx < input.data.len) : (idx += 1) {
+        try std.testing.expectApproxEqAbs(input.data[idx], original[idx], 1e-4);
+    }
 }

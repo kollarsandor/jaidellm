@@ -880,3 +880,5 @@ entry rgpu_rel_or (re1: f32) (im1: f32) (re2: f32) (im2: f32): (f32, f32) =
 entry rgpu_rel_xor (re1: f32) (im1: f32) (re2: f32) (im2: f32): (f32, f32) =
   let result = rgpu_relational_xor {re=re1, im=im1} {re=re2, im=im2}
   in (result.re, result.im)
+
+================

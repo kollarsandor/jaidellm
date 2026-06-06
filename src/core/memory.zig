@@ -93,6 +93,13 @@ pub const Arena = struct {
     }
 
     pub fn deinit(self: *Arena) void {
+        const buf = self.buffer;
+        self.buffer = emptyAlignedU8Slice();
+        self.offset = 0;
+        if (buf.len != 0) self.allocator.free(buf);
+    }
+
+    pub fn secureDeinit(self: *Arena) void {
         self.secureResetInternal();
         const buf = self.buffer;
         self.buffer = emptyAlignedU8Slice();
@@ -146,9 +153,7 @@ pub const Arena = struct {
     pub fn remaining(self: *Arena) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.offset > self.buffer.len) {
-            std.debug.panic("Arena offset corrupted", .{});
-        }
+        if (self.offset > self.buffer.len) return 0;
         return self.buffer.len - self.offset;
     }
 };
@@ -160,6 +165,7 @@ pub const ArenaAllocator = struct {
     pos: usize,
     buffer_size: usize,
     mutex: Mutex,
+    secure_zero: bool,
 
     pub fn init(parent_allocator: Allocator, buffer_size: usize) ArenaAllocator {
         return .{
@@ -169,10 +175,27 @@ pub const ArenaAllocator = struct {
             .pos = 0,
             .buffer_size = if (buffer_size == 0) 4096 else buffer_size,
             .mutex = .{},
+            .secure_zero = false,
         };
     }
 
+    pub fn enableSecureZero(self: *ArenaAllocator, enable: bool) void {
+        self.secure_zero = enable;
+    }
+
     pub fn deinit(self: *ArenaAllocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.buffers.items) |buf| {
+            self.parent_allocator.free(buf);
+        }
+        self.buffers.deinit(self.parent_allocator);
+        self.current_buffer = emptyU8Slice();
+        self.pos = 0;
+    }
+
+    pub fn secureDeinit(self: *ArenaAllocator) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -385,6 +408,21 @@ pub const SlabAllocator = struct {
         const slabs = self.slabs;
         self.slabs = emptySlice(Slab);
         for (slabs) |slab| {
+            self.backing_allocator.free(slab.bitmap);
+            self.backing_allocator.free(slab.data);
+        }
+        if (slabs.len != 0) self.backing_allocator.free(slabs);
+        self.next_id = 0;
+    }
+
+    pub fn secureDeinit(self: *SlabAllocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.allocations.deinit();
+        const slabs = self.slabs;
+        self.slabs = emptySlice(Slab);
+        for (slabs) |slab| {
             secureZeroMemory(slab.data.ptr, slab.data.len);
             self.backing_allocator.free(slab.bitmap);
             self.backing_allocator.free(slab.data);
@@ -492,13 +530,26 @@ pub const SlabAllocator = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const entry = self.allocations.fetchRemove(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
-        const meta = entry.value;
-        var slab = &self.slabs[meta.slab_index];
+        const meta = self.allocations.get(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
         if (ptr.len != meta.size) return error.InvalidPointer;
+        _ = self.allocations.fetchRemove(@intFromPtr(ptr.ptr));
+        var slab = &self.slabs[meta.slab_index];
         slab.setRange(meta.start_block, meta.blocks, false);
+    }
+
+    pub fn secureFree(self: *SlabAllocator, ptr: []u8) !void {
+        if (ptr.len == 0) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const meta = self.allocations.get(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
+        if (ptr.len != meta.size) return error.InvalidPointer;
+        _ = self.allocations.fetchRemove(@intFromPtr(ptr.ptr));
+        var slab = &self.slabs[meta.slab_index];
         const offset = meta.start_block * self.block_size;
         secureZeroMemory(slab.data.ptr + offset, meta.size);
+        slab.setRange(meta.start_block, meta.blocks, false);
     }
 };
 
@@ -520,6 +571,25 @@ pub const PoolAllocator = struct {
         num_blocks: usize,
         free_list_head: ?usize,
         used: usize,
+        allocated_bitmap: []u64,
+
+        fn isBlockAllocated(self: *const Pool, idx: usize) bool {
+            const word_idx = idx / 64;
+            const bit_idx: u6 = @intCast(idx % 64);
+            return (self.allocated_bitmap[word_idx] & (@as(u64, 1) << bit_idx)) != 0;
+        }
+
+        fn setBlockAllocated(self: *Pool, idx: usize) void {
+            const word_idx = idx / 64;
+            const bit_idx: u6 = @intCast(idx % 64);
+            self.allocated_bitmap[word_idx] |= (@as(u64, 1) << bit_idx);
+        }
+
+        fn clearBlockAllocated(self: *Pool, idx: usize) void {
+            const word_idx = idx / 64;
+            const bit_idx: u6 = @intCast(idx % 64);
+            self.allocated_bitmap[word_idx] &= ~(@as(u64, 1) << bit_idx);
+        }
 
         fn ptrForIndex(self: *Pool, idx: usize) [*]u8 {
             return self.buffer.ptr + idx * self.block_size;
@@ -557,15 +627,22 @@ pub const PoolAllocator = struct {
         errdefer {
             var i: usize = 0;
             while (i < initialized) : (i += 1) {
+                parent_allocator.free(pools[i].allocated_bitmap);
                 parent_allocator.free(pools[i].buffer);
             }
             parent_allocator.free(pools);
         }
 
+        const bitmap_words = (num_blocks + 63) / 64;
         while (initialized < num_pools) : (initialized += 1) {
             const total = try mulChecked(actual_block_size, num_blocks);
             pools[initialized].buffer = try parent_allocator.alignedAlloc(u8, Alignment.fromByteUnits(@alignOf(?usize)), total);
+            pools[initialized].allocated_bitmap = parent_allocator.alloc(u64, bitmap_words) catch |err| {
+                parent_allocator.free(pools[initialized].buffer);
+                return err;
+            };
             @memset(pools[initialized].buffer, 0);
+            @memset(pools[initialized].allocated_bitmap, 0);
             pools[initialized].block_size = actual_block_size;
             pools[initialized].num_blocks = num_blocks;
             pools[initialized].free_list_head = null;
@@ -589,7 +666,22 @@ pub const PoolAllocator = struct {
         const pools = self.pools;
         self.pools = emptySlice(Pool);
         for (pools) |pool| {
+            self.backing_allocator.free(pool.allocated_bitmap);
+            self.backing_allocator.free(pool.buffer);
+        }
+        if (pools.len != 0) self.backing_allocator.free(pools);
+    }
+
+    pub fn secureDeinit(self: *PoolAllocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.allocations.deinit();
+        const pools = self.pools;
+        self.pools = emptySlice(Pool);
+        for (pools) |pool| {
             secureZeroMemory(pool.buffer.ptr, pool.buffer.len);
+            self.backing_allocator.free(pool.allocated_bitmap);
             self.backing_allocator.free(pool.buffer);
         }
         if (pools.len != 0) self.backing_allocator.free(pools);
@@ -605,6 +697,7 @@ pub const PoolAllocator = struct {
             if (size > pool.block_size) continue;
             const head_idx = pool.free_list_head orelse continue;
 
+            pool.setBlockAllocated(head_idx);
             const next = pool.nextPtr(head_idx);
             pool.free_list_head = next.*;
             pool.used += 1;
@@ -617,6 +710,7 @@ pub const PoolAllocator = struct {
                 .block_index = head_idx,
                 .size = size,
             }) catch {
+                pool.clearBlockAllocated(head_idx);
                 next.* = pool.free_list_head;
                 pool.free_list_head = head_idx;
                 pool.used -= 1;
@@ -681,11 +775,32 @@ pub const PoolAllocator = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const removed = self.allocations.fetchRemove(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
-        const meta = removed.value;
+        const meta = self.allocations.get(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
+        if (ptr.len != meta.size) return error.InvalidPointer;
         var pool = &self.pools[meta.pool_index];
-        if (ptr.len != meta.size or pool.used == 0) return error.DoubleFree;
+        if (!pool.isBlockAllocated(meta.block_index)) return error.DoubleFree;
 
+        _ = self.allocations.fetchRemove(@intFromPtr(ptr.ptr));
+        pool.clearBlockAllocated(meta.block_index);
+        const next = pool.nextPtr(meta.block_index);
+        next.* = pool.free_list_head;
+        pool.free_list_head = meta.block_index;
+        pool.used -= 1;
+    }
+
+    pub fn secureFree(self: *PoolAllocator, ptr: []u8) !void {
+        if (ptr.len == 0) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const meta = self.allocations.get(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
+        if (ptr.len != meta.size) return error.InvalidPointer;
+        var pool = &self.pools[meta.pool_index];
+        if (!pool.isBlockAllocated(meta.block_index)) return error.DoubleFree;
+
+        _ = self.allocations.fetchRemove(@intFromPtr(ptr.ptr));
+        pool.clearBlockAllocated(meta.block_index);
         const full = pool.buffer[meta.block_index * pool.block_size .. (meta.block_index + 1) * pool.block_size];
         secureZeroMemory(full.ptr, full.len);
         const next = pool.nextPtr(meta.block_index);
@@ -753,6 +868,19 @@ pub const BuddyAllocator = struct {
     }
 
     pub fn deinit(self: *BuddyAllocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.size_map.deinit();
+        const memory = self.memory;
+        const tree = self.tree;
+        self.memory = emptyAlignedU8Slice();
+        self.tree = emptySlice(State);
+        if (memory.len != 0) self.backing_allocator.free(memory);
+        if (tree.len != 0) self.backing_allocator.free(tree);
+    }
+
+    pub fn secureDeinit(self: *BuddyAllocator) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -863,22 +991,32 @@ pub const BuddyAllocator = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var needed = if (size > alignment) size else alignment;
         const min_block_size = @as(usize, 1) << @intCast(self.min_order);
-        if (needed < min_block_size) needed = min_block_size;
-        var want_order: u32 = @intCast(std.math.log2_int_ceil(usize, needed));
+        var base_needed = @max(size, min_block_size);
+        var want_order: u32 = @intCast(std.math.log2_int_ceil(usize, base_needed));
         if (want_order < self.min_order) want_order = self.min_order;
-        if (want_order > self.max_order) return error.OutOfMemory;
 
-        const found = self.allocRec(0, self.max_order, want_order) orelse return error.OutOfMemory;
-        const block = self.ptrFromIndex(found, want_order);
-        const out = block[0..size];
-        self.size_map.put(@intFromPtr(out.ptr), .{ .order = want_order, .size = size }) catch {
-            self.freeIndex(found, want_order);
-            return error.OutOfMemory;
-        };
-        @memset(block, 0);
-        return out;
+        var order = want_order;
+        while (order <= self.max_order) {
+            const block_size = @as(usize, 1) << @intCast(order);
+            if (block_size < alignment) {
+                order += 1;
+                continue;
+            }
+            const found = self.allocRec(0, self.max_order, order) orelse {
+                order += 1;
+                continue;
+            };
+            const block = self.ptrFromIndex(found, order);
+            const out = block[0..size];
+            self.size_map.put(@intFromPtr(out.ptr), .{ .order = order, .size = size }) catch {
+                self.freeIndex(found, order);
+                return error.OutOfMemory;
+            };
+            @memset(block, 0);
+            return out;
+        }
+        return error.OutOfMemory;
     }
 
     pub fn allocator(self: *BuddyAllocator) Allocator {
@@ -936,8 +1074,7 @@ pub const BuddyAllocator = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const removed = self.size_map.fetchRemove(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
-        const meta = removed.value;
+        const meta = self.size_map.get(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
         if (ptr.len != meta.size) return error.InvalidPointer;
 
         const ptr_addr = @intFromPtr(ptr.ptr);
@@ -948,11 +1085,40 @@ pub const BuddyAllocator = struct {
         const offset = ptr_addr - base;
         if (offset % block_size != 0) return error.InvalidPointer;
 
+        _ = self.size_map.fetchRemove(@intFromPtr(ptr.ptr));
+
         const level = self.max_order - meta.order;
         const start = levelStart(level);
         const offset_in_level = offset / block_size;
         const idx = start + offset_in_level;
+        self.freeIndex(idx, meta.order);
+    }
+
+    pub fn secureFree(self: *BuddyAllocator, ptr: []u8) !void {
+        if (ptr.len == 0) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const meta = self.size_map.get(@intFromPtr(ptr.ptr)) orelse return error.InvalidPointer;
+        if (ptr.len != meta.size) return error.InvalidPointer;
+
+        const ptr_addr = @intFromPtr(ptr.ptr);
+        const base = @intFromPtr(self.memory.ptr);
+        if (ptr_addr < base or ptr_addr >= base + self.memory.len) return error.InvalidPointer;
+
+        const block_size = @as(usize, 1) << @intCast(meta.order);
+        const offset = ptr_addr - base;
+        if (offset % block_size != 0) return error.InvalidPointer;
+
+        _ = self.size_map.fetchRemove(@intFromPtr(ptr.ptr));
+
         secureZeroMemory(ptr.ptr, ptr.len);
+
+        const level = self.max_order - meta.order;
+        const start = levelStart(level);
+        const offset_in_level = offset / block_size;
+        const idx = start + offset_in_level;
         self.freeIndex(idx, meta.order);
     }
 };
@@ -1016,13 +1182,21 @@ pub const LockFreeQueue = struct {
     head: usize,
     tail: usize,
     mask: usize,
-    buffer: []usize,
+    buffer: []Cell,
     allocator: Allocator,
+
+    const Cell = struct {
+        sequence: usize,
+        data: usize,
+    };
 
     pub fn init(allocator: Allocator, capacity: usize) !LockFreeQueue {
         if (capacity < 2 or !isPow2(capacity)) return error.InvalidSize;
-        const buffer = try allocator.alloc(usize, capacity);
-        @memset(buffer, 0);
+        const buffer = try allocator.alloc(Cell, capacity);
+        for (buffer, 0..) |*cell, i| {
+            cell.sequence = i;
+            cell.data = 0;
+        }
         return .{
             .head = 0,
             .tail = 0,
@@ -1034,7 +1208,7 @@ pub const LockFreeQueue = struct {
 
     pub fn deinit(self: *LockFreeQueue) void {
         const buf = self.buffer;
-        self.buffer = emptySlice(usize);
+        self.buffer = emptySlice(Cell);
         self.head = 0;
         self.tail = 0;
         self.mask = 0;
@@ -1042,28 +1216,41 @@ pub const LockFreeQueue = struct {
     }
 
     pub fn enqueue(self: *LockFreeQueue, item: *anyopaque) bool {
+        var pos = @atomicLoad(usize, &self.tail, .relaxed);
         while (true) {
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const next_tail = (tail + 1) & self.mask;
-            if (next_tail == head) return false;
-            self.buffer[tail] = @intFromPtr(item);
-            if (@cmpxchgWeak(usize, &self.tail, tail, next_tail, .acq_rel, .acquire) == null) {
-                return true;
+            const cell = &self.buffer[pos & self.mask];
+            const seq = @atomicLoad(usize, &cell.sequence, .acquire);
+            const diff: isize = @as(isize, @bitCast(seq)) -% @as(isize, @bitCast(pos));
+            if (diff == 0) {
+                cell.data = @intFromPtr(item);
+                if (@cmpxchgWeak(usize, &self.tail, pos, pos + 1, .relaxed, .relaxed) == null) {
+                    @atomicStore(usize, &cell.sequence, pos + 1, .release);
+                    return true;
+                }
+            } else if (diff < 0) {
+                return false;
+            } else {
+                pos = @atomicLoad(usize, &self.tail, .relaxed);
             }
         }
     }
 
     pub fn dequeue(self: *LockFreeQueue) ?*anyopaque {
+        var pos = @atomicLoad(usize, &self.head, .relaxed);
         while (true) {
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            if (head == tail) return null;
-            const value = self.buffer[head];
-            const next_head = (head + 1) & self.mask;
-            if (@cmpxchgWeak(usize, &self.head, head, next_head, .acq_rel, .acquire) == null) {
-                self.buffer[head] = 0;
-                return @ptrFromInt(value);
+            const cell = &self.buffer[pos & self.mask];
+            const seq = @atomicLoad(usize, &cell.sequence, .acquire);
+            const diff: isize = @as(isize, @bitCast(seq)) -% @as(isize, @bitCast(pos + 1));
+            if (diff == 0) {
+                if (@cmpxchgWeak(usize, &self.head, pos, pos + 1, .relaxed, .relaxed) == null) {
+                    const data = cell.data;
+                    @atomicStore(usize, &cell.sequence, pos + self.mask + 1, .release);
+                    return @ptrFromInt(data);
+                }
+            } else if (diff < 0) {
+                return null;
+            } else {
+                pos = @atomicLoad(usize, &self.head, .relaxed);
             }
         }
     }
@@ -1197,6 +1384,17 @@ pub const PageAllocator = struct {
         const bitmap = self.bitmap;
         self.pages = emptyAlignedU8Slice();
         self.bitmap = emptySlice(u64);
+        if (pages.len != 0) self.allocator.free(pages);
+        if (bitmap.len != 0) self.allocator.free(bitmap);
+    }
+
+    pub fn secureDeinit(self: *PageAllocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const pages = self.pages;
+        const bitmap = self.bitmap;
+        self.pages = emptyAlignedU8Slice();
+        self.bitmap = emptySlice(u64);
         if (pages.len != 0) {
             const bytes_ptr: [*]u8 = pages.ptr;
             secureZeroMemory(bytes_ptr, pages.len);
@@ -1273,6 +1471,31 @@ pub const PageAllocator = struct {
         while (i < start_page + num_pages) : (i += 1) {
             if (self.isPageFree(i)) return error.DoubleFree;
         }
+        i = start_page;
+        while (i < start_page + num_pages) : (i += 1) self.setPageFree(i);
+    }
+
+    pub fn secureFreePages(self: *PageAllocator, ptr: []u8) !void {
+        if (ptr.len == 0) return;
+        if (ptr.len % self.page_size != 0) return error.InvalidPointer;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const pages_start = @intFromPtr(self.pages.ptr);
+        const pages_end = pages_start + self.pages.len;
+        const ptr_addr = @intFromPtr(ptr.ptr);
+        if (ptr_addr < pages_start or ptr_addr >= pages_end) return error.InvalidPointer;
+        const offset = ptr_addr - pages_start;
+        if (offset % self.page_size != 0) return error.InvalidPointer;
+
+        const start_page = offset / self.page_size;
+        const num_pages = ptr.len / self.page_size;
+        if (start_page + num_pages > self.pages.len / self.page_size) return error.InvalidPointer;
+        var i: usize = start_page;
+        while (i < start_page + num_pages) : (i += 1) {
+            if (self.isPageFree(i)) return error.DoubleFree;
+        }
         secureZeroMemory(ptr.ptr, ptr.len);
         i = start_page;
         while (i < start_page + num_pages) : (i += 1) self.setPageFree(i);
@@ -1327,6 +1550,14 @@ pub const ResizeBuffer = struct {
 
     pub fn deinit(self: *ResizeBuffer) void {
         if (self.buffer.len != 0) {
+            self.allocator.free(self.buffer);
+        }
+        self.buffer = emptyU8Slice();
+        self.len = 0;
+    }
+
+    pub fn secureDeinit(self: *ResizeBuffer) void {
+        if (self.buffer.len != 0) {
             secureZeroMemory(self.buffer.ptr, self.buffer.len);
             self.allocator.free(self.buffer);
         }
@@ -1353,6 +1584,10 @@ pub const ResizeBuffer = struct {
     }
 
     pub fn clear(self: *ResizeBuffer) void {
+        self.len = 0;
+    }
+
+    pub fn secureClear(self: *ResizeBuffer) void {
         if (self.len != 0) secureZeroMemory(self.buffer.ptr, self.len);
         self.len = 0;
     }
@@ -1404,8 +1639,8 @@ pub fn secureZeroMemory(ptr: [*]u8, size: usize) void {
     const p: [*]volatile u8 = @ptrCast(ptr);
     var i: usize = 0;
     while (i < size) : (i += 1) p[i] = 0;
-    var sink: u8 = 0;
-    @atomicStore(u8, &sink, 0, .seq_cst);
+    _ = p[size - 1];
+    @fence(.seq_cst);
 }
 
 pub fn constantTimeCompare(a: []const u8, b: []const u8) bool {
@@ -1448,18 +1683,15 @@ pub fn pageAlignedSize(size: usize) usize {
 }
 
 pub fn memoryBarrier() void {
-    var dummy: u8 = 0;
-    _ = @atomicRmw(u8, &dummy, .Or, 0, .seq_cst);
+    @fence(.seq_cst);
 }
 
 pub fn readMemoryFence() void {
-    var dummy: u8 = 0;
-    _ = @atomicLoad(u8, &dummy, .acquire);
+    @fence(.acquire);
 }
 
 pub fn writeMemoryFence() void {
-    var dummy: u8 = 0;
-    @atomicStore(u8, &dummy, 0, .release);
+    @fence(.release);
 }
 
 pub fn compareExchangeMemory(ptr: *u64, expected: u64, desired: u64) bool {
@@ -1516,8 +1748,8 @@ pub fn secureErase(ptr: [*]u8, size: usize) void {
     while (i < size) : (i += 1) p[i] = 0xAA;
     i = 0;
     while (i < size) : (i += 1) p[i] = 0x00;
-    var sink: u8 = 0;
-    @atomicStore(u8, &sink, 0, .seq_cst);
+    _ = p[size - 1];
+    @fence(.seq_cst);
 }
 
 pub fn duplicateMemory(allocator: Allocator, data: []const u8) ![]u8 {
@@ -1731,6 +1963,12 @@ pub fn resetMemoryStats() void {
     global_memory_stats = .{ .allocated = 0, .freed = 0, .peak = 0 };
 }
 
+pub fn cleanupGlobalState() void {
+    global_memory_stats_mutex.lock();
+    defer global_memory_stats_mutex.unlock();
+    global_memory_stats = .{ .allocated = 0, .freed = 0, .peak = 0 };
+}
+
 pub fn memoryFootprint() usize {
     const s = getMemoryStats();
     return saturatingSub(s.allocated, s.freed);
@@ -1841,8 +2079,8 @@ pub const ReadWriteLock = struct {
     pub fn writeUnlock(self: *ReadWriteLock) void {
         self.mutex.lock();
         self.writer = false;
-        self.mutex.unlock();
         self.cond.broadcast();
+        self.mutex.unlock();
     }
 };
 
