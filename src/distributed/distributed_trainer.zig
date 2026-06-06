@@ -1748,9 +1748,17 @@ pub const Tensor = struct {
             }
 
             if (descending) {
-                mem.sort(f32, temp, {}, comptime struct { pub fn lessThan(_: void, a: f32, b: f32) bool { return a > b; } }.lessThan);
+                mem.sort(f32, temp, {}, comptime struct {
+                    pub fn lessThan(_: void, a: f32, b: f32) bool {
+                        return a > b;
+                    }
+                }.lessThan);
             } else {
-                mem.sort(f32, temp, {}, comptime struct { pub fn lessThan(_: void, a: f32, b: f32) bool { return a < b; } }.lessThan);
+                mem.sort(f32, temp, {}, comptime struct {
+                    pub fn lessThan(_: void, a: f32, b: f32) bool {
+                        return a < b;
+                    }
+                }.lessThan);
             }
 
             i = 0;
@@ -1913,20 +1921,20 @@ pub const Tensor = struct {
         var last_sigma: f32 = 0.0;
         var iter: usize = 0;
         while (iter < max_iter) : (iter += 1) {
-            var self_t = try self.transpose(&.{1, 0});
-            var vv = try Tensor.init(allocator, &.{1, n});
+            var self_t = try self.transpose(&.{ 1, 0 });
+            var vv = try Tensor.init(allocator, &.{ 1, n });
             var vi: usize = 0;
             while (vi < n) : (vi += 1) {
-                try vv.set(&.{0, vi}, v.data.ptr[vi]);
+                try vv.set(&.{ 0, vi }, v.data.ptr[vi]);
             }
             var u_new = try matmul(self, &vv, allocator);
             vv.deinit();
             self_t.deinit();
 
-            var uu = try Tensor.init(allocator, &.{1, m});
+            var uu = try Tensor.init(allocator, &.{ 1, m });
             var ui: usize = 0;
             while (ui < m) : (ui += 1) {
-                try uu.set(&.{0, ui}, u_new.data.ptr[ui]);
+                try uu.set(&.{ 0, ui }, u_new.data.ptr[ui]);
             }
             u_new.deinit();
 
@@ -1936,7 +1944,7 @@ pub const Tensor = struct {
             var norm_u: f32 = 0.0;
             ui = 0;
             while (ui < m) : (ui += 1) {
-                const val = try v_new.get(&.{0, ui});
+                const val = try v_new.get(&.{ 0, ui });
                 norm_u += val * val;
             }
             norm_u = @sqrt(norm_u);
@@ -1946,7 +1954,7 @@ pub const Tensor = struct {
             u = try Tensor.init(allocator, &.{m});
             ui = 0;
             while (ui < m) : (ui += 1) {
-                const val = try v_new.get(&.{0, ui});
+                const val = try v_new.get(&.{ 0, ui });
                 u.data.ptr[ui] = val / norm_u;
             }
             v_new.deinit();
@@ -2212,7 +2220,7 @@ pub const Tensor = struct {
         const m = self.shape.dims[0];
         const n = self.shape.dims[1];
 
-        var ata = try self.transpose(&.{1, 0});
+        var ata = try self.transpose(&.{ 1, 0 });
         var ata_self = try matmul(&ata, self, allocator);
         ata.deinit();
         var eigen = try eig(&ata_self, allocator);
@@ -2567,7 +2575,7 @@ pub const Tensor = struct {
             }
         }
         if (total_size > 10) {
-            try writer.print(", ...", .{});
+            try writer.print(", more", .{});
         }
         try writer.print("])", .{});
         return buf.toOwnedSlice();

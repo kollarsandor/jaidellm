@@ -38,22 +38,25 @@ pub const LearnedEmbedding = struct {
     pub fn forward(self: *LearnedEmbedding, allocator: Allocator, tokens: []const u32, output_dim: usize) !Tensor {
         var out = try Tensor.init(allocator, &.{ 1, output_dim });
         @memset(out.data, 0.0);
-        const max_tokens = @min(tokens.len, self.dim);
+        if (tokens.len == 0 or output_dim == 0 or self.dim == 0 or self.vocab_size == 0) {
+            return out;
+        }
+        const usable_dim = @min(self.dim, output_dim);
         var r: usize = 0;
-        while (r < max_tokens) : (r += 1) {
+        while (r < tokens.len) : (r += 1) {
             const t = @min(@as(usize, tokens[r]), self.vocab_size - 1);
             var c: usize = 0;
-            while (c < self.dim) : (c += 1) {
+            while (c < usable_dim) : (c += 1) {
                 const w_idx = t * self.dim + c;
                 if (w_idx < self.weight.data.len) {
-                    if (r * self.dim + c < output_dim) {
-                        const out_idx = r * self.dim + c;
-                        if (out_idx < out.data.len) {
-                            out.data[out_idx] = self.weight.data[w_idx];
-                        }
-                    }
+                    out.data[c] += self.weight.data[w_idx];
                 }
             }
+        }
+        const scale = 1.0 / @as(f32, @floatFromInt(tokens.len));
+        var c: usize = 0;
+        while (c < usable_dim) : (c += 1) {
+            out.data[c] *= scale;
         }
         return out;
     }

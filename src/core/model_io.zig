@@ -40,16 +40,20 @@ pub const ModelMetadata = struct {
     fn writeJsonEscapedString(writer: anytype, str: []const u8) !void {
         try writer.writeByte('"');
         for (str) |c| {
-            switch (c) {
-                '"' => try writer.writeAll("\\\""),
-                '\\' => try writer.writeAll("\\\\"),
-                '\n' => try writer.writeAll("\\n"),
-                '\r' => try writer.writeAll("\\r"),
-                '\t' => try writer.writeAll("\\t"),
-                0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-                    try writer.print("\\u{x:0>4}", .{c});
-                },
-                else => try writer.writeByte(c),
+            if (c == '"') {
+                try writer.writeAll("\\\"");
+            } else if (c == '\\') {
+                try writer.writeAll("\\\\");
+            } else if (c == '\n') {
+                try writer.writeAll("\\n");
+            } else if (c == '\r') {
+                try writer.writeAll("\\r");
+            } else if (c == '\t') {
+                try writer.writeAll("\\t");
+            } else if (c < 0x20) {
+                try writer.print("\\u{x:0>4}", .{c});
+            } else {
+                try writer.writeByte(c);
             }
         }
         try writer.writeByte('"');
@@ -98,15 +102,42 @@ pub const ModelMetadata = struct {
         const mgt_vocab_val = obj.get("mgt_vocab_size") orelse return ModelError.InvalidMetadata;
         const description_val = obj.get("description") orelse return ModelError.InvalidMetadata;
 
-        const model_name = switch (model_name_val) { .string => |s| s, else => return ModelError.InvalidMetadata };
-        const version = switch (version_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @as(u32, @intCast(i)) else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const created = switch (created_val) { .integer => |i| i, else => return ModelError.InvalidMetadata };
-        const rsf_layers_raw = switch (rsf_layers_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const rsf_dim_raw = switch (rsf_dim_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const ranker_ngrams_raw = switch (ranker_ngrams_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const ranker_lsh_raw = switch (ranker_lsh_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const mgt_vocab_raw = switch (mgt_vocab_val) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata, else => return ModelError.InvalidMetadata };
-        const description = switch (description_val) { .string => |s| s, else => return ModelError.InvalidMetadata };
+        const model_name = switch (model_name_val) {
+            .string => |s| s,
+            else => return ModelError.InvalidMetadata,
+        };
+        const version = switch (version_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @as(u32, @intCast(i)) else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const created = switch (created_val) {
+            .integer => |i| i,
+            else => return ModelError.InvalidMetadata,
+        };
+        const rsf_layers_raw = switch (rsf_layers_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const rsf_dim_raw = switch (rsf_dim_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const ranker_ngrams_raw = switch (ranker_ngrams_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const ranker_lsh_raw = switch (ranker_lsh_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const mgt_vocab_raw = switch (mgt_vocab_val) {
+            .integer => |i| if (i >= 0 and i <= std.math.maxInt(usize)) i else return ModelError.InvalidMetadata,
+            else => return ModelError.InvalidMetadata,
+        };
+        const description = switch (description_val) {
+            .string => |s| s,
+            else => return ModelError.InvalidMetadata,
+        };
 
         const model_name_duped = try allocator.dupe(u8, model_name);
         errdefer allocator.free(model_name_duped);

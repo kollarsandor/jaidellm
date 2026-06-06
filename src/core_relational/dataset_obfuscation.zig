@@ -22,32 +22,28 @@ pub const PaillierKeyPair = struct {
     mu: u256,
 
     pub fn generate() PaillierKeyPair {
-        var p_bytes: [16]u8 = undefined;
-        crypto.random.bytes(&p_bytes);
-        var q_bytes: [16]u8 = undefined;
-        crypto.random.bytes(&q_bytes);
+        while (true) {
+            const p = randomPrime128();
+            var q = randomPrime128();
+            while (q == p) {
+                q = randomPrime128();
+            }
 
-        const p = bytesToU128(&p_bytes) | 1;
-        const q = bytesToU128(&q_bytes) | 1;
+            const n: u256 = @as(u256, p) * @as(u256, q);
+            const n_squared: u512 = @as(u512, n) * @as(u512, n);
+            const lambda = lcm128(p -% 1, q -% 1);
+            const g = n +% 1;
+            const mu = modInverse256(@as(u256, lambda), n);
+            if (mu == 0) continue;
 
-        const n: u256 = @as(u256, p) * @as(u256, q);
-        const n_squared: u512 = @as(u512, n) * @as(u512, n);
-
-        const p_minus_1 = p -% 1;
-        const q_minus_1 = q -% 1;
-
-        const lambda = lcm128(p_minus_1, q_minus_1);
-        const g = n +% 1;
-
-        const mu = modInverse256(@as(u256, lambda), n);
-
-        return PaillierKeyPair{
-            .n = n,
-            .n_squared = n_squared,
-            .g = g,
-            .lambda = @as(u256, lambda),
-            .mu = mu,
-        };
+            return PaillierKeyPair{
+                .n = n,
+                .n_squared = n_squared,
+                .g = g,
+                .lambda = @as(u256, lambda),
+                .mu = mu,
+            };
+        }
     }
 };
 
@@ -67,6 +63,70 @@ fn bytesToU128(bytes: *const [16]u8) u128 {
         result = (result << 8) | @as(u128, bytes[i]);
     }
     return result;
+}
+
+fn modPow128(base: u128, exp: u128, modulus: u128) u128 {
+    if (modulus <= 1) return 0;
+    var result: u256 = 1;
+    var b: u256 = @as(u256, base) % @as(u256, modulus);
+    var e = exp;
+    while (e > 0) {
+        if ((e & 1) == 1) {
+            result = (result * b) % @as(u256, modulus);
+        }
+        e >>= 1;
+        b = (b * b) % @as(u256, modulus);
+    }
+    return @truncate(result);
+}
+
+fn isProbablePrime128(n: u128) bool {
+    if (n < 2) return false;
+    const small_primes = [_]u128{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47 };
+    for (small_primes) |p| {
+        if (n == p) return true;
+        if ((n % p) == 0) return false;
+    }
+    var d = n - 1;
+    var s: u7 = 0;
+    while ((d & 1) == 0) {
+        d >>= 1;
+        s += 1;
+    }
+    const witnesses = [_]u128{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37 };
+    for (witnesses) |a_raw| {
+        if (a_raw >= n - 2) continue;
+        const a = a_raw;
+        var x = modPow128(a, d, n);
+        if (x == 1 or x == n - 1) continue;
+        var r: u7 = 1;
+        var composite = true;
+        while (r < s) : (r += 1) {
+            x = modPow128(x, 2, n);
+            if (x == n - 1) {
+                composite = false;
+                break;
+            }
+        }
+        if (composite) return false;
+    }
+    return true;
+}
+
+fn randomPrime128() u128 {
+    while (true) {
+        var bytes: [16]u8 = undefined;
+        crypto.random.bytes(&bytes);
+        var candidate = bytesToU128(&bytes);
+        candidate |= (@as(u128, 1) << 127);
+        candidate |= 1;
+        var attempts: usize = 0;
+        while (attempts < 4096) : (attempts += 1) {
+            if (isProbablePrime128(candidate)) return candidate;
+            candidate +%= 2;
+            candidate |= (@as(u128, 1) << 127);
+        }
+    }
 }
 
 fn gcd256(a: u256, b: u256) u256 {

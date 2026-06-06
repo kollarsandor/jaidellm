@@ -544,13 +544,13 @@ pub const SurpriseMemoryManager = struct {
         errdefer high_surprise_ids.deinit();
 
         self.mutex.lock();
+        defer self.mutex.unlock();
         var iter = self.surprise_records.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.surprise_score > self.surprise_threshold and high_surprise_ids.items.len < MAX_ENTANGLEMENT_PAIRS) {
                 try high_surprise_ids.append(entry.key_ptr.*);
             }
         }
-        self.mutex.unlock();
         defer high_surprise_ids.deinit();
 
         var entangled_pairs: usize = 0;

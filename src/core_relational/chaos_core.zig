@@ -635,7 +635,7 @@ pub const ContentAddressableStorage = struct {
         }
     }
 
-    fn removeBlock(self: *ContentAddressableStorage, block_id: [ChaosCoreConfig.BLOCK_ID_SIZE]u8) ?usize {
+    pub fn removeBlock(self: *ContentAddressableStorage, block_id: [ChaosCoreConfig.BLOCK_ID_SIZE]u8) ?usize {
         if (self.storage.fetchRemove(block_id)) |removed| {
             var block = removed.value;
 

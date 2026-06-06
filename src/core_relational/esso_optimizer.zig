@@ -241,12 +241,7 @@ const SymmetryTransform = struct {
 
         new_phase = normalizeAngle(new_phase);
 
-        return QuantumState{
-            .amplitude_real = new_real,
-            .amplitude_imag = new_imag,
-            .phase = new_phase,
-            .entanglement_degree = state.entanglement_degree,
-        };
+        return QuantumState.init(new_real, new_imag, state.amplitudes[1].re, state.amplitudes[1].im, new_phase, state.entanglement_degree);
     }
 
     pub fn inverse(self: *const Self) Self {
@@ -922,8 +917,7 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
     const DEFAULT_CONVERGENCE_THRESHOLD: f64 = 1e-8;
 
     pub fn init(allocator: Allocator, initial_temp: f64, cooling_rate: f64, max_iterations: usize) Self {
-        const ts = std.time.nanoTimestamp();
-        const seed = @as(u64, @truncate(@as(u128, @bitCast(ts))));
+        const seed: u64 = 0;
 
         const safe_initial_temp = if (!std.math.isFinite(initial_temp) or initial_temp <= 0.0) DEFAULT_INITIAL_TEMP else initial_temp;
         const safe_cooling_rate = if (!std.math.isFinite(cooling_rate) or cooling_rate <= 0.0 or cooling_rate > 1.0) DEFAULT_COOLING_RATE else cooling_rate;
@@ -1036,7 +1030,9 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
         }
         try self.symmetry_transforms.append(transform);
         var transform_appended = true;
-        errdefer if (transform_appended) _ = self.symmetry_transforms.pop();
+        errdefer {
+            if (transform_appended) _ = self.symmetry_transforms.pop();
+        }
         try self.detected_patterns.append(pattern);
         transform_appended = false;
     }
@@ -1275,18 +1271,10 @@ pub const EntangledStochasticSymmetryOptimizer = struct {
                             const node = entry.value_ptr;
                             try log.node_states.append(.{ .id = entry.key_ptr.*, .phase = node.phase, .qubit_a = node.qubit.a, .qubit_b = node.qubit.b });
 
-                            const transformed_a = transform.applyToQuantumState(&QuantumState{
-                                .amplitude_real = node.qubit.a.re,
-                                .amplitude_imag = node.qubit.a.im,
-                                .phase = node.phase,
-                                .entanglement_degree = 0.0,
-                            });
-                            const transformed_b = transform.applyToQuantumState(&QuantumState{
-                                .amplitude_real = node.qubit.b.re,
-                                .amplitude_imag = node.qubit.b.im,
-                                .phase = node.phase,
-                                .entanglement_degree = 0.0,
-                            });
+                            const state_a = QuantumState.init(node.qubit.a.re, node.qubit.a.im, node.qubit.b.re, node.qubit.b.im, node.phase, 0.0);
+                            const state_b = QuantumState.init(node.qubit.b.re, node.qubit.b.im, node.qubit.a.re, node.qubit.a.im, node.phase, 0.0);
+                            const transformed_a = transform.applyToQuantumState(&state_a);
+                            const transformed_b = transform.applyToQuantumState(&state_b);
 
                             node.qubit.a = Complex(f64).init(transformed_a.amplitude_real, transformed_a.amplitude_imag);
                             node.qubit.b = Complex(f64).init(transformed_b.amplitude_real, transformed_b.amplitude_imag);

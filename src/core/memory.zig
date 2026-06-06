@@ -1448,18 +1448,18 @@ pub fn pageAlignedSize(size: usize) usize {
 }
 
 pub fn memoryBarrier() void {
-    var dummy: u8 = 0;
-    _ = @atomicRmw(u8, &dummy, .Or, 0, .seq_cst);
+    var fence_byte: u8 = 0;
+    _ = @atomicRmw(u8, &fence_byte, .Or, 0, .seq_cst);
 }
 
 pub fn readMemoryFence() void {
-    var dummy: u8 = 0;
-    _ = @atomicLoad(u8, &dummy, .acquire);
+    var fence_byte: u8 = 0;
+    _ = @atomicLoad(u8, &fence_byte, .acquire);
 }
 
 pub fn writeMemoryFence() void {
-    var dummy: u8 = 0;
-    @atomicStore(u8, &dummy, 0, .release);
+    var fence_byte: u8 = 0;
+    @atomicStore(u8, &fence_byte, 0, .release);
 }
 
 pub fn compareExchangeMemory(ptr: *u64, expected: u64, desired: u64) bool {

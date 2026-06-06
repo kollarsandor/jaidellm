@@ -119,7 +119,7 @@ pub const Ranker = struct {
     pub fn scoreSequenceWithQuery(self: *const Ranker, tokens: []const u32, query: []const u32, ssi: *const SSI) !f32 {
         const base_score = try self.scoreSequence(tokens, ssi);
 
-        const token_overlap = self.computeTokenOverlap(tokens, query);
+        const token_overlap = try self.computeTokenOverlap(tokens, query);
         const jaccard = try self.computeJaccardSimilarity(tokens, query);
 
         const combined_score = base_score * RankerConfig.BASE_SCORE_WEIGHT + token_overlap * RankerConfig.OVERLAP_WEIGHT + jaccard * RankerConfig.JACCARD_WEIGHT;
@@ -142,16 +142,19 @@ pub const Ranker = struct {
         return diversity;
     }
 
-    fn computeTokenOverlap(_: *const Ranker, tokens: []const u32, query: []const u32) f32 {
+    fn computeTokenOverlap(self: *const Ranker, tokens: []const u32, query: []const u32) !f32 {
         if (tokens.len == 0 or query.len == 0) return 0.0;
+
+        var query_tokens = std.AutoHashMap(u32, void).init(self.allocator);
+        defer query_tokens.deinit();
+        for (query) |qtoken| {
+            try query_tokens.put(qtoken, {});
+        }
 
         var overlap: usize = 0;
         for (tokens) |token| {
-            for (query) |qtoken| {
-                if (token == qtoken) {
-                    overlap += 1;
-                    break;
-                }
+            if (query_tokens.contains(token)) {
+                overlap += 1;
             }
         }
 

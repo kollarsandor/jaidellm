@@ -574,9 +574,9 @@ pub const FractalLevel = struct {
             var stored_list = entry.value_ptr.*;
             _ = self.edges.remove(source_id);
             stored_list.deinit();
-            for (self.edge_keys_owned.items, 0..) |k, i2| {
+            for (self.edge_keys_owned.items, 0..) |k, edge_index| {
                 if (k.ptr == stored_key.ptr and k.len == stored_key.len) {
-                    _ = self.edge_keys_owned.swapRemove(i2);
+                    _ = self.edge_keys_owned.swapRemove(edge_index);
                     self.allocator.free(k);
                     break;
                 }
