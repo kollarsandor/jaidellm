@@ -68,6 +68,30 @@ pub fn build(b: *std.Build) void {
     const memory_test_step = b.step("test-memory", "Run memory tests");
     memory_test_step.dependOn(&run_memory_tests.step);
 
+    const oftb_tests = b.addTest(.{
+        .root_source_file = b.path("src/processor/oftb.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_oftb_tests = b.addRunArtifact(oftb_tests);
+    const oftb_test_step = b.step("test-oftb", "Run OFTB butterfly reversibility tests");
+    oftb_test_step.dependOn(&run_oftb_tests.step);
+
+    const embedding_tests = b.addTest(.{
+        .root_source_file = b.path("src/core/learned_embedding.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const run_embedding_tests = b.addRunArtifact(embedding_tests);
+    const embedding_test_step = b.step("test-embedding", "Run learned embedding tests");
+    embedding_test_step.dependOn(&run_embedding_tests.step);
+
+    const test_all_step = b.step("test", "Run all tests");
+    test_all_step.dependOn(&run_tensor_tests.step);
+    test_all_step.dependOn(&run_memory_tests.step);
+    test_all_step.dependOn(&run_oftb_tests.step);
+    test_all_step.dependOn(&run_embedding_tests.step);
+
     // Benchmark dependency module (rooted at src/ for Zig module path resolution)
     const bench_deps = b.createModule(.{
         .root_source_file = b.path("src/_bench_deps.zig"),

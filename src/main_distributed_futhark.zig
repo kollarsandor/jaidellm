@@ -161,6 +161,27 @@ pub fn main() !void {
 
     std.debug.print("[Rank {d}] Futhark-accelerated trainer initialized (f16, model_dim={d}, layers={d})\n", .{ rank, model_dim, num_layers });
 
+    // Audit #3: Enable CREV pipeline so that every batch in trainEpoch flows
+    // through processTextStream and populates the knowledge graph index. Set
+    // JAIDE_DISABLE_CREV=1 to opt out for ablations.
+    const disable_crev_env = std.process.getEnvVarOwned(allocator, "JAIDE_DISABLE_CREV") catch null;
+    defer if (disable_crev_env) |s| allocator.free(s);
+    const crev_enabled = blk: {
+        if (disable_crev_env) |s| {
+            const trimmed = std.mem.trim(u8, s, " \t\r\n");
+            if (std.mem.eql(u8, trimmed, "1") or std.mem.eql(u8, trimmed, "true")) break :blk false;
+        }
+        break :blk true;
+    };
+    if (crev_enabled) {
+        trainer.enableCREV() catch |err| {
+            std.debug.print("[Rank {d}] CREV enable failed: {} (continuing without knowledge graph)\n", .{ rank, err });
+        };
+        std.debug.print("[Rank {d}] CREV pipeline enabled for knowledge graph construction\n", .{rank});
+    } else {
+        std.debug.print("[Rank {d}] CREV pipeline DISABLED (JAIDE_DISABLE_CREV=1)\n", .{rank});
+    }
+
     var dataset_path_owned: ?[]u8 = null;
     const dataset_path: []const u8 = blk: {
         dataset_path_owned = std.process.getEnvVarOwned(allocator, "JAIDE_DATASET") catch null;

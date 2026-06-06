@@ -7,6 +7,8 @@ const FutharkArray2DF16 = accel.FutharkArray2DF16;
 const FutharkArray1DF16 = accel.FutharkArray1DF16;
 const FutharkArray3DF16 = accel.FutharkArray3DF16;
 const PinnedMemory = accel.PinnedMemory;
+const chaos = @import("../core_relational/chaos_core.zig");
+const crev = @import("../core_relational/crev_pipeline.zig");
 
 pub const TrainerConfig = struct {
     learning_rate: f32 = 0.001,
@@ -29,6 +31,10 @@ pub const DistributedTrainerFuthark = struct {
     learning_rate: f32,
     momentum: f32,
     config: TrainerConfig,
+    chaos_kernel: ?*chaos.ChaosCoreKernel = null,
+    crev_pipeline: ?*crev.CREVPipeline = null,
+    crev_samples_processed: u64 = 0,
+    crev_triplets_extracted: u64 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -59,20 +65,20 @@ pub const DistributedTrainerFuthark = struct {
         if (coordinator.world_size > 1 and config.momentum != 0.0) return error.UnsupportedDistributedMomentum;
 
         const vocab = &[_][]const u8{
-            "a",     "about",   "all",   "also",  "and",   "as",    "at",
-            "be",    "because", "but",   "by",    "can",   "come",  "could",
-            "day",   "do",      "even",  "find",  "first", "for",   "from",
-            "get",   "give",    "go",    "have",  "he",    "her",   "here",
-            "him",   "his",     "how",   "i",     "if",    "in",    "into",
-            "it",    "its",     "just",  "know",  "like",  "look",  "make",
-            "man",   "many",    "me",    "more",  "my",    "new",   "no",
-            "not",   "now",     "of",    "on",    "one",   "only",  "or",
-            "other", "our",     "out",   "people", "say",  "see",   "she",
-            "so",    "some",    "take",  "tell",  "than",  "that",  "the",
-            "their", "them",    "then",  "there", "these", "they",  "thing",
-            "think", "this",    "those", "time",  "to",    "two",   "up",
-            "use",   "very",    "want",  "way",   "we",    "well",  "what",
-            "when",  "which",   "who",   "will",  "with",  "would", "year",
+            "a",     "about",   "all",   "also",   "and",   "as",    "at",
+            "be",    "because", "but",   "by",     "can",   "come",  "could",
+            "day",   "do",      "even",  "find",   "first", "for",   "from",
+            "get",   "give",    "go",    "have",   "he",    "her",   "here",
+            "him",   "his",     "how",   "i",      "if",    "in",    "into",
+            "it",    "its",     "just",  "know",   "like",  "look",  "make",
+            "man",   "many",    "me",    "more",   "my",    "new",   "no",
+            "not",   "now",     "of",    "on",     "one",   "only",  "or",
+            "other", "our",     "out",   "people", "say",   "see",   "she",
+            "so",    "some",    "take",  "tell",   "than",  "that",  "the",
+            "their", "them",    "then",  "there",  "these", "they",  "thing",
+            "think", "this",    "those", "time",   "to",    "two",   "up",
+            "use",   "very",    "want",  "way",    "we",    "well",  "what",
+            "when",  "which",   "who",   "will",   "with",  "would", "year",
             "you",   "your",
         };
         if (model_dim < vocab.len) return error.ModelDimTooSmallForVocabulary;
@@ -110,7 +116,49 @@ pub const DistributedTrainerFuthark = struct {
     pub fn deinit(self: *DistributedTrainerFuthark) void {
         self.accelerator.sync() catch {};
         self.accelerator.deinit();
+        if (self.crev_pipeline) |p| {
+            p.deinit();
+            self.allocator.destroy(p);
+            self.crev_pipeline = null;
+        }
+        if (self.chaos_kernel) |k| {
+            k.deinit();
+            self.allocator.destroy(k);
+            self.chaos_kernel = null;
+        }
         self.tokenizer.deinit();
+    }
+
+    /// Audit #3: Wire CREV (Conflict Resolution & Evidence Validation) into the
+    /// training pipeline. Allocates the chaos kernel and CREV pipeline so that
+    /// every batch can have its raw text passed through processTextStream and
+    /// integrated into the global knowledge graph index.
+    pub fn enableCREV(self: *DistributedTrainerFuthark) !void {
+        if (self.crev_pipeline != null) return;
+        var kernel = try self.allocator.create(chaos.ChaosCoreKernel);
+        errdefer self.allocator.destroy(kernel);
+        kernel.* = chaos.ChaosCoreKernel.init(self.allocator);
+        errdefer kernel.deinit();
+
+        var pipeline = try self.allocator.create(crev.CREVPipeline);
+        errdefer self.allocator.destroy(pipeline);
+        pipeline.* = try crev.CREVPipeline.init(self.allocator, kernel);
+
+        self.chaos_kernel = kernel;
+        self.crev_pipeline = pipeline;
+    }
+
+    /// Audit #3: Build knowledge graph from a raw training sample. Idempotent
+    /// no-op when CREV has not been enabled. Updates statistics for telemetry.
+    pub fn buildKnowledgeGraph(self: *DistributedTrainerFuthark, text: []const u8) !void {
+        const pipeline = self.crev_pipeline orelse return;
+        var result = pipeline.processTextStream(text) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        _ = &result;
+        self.crev_samples_processed +%= 1;
+        self.crev_triplets_extracted +%= @as(u64, @intCast(result.triplets_extracted));
     }
 
     fn validateHyperparameters(learning_rate: f32, momentum: f32) !void {
@@ -473,6 +521,15 @@ pub const DistributedTrainerFuthark = struct {
                 const batch_end = batch_start + batch_len;
                 batch = samples[batch_start..batch_end];
                 batch_start = batch_end;
+            }
+
+            // Audit #3: feed every training sample through the CREV pipeline
+            // before the gradient step so the knowledge graph index keeps in
+            // sync with the data the RSF is observing.
+            if (self.crev_pipeline != null) {
+                for (batch) |sample| {
+                    self.buildKnowledgeGraph(sample) catch {};
+                }
             }
 
             const loss = self.trainStepFuthark(batch) catch |err| {
